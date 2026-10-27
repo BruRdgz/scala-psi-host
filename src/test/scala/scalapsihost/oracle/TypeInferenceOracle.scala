@@ -1,5 +1,6 @@
 package scalapsihost.oracle
 
+import com.intellij.openapi.application.ApplicationManager
 import com.intellij.psi.util.PsiTreeUtil
 import com.intellij.psi.{PsiComment, PsiErrorElement}
 import org.jetbrains.plugins.scala.lang.lexer.ScalaTokenTypes
@@ -7,7 +8,7 @@ import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.api.base.ScLiteral
 import org.jetbrains.plugins.scala.lang.psi.api.expr.{ScExpression, ScInfixExpr, ScReferenceExpression}
 import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunctionDefinition
-import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScClass
+import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.{ScClass, ScTypeDefinition}
 import org.jetbrains.plugins.scala.lang.psi.types.api.presentation.TypePresentation
 import org.jetbrains.plugins.scala.lang.psi.types.result.*
 import org.jetbrains.plugins.scala.lang.psi.types.{Context, ScType, ScTypeExt, TypePresentationContext}
@@ -30,18 +31,23 @@ import scala.util.control.NonFatal
  * fixture's default setup: Scala 2.12 (`ScalaSdkOwner.defaultSdkVersion`), scala-library only, expected to pass.
  * Everything else is reported as skipped, with the reason.
  *
- * Usage: `Test/runMain scalapsihost.oracle.TypeInferenceOracle <intellij-scala checkout> <report.md>`
+ * Usage: `Test/runMain scalapsihost.oracle.TypeInferenceOracle <intellij-scala checkout> <report.md> [--unit-test-mode]`
+ *
+ * `--unit-test-mode` runs the host as the plugin's fixture does (`isUnitTestMode`), to check which disagreements
+ * come only from behaviour the plugin enables in tests.
  */
 object TypeInferenceOracle {
   /** The version the plugin's light fixture selects for tests without a `supportedIn` restriction. */
   private[oracle] val TestVersion: ScalaVersion = LatestScalaVersions.Scala_2_12
 
   def main(args: Array[String]): Unit = {
-    val Array(repo, reportPath) = args
+    val (Seq(repo, reportPath), flags) = args.toSeq.partition(!_.startsWith("--"))
+    val unitTestMode = flags.contains("--unit-test-mode")
     val pluginRoot = Path.of(repo, "scala/scala-impl")
     val host = ScalaPsiHost.start(HostConfig(
       stateDir = Path.of(sys.props("scalapsihost.stateDir")),
       scalaPluginJars = sys.props("scalapsihost.scalaPluginJars").split(File.pathSeparator).toSeq.map(Path.of(_)),
+      unitTestMode = unitTestMode,
     ))
     host.addJdk(Path.of(System.getProperty("java.home")))
     host.addLibrary(Path.of(sys.props("scalapsihost.fixture.scalaLibrary212")))
@@ -67,7 +73,14 @@ object TypeInferenceOracle {
         if (parseErrors.nonEmpty) Outcome.ParseError(parseErrors.head.getErrorDescription)
         else Expected.lastComment(file) match {
           case None => Outcome.Unusable("the file does not end with a comment")
-          case Some(comment) => compare(selectedExpression(file), Expected.forVersion(comment, TestVersion))
+          case Some(comment) =>
+            val outcome = compare(selectedExpression(file), Expected.forVersion(comment, TestVersion))
+            // FileDeclarationsHolder processes top-level declarations of a Scala 2 file only in unit-test mode
+            // (SCL-20481, "a hack not to patch hundreds of tests"). The host, like the IDE outside tests, does not.
+            val hasTopLevelDeclarations = file.members.exists(!_.isInstanceOf[ScTypeDefinition])
+            if (outcome != Outcome.Agree && hasTopLevelDeclarations && !ApplicationManager.getApplication.isUnitTestMode)
+              Outcome.UnitTestModeOnly(outcome.toString.take(200))
+            else outcome
         }
       }
       finally host.closeSource(file)
@@ -137,6 +150,8 @@ enum Outcome {
   case ParseError(message: String)
   case Crash(message: String, origin: String)
   case Unusable(reason: String)
+  /** Disagrees, but the test relies on behaviour the plugin enables only in unit-test mode. */
+  case UnitTestModeOnly(outcome: String)
 }
 
 /** Expected results as TestUtils.extractExpectedResultFromLastComment and TypeInferenceTestFixture read them. */
@@ -264,6 +279,7 @@ object Report {
       case _: Outcome.ParseError => "parse error"
       case _: Outcome.Crash => "crash"
       case _: Outcome.Unusable => "unusable"
+      case _: Outcome.UnitTestModeOnly => "unit-test mode only"
     }
     val counts = outcomes.groupBy(o => kind(o._2)).view.mapValues(_.size).toMap
     val lines = Vector.newBuilder[String]
@@ -273,7 +289,8 @@ object Report {
     lines += ""
     lines += "| Outcome | Cases |"
     lines += "|---|---|"
-    for (k <- Seq("agree", "differ", "type failure", "parse error", "crash", "unusable")) lines += s"| $k | ${counts.getOrElse(k, 0)} |"
+    for (k <- Seq("agree", "differ", "type failure", "parse error", "crash", "unusable", "unit-test mode only"))
+      lines += s"| $k | ${counts.getOrElse(k, 0)} |"
     lines += ""
     lines += "## Disagreements"
     lines += ""
@@ -287,6 +304,7 @@ object Report {
         case Outcome.ParseError(m) => ("", m)
         case Outcome.Crash(m, origin) => ("", s"$m (at $origin)")
         case Outcome.Unusable(r) => ("", r)
+        case Outcome.UnitTestModeOnly(o) => ("", o)
         case Outcome.Agree => ("", "")
       }
       lines += s"| ${c.testClass}.${c.testName} | ${kind(o)} | ${cell(expected)} | ${cell(actual)} |"

@@ -32,8 +32,10 @@ import scala.jdk.CollectionConverters.*
 /**
  * @param stateDir        the only place the platform writes to disk (index ID enumeration under `idea.system.path`)
  * @param scalaPluginJars the Scala plugin's jars; they must also be on the classpath
+ * @param unitTestMode    answer `isUnitTestMode` as the plugin's test fixture does; only for comparing with the
+ *                        plugin's own tests, since the plugin changes behaviour in that mode
  */
-final case class HostConfig(stateDir: Path, scalaPluginJars: Seq[Path])
+final case class HostConfig(stateDir: Path, scalaPluginJars: Seq[Path], unitTestMode: Boolean = false)
 
 /**
  * Scala PSI and type checker hosted without an IntelliJ application container. The host installs three fixed
@@ -113,7 +115,8 @@ object ScalaPsiHost {
     }
     lazy val appBus = MessageBusFactoryImpl.createRootBus(busOwner)
     lazy val area: ExtensionsAreaImpl = new ExtensionsAreaImpl(app)
-    lazy val app: Application = tableProxy(classOf[Application], "Application") {
+    // ApplicationEx, the interface the IDE's application implements: platform utilities cast to it.
+    lazy val app: Application = tableProxy(classOf[com.intellij.openapi.application.ex.ApplicationEx], "Application") {
       case ("getService", Array(c: Class[?])) => appServices.get(c)
       case ("getServiceIfCreated", Array(c: Class[?])) => appServices.get(c)
       case ("getExtensionArea", _) => area
@@ -124,7 +127,8 @@ object ScalaPsiHost {
       case ("isReadAccessAllowed", _) => java.lang.Boolean.TRUE
       case ("isWriteAccessAllowed", _) => java.lang.Boolean.FALSE
       case ("assertReadAccessAllowed" | "assertIsNonDispatchThread" | "assertReadAccessNotAllowed", _) => null
-      case ("isUnitTestMode" | "isInternal" | "isEAP" | "isDisposed", _) => java.lang.Boolean.FALSE
+      case ("isUnitTestMode", _) => java.lang.Boolean.valueOf(config.unitTestMode)
+      case ("isInternal" | "isEAP" | "isDisposed", _) => java.lang.Boolean.FALSE
       case ("isHeadlessEnvironment" | "isCommandLine", _) => java.lang.Boolean.TRUE
       case ("getUserData", Array(k: Key[?])) => appData.getUserData(k).asInstanceOf[AnyRef]
       // Extension points resolve their declared class through the component manager.
@@ -132,6 +136,9 @@ object ScalaPsiHost {
       // Wraps an extension's failure for logging; the IDE adds plugin attribution, which the host does not track.
       case ("createError", Array(t: Throwable, _*)) => new RuntimeException(t)
       case ("runReadAction", Array(r: Runnable)) => r.run(); null
+      case ("tryRunReadAction", Array(r: Runnable)) => r.run(); java.lang.Boolean.TRUE
+      // In unit-test mode the plugin runs some startup work on the UI thread; the host has none, so it runs here.
+      case ("invokeAndWait", Array(r: Runnable, _*)) if config.unitTestMode => r.run(); null
       case ("runReadAction", Array(c: com.intellij.openapi.util.Computable[?])) => c.compute().asInstanceOf[AnyRef]
     }
     ApplicationManager.setApplication(app, root)

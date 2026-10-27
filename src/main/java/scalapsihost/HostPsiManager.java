@@ -59,9 +59,9 @@ public final class HostPsiManager extends PsiManagerEx {
   @Override public FileViewProvider findViewProvider(VirtualFile f) { hit("findViewProvider"); return fileManager.findViewProvider(f); }
   @Override public PsiDirectory findDirectory(VirtualFile f) { hit("findDirectory"); return fileManager.findDirectory(f); }
   @Override public FileViewProvider findCachedViewProvider(VirtualFile f) { hit("findCachedViewProvider"); return fileManager.findCachedViewProvider(f); }
-  // The host has one code-insight context per file (no multiverse).
-  @Override public PsiFile findFile(VirtualFile f, CodeInsightContext c) { return no("findFile(context)"); }
-  @Override public FileViewProvider findViewProvider(VirtualFile f, CodeInsightContext c) { return no("findViewProvider(context)"); }
+  // The host has one code-insight context per file (no multiverse): every context sees the same file.
+  @Override public PsiFile findFile(VirtualFile f, CodeInsightContext c) { hit("findFile(context)"); return fileManager.findFile(f); }
+  @Override public FileViewProvider findViewProvider(VirtualFile f, CodeInsightContext c) { hit("findViewProvider(context)"); return fileManager.findViewProvider(f); }
 
   // Unsupported until a scenario proves they are needed.
   @Override public void cleanupForNextTest() { no("cleanupForNextTest"); }
