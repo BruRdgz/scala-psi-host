@@ -31,8 +31,11 @@ Platform jars come from the IntelliJ snapshots repository at the version pinned 
 ## Layout
 
 - `ScalaPsiHost` — bootstrap: the three tables, service registrations, startup of synthetic classes.
-- `LibraryIndex` — the symbol index: library binaries → the plugin's decompiler → PSI → the plugin's stub
-  builder and indexers → an in-memory map answering `StubIndex`.
+- `LibraryFileSystem` — library class roots (jars via zipfs, JDK modules via `jrt:`) as read-only VirtualFiles.
+- `LibraryIndex` — the symbol index: library class files → the plugin's decompiler (through the platform's
+  class-file view providers) → PSI → the plugin's stub builder and indexers → an in-memory map answering `StubIndex`.
+- `LibraryClassFinder` — classes and packages of the library roots for the platform's `JavaPsiFacadeImpl`,
+  next to the plugin's own element finders.
 - `Descriptors` — extension-point declarations and registry keys read from descriptor XML.
 - `Adapters` — `CallLog`, proxy and dispatch tables, `ServiceTable`.
 - `src/main/java` — host subclasses of abstract platform classes. `Host_*` files are generated:
@@ -51,9 +54,9 @@ Platform jars come from the IntelliJ snapshots repository at the version pinned 
 
 ## Known limitations
 
-- Only the root `scala` package of scala-library is indexed, and there are no JDK symbols. Types that depend on
-  them come out wrong rather than failing (`Box[Nothing]` instead of `Box[Int]`). Phase F1.
-- `scala/Array.class` is not indexed until the host has a library directory model (see `LibraryIndex`).
+- No library sources are attached: navigation into libraries lands on decompiled code.
 - One scope for everything, no module model, single-threaded use. Phases F2 and F3.
+- Java class files are read by path on demand, not indexed: Java short-name lookups (completion, auto-import)
+  do not see them yet.
 - Depends on platform `@Internal` APIs (`Extensions.setRootArea`, `ExtensionsAreaImpl`) and constructs a few
   platform and plugin classes with non-public constructors, as the IDE container does.

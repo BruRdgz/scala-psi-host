@@ -7,7 +7,7 @@ import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScClass
 /** Library binaries reach the plugin's symbol lookups through its own decompiler, stub builder and indexers. */
 class LibraryIndexTest extends munit.FunSuite {
 
-  test("indexes the scala package of scala-library without refusing any class") {
+  test("indexes scala-library without refusing any class") {
     val report = TestHost.libraryReport
     assertEquals(report.refused, Seq.empty)
     assert(report.scalaIndexed > 0, report)
