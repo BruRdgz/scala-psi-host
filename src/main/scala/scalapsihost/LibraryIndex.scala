@@ -3,31 +3,30 @@ package scalapsihost
 import com.intellij.lang.ASTNode
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.SimpleModificationTracker
-import com.intellij.psi.{PsiElement, PsiFileFactory}
+import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.psi.{PsiElement, PsiJavaFile, PsiManager}
 import com.intellij.psi.stubs.{IndexSink, ObjectStubSerializer, StubElement, StubElementRegistryService, StubIndex, StubIndexKey}
 import com.intellij.util.Processor
-import org.jetbrains.plugins.scala.ScalaFileType
-import org.jetbrains.plugins.scala.decompiler.Decompiler
+import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 
-import java.nio.file.Path
 import java.util.concurrent.{ConcurrentHashMap, CopyOnWriteArrayList}
-import java.util.zip.ZipFile
 import scala.collection.mutable
 import scala.jdk.CollectionConverters.*
-import scala.util.Using
 
 /**
- * Outcome of indexing one library jar.
+ * Outcome of indexing one library root.
  *
- * @param refused class files whose stubs could not be paired with their PSI; they are left out of the index
- * @param skipped class files the host deliberately does not index yet (see [[LibraryIndex.knownUnsupported]])
+ * @param scalaIndexed top-level Scala class files whose decompiled PSI went into the index
+ * @param javaClasses  Java class files: not indexed, the host's class finder reads them by path on demand
+ * @param notTopLevel  class files without a PSI file of their own (inner and companion classes)
+ * @param refused      Scala class files whose stubs could not be paired with their PSI; left out of the index
  */
 final case class LibraryIndexReport(
   classFiles: Int,
-  notScala: Int,
-  indexed: Int,
+  scalaIndexed: Int,
+  javaClasses: Int,
+  notTopLevel: Int,
   refused: Seq[String],
-  skipped: Seq[String],
   occurrences: Int,
 )
 
@@ -66,68 +65,64 @@ final class LibraryIndex {
     case ("StubIndex.getPerFileElementTypeModificationTracker" | "StubIndex.getStubIndexModificationTracker", _) => tracker
   })
 
-  /** Indexes the `.class` entries of `jar` accepted by `includeEntry` (a jar entry name such as `scala/Option.class`). */
-  def indexJar(project: Project, jar: Path, includeEntry: String => Boolean): LibraryIndexReport = {
+  /**
+   * Indexes the class files under `root` accepted by `includeEntry` (a path relative to the root, such as
+   * `scala/Option.class`). PSI files come from the PsiManager, i.e. from the plugin's class-file decompiler.
+   */
+  def index(project: Project, root: VirtualFile, includeEntry: String => Boolean): LibraryIndexReport = {
     val registry = StubElementRegistryService.Companion.getInstance()
-    var notScala, indexed, occurrences = 0
-    val refused, skipped = mutable.ArrayBuffer.empty[String]
-    val entryNames = Using.resource(new ZipFile(jar.toFile)) { zip =>
-      val names = zip.entries().asScala.map(_.getName).filter(n => n.endsWith(".class") && includeEntry(n)).toVector
-      for (name <- names) {
-        if (LibraryIndex.knownUnsupported.contains(name)) skipped += name
-        else {
-          val bytes = zip.getInputStream(zip.getEntry(name)).readAllBytes()
-          // Only top-level Scala classes decompile to a source file; inner classes and Java classes do not.
-          Decompiler.sourceNameAndText(name.substring(name.lastIndexOf('/') + 1), bytes) match {
-            case None => notScala += 1
-            case Some((sourceName, text)) =>
-              val file = PsiFileFactory.getInstance(project).createFileFromText(sourceName, ScalaFileType.INSTANCE, text)
-              val builder = registry.getStubDescriptor(file.getLanguage).getStubDefinition.getBuilder
-              def preorder(s: StubElement[?]): Seq[StubElement[?]] = s +: s.getChildrenStubs.asScala.toSeq.flatMap(preorder)
-              val stubs = preorder(builder.buildStubTree(file)).drop(1)
-              // Pair each stub with the AST element that produced it by mirroring the builder's traversal.
-              val psis = mutable.ArrayBuffer.empty[PsiElement]
-              def walk(node: ASTNode): Unit =
-                node.getChildren(null).foreach { child =>
-                  if (!builder.skipChildProcessingWhenBuildingStubs(node, child)) {
-                    val factory = registry.getStubFactory(child.getElementType)
-                    if (factory != null && factory.shouldCreateStub(child)) psis += child.getPsi
-                    walk(child)
-                  }
-                }
-              walk(file.getNode)
-              val paired = stubs.size == psis.size && stubs.zip(psis).forall((s, p) => s.getElementType == p.getNode.getElementType)
-              // No mapping is better than a wrong one: an unpaired file stays out of the index.
-              if (!paired) refused += name
-              else {
-                indexed += 1
-                for ((stub, psi) <- stubs.zip(psis); serializer <- Option(registry.getStubSerializer(stub.getElementType))) {
-                  val sink = new IndexSink {
-                    override def occurrence[Psi <: PsiElement, K](key: StubIndexKey[K, Psi], value: K): Unit = {
-                      occurrences += 1
-                      val k = normKey(value.asInstanceOf[AnyRef])
-                      elements.computeIfAbsent((key.getName, k), _ => new CopyOnWriteArrayList[PsiElement]()).add(psi)
-                      keys.computeIfAbsent(key.getName, _ => ConcurrentHashMap.newKeySet[AnyRef]()).add(k)
-                    }
-                  }
-                  serializer.asInstanceOf[ObjectStubSerializer[StubElement[?], ?]].indexStub(stub, sink)
-                }
-              }
+    val psiManager = PsiManager.getInstance(project)
+    var classFiles, scalaIndexed, javaClasses, notTopLevel, occurrences = 0
+    val refused = mutable.ArrayBuffer.empty[String]
+    def visit(dir: VirtualFile, relativeDir: String): Unit =
+      for (file <- dir.getChildren) {
+        val relative = relativeDir + file.getName
+        if (file.isDirectory) visit(file, relative + "/")
+        else if (file.getName.endsWith(".class") && includeEntry(relative)) {
+          classFiles += 1
+          psiManager.findFile(file) match {
+            case scalaFile: ScalaFile => if (indexScalaFile(registry, scalaFile)) scalaIndexed += 1 else refused += relative
+            case _: PsiJavaFile => javaClasses += 1
+            case _ => notTopLevel += 1
           }
         }
       }
-      names
-    }
-    tracker.incModificationCount()
-    LibraryIndexReport(entryNames.size, notScala, indexed, refused.toSeq, skipped.toSeq, occurrences)
-  }
-}
 
-object LibraryIndex {
-  /**
-   * `scala.Array` is also a synthetic class; resolving through it navigates to its library source directory
-   * (`SyntheticNamedElement`, ScSyntheticClass.scala:84) and dereferences it unchecked. The host has no library
-   * directory model until phase F1, so this class file is not indexed yet.
-   */
-  val knownUnsupported: Set[String] = Set("scala/Array.class")
+    def indexScalaFile(registry: StubElementRegistryService, file: ScalaFile): Boolean = {
+      val builder = registry.getStubDescriptor(file.getLanguage).getStubDefinition.getBuilder
+      def preorder(s: StubElement[?]): Seq[StubElement[?]] = s +: s.getChildrenStubs.asScala.toSeq.flatMap(preorder)
+      val stubs = preorder(builder.buildStubTree(file)).drop(1)
+      // Pair each stub with the AST element that produced it by mirroring the builder's traversal.
+      val psis = mutable.ArrayBuffer.empty[PsiElement]
+      def walk(node: ASTNode): Unit =
+        node.getChildren(null).foreach { child =>
+          if (!builder.skipChildProcessingWhenBuildingStubs(node, child)) {
+            val factory = registry.getStubFactory(child.getElementType)
+            if (factory != null && factory.shouldCreateStub(child)) psis += child.getPsi
+            walk(child)
+          }
+        }
+      walk(file.getNode)
+      val paired = stubs.size == psis.size && stubs.zip(psis).forall((s, p) => s.getElementType == p.getNode.getElementType)
+      // No mapping is better than a wrong one: an unpaired file stays out of the index.
+      if (paired) {
+        for ((stub, psi) <- stubs.zip(psis); serializer <- Option(registry.getStubSerializer(stub.getElementType))) {
+          val sink = new IndexSink {
+            override def occurrence[Psi <: PsiElement, K](key: StubIndexKey[K, Psi], value: K): Unit = {
+              occurrences += 1
+              val k = normKey(value.asInstanceOf[AnyRef])
+              elements.computeIfAbsent((key.getName, k), _ => new CopyOnWriteArrayList[PsiElement]()).add(psi)
+              keys.computeIfAbsent(key.getName, _ => ConcurrentHashMap.newKeySet[AnyRef]()).add(k)
+            }
+          }
+          serializer.asInstanceOf[ObjectStubSerializer[StubElement[?], ?]].indexStub(stub, sink)
+        }
+      }
+      paired
+    }
+
+    visit(root, "")
+    tracker.incModificationCount()
+    LibraryIndexReport(classFiles, scalaIndexed, javaClasses, notTopLevel, refused.toSeq, occurrences)
+  }
 }

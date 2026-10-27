@@ -10,8 +10,7 @@ class LibraryIndexTest extends munit.FunSuite {
   test("indexes the scala package of scala-library without refusing any class") {
     val report = TestHost.libraryReport
     assertEquals(report.refused, Seq.empty)
-    assertEquals(report.skipped, Seq("scala/Array.class"))
-    assert(report.indexed > 0, report)
+    assert(report.scalaIndexed > 0, report)
   }
 
   test("the plugin's class lookup finds a library class in the host index") {

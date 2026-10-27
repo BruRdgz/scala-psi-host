@@ -19,9 +19,11 @@ object TestHost {
     scalaPluginJars = property("scalapsihost.scalaPluginJars").split(File.pathSeparator).toSeq.map(Path.of(_)),
   ))
 
-  /** Only the root `scala` package for now: the full library and the JDK are phase F1. */
-  lazy val libraryReport: LibraryIndexReport =
-    host.indexLibrary(Path.of(property("scalapsihost.fixture.scalaLibrary")), _.matches("scala/[A-Za-z0-9]+\\.class"))
+  /** Only the root `scala` package for now (the full library is the next F1 step), and the test JVM's JDK. */
+  lazy val libraryReport: LibraryIndexReport = {
+    host.addJdk(Path.of(System.getProperty("java.home")))
+    host.addLibrary(Path.of(property("scalapsihost.fixture.scalaLibrary")), _.matches("scala/[A-Za-z0-9]+\\.class"))
+  }
 
   val scenarioSource: String =
     """object Main {

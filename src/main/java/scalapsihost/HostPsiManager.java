@@ -54,6 +54,15 @@ public final class HostPsiManager extends PsiManagerEx {
   @Override public void beforeChange(boolean physical) { hit("beforeChange"); }
   @Override public void afterChange(boolean physical) { hit("afterChange"); }
 
+  // File lookups go to the host's FileManager, as PsiManagerImpl delegates to its FileManager.
+  @Override public PsiFile findFile(VirtualFile f) { hit("findFile"); return fileManager.findFile(f); }
+  @Override public FileViewProvider findViewProvider(VirtualFile f) { hit("findViewProvider"); return fileManager.findViewProvider(f); }
+  @Override public PsiDirectory findDirectory(VirtualFile f) { hit("findDirectory"); return fileManager.findDirectory(f); }
+  @Override public FileViewProvider findCachedViewProvider(VirtualFile f) { hit("findCachedViewProvider"); return fileManager.findCachedViewProvider(f); }
+  // The host has one code-insight context per file (no multiverse).
+  @Override public PsiFile findFile(VirtualFile f, CodeInsightContext c) { return no("findFile(context)"); }
+  @Override public FileViewProvider findViewProvider(VirtualFile f, CodeInsightContext c) { return no("findViewProvider(context)"); }
+
   // Unsupported until a scenario proves they are needed.
   @Override public void cleanupForNextTest() { no("cleanupForNextTest"); }
   @Override public void dropResolveCacheRegularly(ProgressIndicator i) { no("dropResolveCacheRegularly"); }
@@ -65,11 +74,6 @@ public final class HostPsiManager extends PsiManagerEx {
   @Override public void addTreeChangePreprocessor(PsiTreeChangePreprocessor p) { no("addTreeChangePreprocessor"); }
   @Override public void removeTreeChangePreprocessor(PsiTreeChangePreprocessor p) { no("removeTreeChangePreprocessor"); }
   @Override public void addTreeChangePreprocessorBackgroundable(PsiTreeChangePreprocessor p, Disposable d) { no("addTreeChangePreprocessorBackgroundable"); }
-  @Override public PsiFile findFile(VirtualFile f) { return no("findFile"); }
-  @Override public PsiFile findFile(VirtualFile f, CodeInsightContext c) { return no("findFile"); }
-  @Override public FileViewProvider findViewProvider(VirtualFile f) { return no("findViewProvider"); }
-  @Override public FileViewProvider findViewProvider(VirtualFile f, CodeInsightContext c) { return no("findViewProvider"); }
-  @Override public PsiDirectory findDirectory(VirtualFile f) { return no("findDirectory"); }
   @Override public void reloadFromDisk(PsiFile f) { no("reloadFromDisk"); }
   @Override public void addPsiTreeChangeListener(PsiTreeChangeListener l) { no("addPsiTreeChangeListener"); }
   @Override public void addPsiTreeChangeListener(PsiTreeChangeListener l, Disposable d) { no("addPsiTreeChangeListener"); }
@@ -81,5 +85,4 @@ public final class HostPsiManager extends PsiManagerEx {
   @Override public void dropResolveCaches() { no("dropResolveCaches"); }
   @Override public void dropPsiCaches() { no("dropPsiCaches"); }
   @Override public boolean isInProject(PsiElement e) { return no("isInProject"); }
-  @Override public FileViewProvider findCachedViewProvider(VirtualFile f) { return no("findCachedViewProvider"); }
 }

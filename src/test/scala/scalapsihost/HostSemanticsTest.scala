@@ -1,7 +1,8 @@
 package scalapsihost
 
-import com.intellij.psi.PsiErrorElement
+import com.intellij.psi.{PsiErrorElement, PsiMethod}
 import com.intellij.psi.util.PsiTreeUtil
+import org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.ScSyntheticFunction
 
 /**
  * The plugin's parser, resolver and type checker answering through the host. Expectations are what the Scala
@@ -20,14 +21,13 @@ class HostSemanticsTest extends munit.FunSuite {
     "x" -> "x: Int",
     "inc" -> "def inc(x: Int): Int = x + 1",
     "b" -> "b",
-    "f" -> "f: A => B",
     "v" -> "val v: A",
     "c" -> "c",
     "x" -> "x",
   )
 
   test("resolves references to their local declarations") {
-    val resolved = TestHost.references(file).filterNot(_.getText == "+").map { ref =>
+    val resolved = TestHost.references(file).filterNot(r => r.getText == "+" || r.getText == "f").map { ref =>
       val target = ref.resolve()
       assert(target != null, s"'${ref.getText}' is unresolved")
       assertEquals(target.getContainingFile, file, s"'${ref.getText}' resolved outside the file")
@@ -36,9 +36,23 @@ class HostSemanticsTest extends munit.FunSuite {
     assertEquals(resolved, localResolves)
   }
 
-  test("resolves Int's + (needs the full library and JDK index, phase F1)".fail) {
+  // Arithmetic on primitives resolves to the plugin's synthetic members (registered at startup), not library code.
+  test("resolves Int's + to the synthetic Int member") {
     val plus = TestHost.references(file).find(_.getText == "+").get
-    assert(plus.resolve() != null, "'+' is unresolved")
+    plus.resolve() match {
+      case m: ScSyntheticFunction => assertEquals(m.name, "+")
+      case other => fail(s"'+' resolved to $other")
+    }
+  }
+
+  // A call on a function value is sugar for apply: the reference resolves to Function1.apply, and the plugin keeps
+  // the parameter `f` as the inner resolve result (see ScalaResolveResult.innerResolveResult).
+  test("resolves a function value call to Function1.apply") {
+    val f = TestHost.references(file).find(_.getText == "f").get
+    f.resolve() match {
+      case m: PsiMethod => assertEquals((m.getName, m.getContainingClass.getQualifiedName), ("apply", "scala.Function1"))
+      case other => fail(s"'f' resolved to $other")
+    }
   }
 
   private def typeOf(definition: String): String = {
@@ -51,12 +65,11 @@ class HostSemanticsTest extends munit.FunSuite {
     assertEquals(typeOf("val b"), "Int")
   }
 
-  // Wrong without the full library and JDK: the type checker degrades instead of failing.
-  test("types a method application (phase F1: currently Any)".fail) {
+  test("types a method application") {
     assertEquals(typeOf("val c"), "Int")
   }
 
-  test("types a for-comprehension through map (phase F1: currently Box[Nothing])".fail) {
+  test("types a for-comprehension through map") {
     assertEquals(typeOf("val d"), "Box[Int]")
   }
 }

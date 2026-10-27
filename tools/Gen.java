@@ -29,7 +29,8 @@ public class Gen {
   }
 
   static void generate(String outDir, Class<?> base) throws Exception {
-    Map<String, Method> abstracts = new LinkedHashMap<>();
+    // Sorted by signature: reflection order is unspecified, and regenerated files should diff cleanly.
+    Map<String, Method> abstracts = new TreeMap<>();
     Set<String> concrete = new HashSet<>();
     Deque<Class<?>> todo = new ArrayDeque<>();
     for (Class<?> c = base; c != null; c = c.getSuperclass()) {
@@ -53,7 +54,20 @@ public class Gen {
     sb.append("package scalapsihost;\n\n@SuppressWarnings({\"unchecked\", \"rawtypes\", \"deprecation\"})\n");
     sb.append("public final class Host_").append(simple).append(" extends ").append(typeName(base)).append(" {\n");
     sb.append("  private final Dispatch d;\n");
-    sb.append("  public Host_").append(simple).append("(Dispatch d) { this.d = d; }\n");
+    // Forward the parameters of the base class's shortest non-private constructor (e.g. FileIndexFacade(Project)).
+    Constructor<?> superCtor = Arrays.stream(base.getDeclaredConstructors())
+      .filter(c -> !Modifier.isPrivate(c.getModifiers()))
+      .min(Comparator.comparingInt(Constructor::getParameterCount))
+      .orElseThrow(() -> new IllegalArgumentException("no accessible constructor in " + base.getName()));
+    StringBuilder ctorParams = new StringBuilder(), superArgs = new StringBuilder();
+    Class<?>[] cps = superCtor.getParameterTypes();
+    for (int k = 0; k < cps.length; k++) {
+      ctorParams.append(typeName(cps[k])).append(" s").append(k).append(", ");
+      if (k > 0) superArgs.append(", ");
+      superArgs.append("s").append(k);
+    }
+    sb.append("  public Host_").append(simple).append("(").append(ctorParams).append("Dispatch d) { super(")
+      .append(superArgs).append("); this.d = d; }\n");
     for (Method m : abstracts.values()) {
       Class<?>[] ps = m.getParameterTypes();
       StringBuilder params = new StringBuilder(), argList = new StringBuilder();

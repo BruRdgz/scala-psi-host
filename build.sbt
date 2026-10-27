@@ -39,6 +39,8 @@ lazy val root = (project in file("."))
       "com.jetbrains.intellij.platform" % "analysis-impl" % platformVersion,
       "com.jetbrains.intellij.java" % "java-psi-impl" % platformVersion,
       "com.jetbrains.intellij.platform" % "indexing-impl" % platformVersion,
+      // Java stub factories and serializers (JavaStubRegistryExtension): the stub schema of Java class files.
+      "com.jetbrains.intellij.java" % "java-indexing-serializers" % platformVersion,
       // XML PSI: ScalaDoc and XML literals parse through it.
       "com.jetbrains.intellij.xml" % "xml-psi" % platformVersion intransitive(),
       "com.jetbrains.intellij.xml" % "xml-psi-impl" % platformVersion intransitive(),

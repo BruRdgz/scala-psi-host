@@ -40,13 +40,17 @@ final case class HostConfig(stateDir: Path, scalaPluginJars: Seq[Path])
  * tables — an `Application` object, a root extension area and a `Project` object — and then only consumes the
  * plugin's PSI. Whatever is not in a table fails loudly and is recorded in [[CallLog]].
  */
-final class ScalaPsiHost private (val project: Project, libraryIndex: LibraryIndex) {
+final class ScalaPsiHost private (val project: Project, libraryIndex: LibraryIndex, libraryFiles: LibraryFileSystem) {
 
   def parse(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile =
     ScalaPsiElementFactory.createScalaFileFromText(text, features)(using new ProjectContext(project))
 
-  def indexLibrary(jar: Path, includeEntry: String => Boolean): LibraryIndexReport =
-    libraryIndex.indexJar(project, jar, includeEntry)
+  /** Mounts a library jar and indexes its Scala class files accepted by `includeEntry` (e.g. `scala/Option.class`). */
+  def addLibrary(jar: Path, includeEntry: String => Boolean = _ => true): LibraryIndexReport =
+    libraryIndex.index(project, libraryFiles.mountJar(jar), includeEntry)
+
+  /** Mounts the JDK's modules. Java classes are read on demand, not indexed. */
+  def addJdk(javaHome: Path): Unit = libraryFiles.mountJdk(javaHome)
 }
 
 object ScalaPsiHost {
@@ -99,6 +103,8 @@ object ScalaPsiHost {
       case ("getUserData", Array(k: Key[?])) => appData.getUserData(k).asInstanceOf[AnyRef]
       // Extension points resolve their declared class through the component manager.
       case ("loadClass", Array(name: String, _)) => Class.forName(name)
+      // Wraps an extension's failure for logging; the IDE adds plugin attribution, which the host does not track.
+      case ("createError", Array(t: Throwable, _*)) => new RuntimeException(t)
       case ("runReadAction", Array(r: Runnable)) => r.run(); null
       case ("runReadAction", Array(c: com.intellij.openapi.util.Computable[?])) => c.compute().asInstanceOf[AnyRef]
     }
@@ -120,6 +126,8 @@ object ScalaPsiHost {
     CoreApplicationEnvironment.registerExtensionPoint(area, FileIndentOptionsProvider.EP_NAME, classOf[FileIndentOptionsProvider])
     CoreApplicationEnvironment.registerExtensionPoint(area, TreeCopyHandler.EP_NAME, classOf[TreeCopyHandler])
     CoreApplicationEnvironment.registerExtensionPoint(area, "com.intellij.multiverseEnabler", classOf[com.intellij.codeInsight.multiverse.MultiverseEnabler])
+    // Java PSI of library classes asks for augmentations (Lombok-style); there are none.
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.augment.PsiAugmentProvider.EP_NAME, classOf[com.intellij.psi.augment.PsiAugmentProvider])
 
     appServices.register(classOf[ProgressManager])(new CoreProgressManager)
     appServices.register(classOf[PsiBuilderFactory])(new PsiBuilderFactoryImpl)
@@ -187,8 +195,13 @@ object ScalaPsiHost {
 
     // Stub schema (model): the plugin's serializer/factory registrations and language stub definitions.
     val scalaPlugin = new DefaultPluginDescriptor(PluginId.getId("org.intellij.scala"))
-    declare("com.intellij.stubElementRegistryExtension").asInstanceOf[ExtensionPointImpl[StubRegistryExtension]]
+    val declaredStubRegistry = declare("com.intellij.stubElementRegistryExtension").asInstanceOf[ExtensionPointImpl[StubRegistryExtension]]
+    declaredStubRegistry
       .registerExtension(new org.jetbrains.plugins.scala.lang.psi.stubs.ScalaStubRegistryExtension, root)
+    declaredStubRegistry.registerExtension(new com.intellij.psi.impl.java.stubs.JavaStubRegistryExtension, root)
+    // Element type <-> PSI class mapping the Java stub registry fills (private constructor, as a container service).
+    appServices.register(classOf[com.intellij.psi.impl.java.stubs.JavaStubElementTypePsiElementMappingRegistry])(
+      newPrivate(classOf[com.intellij.psi.impl.java.stubs.JavaStubElementTypePsiElementMappingRegistry]))
     val stubDefinitions = declare("com.intellij.languageStubDefinition")
       .asInstanceOf[ExtensionPointImpl[LanguageExtensionPoint[LanguageStubDefinition]]]
     def stubDefinition(language: String, definition: LanguageStubDefinition) = {
@@ -206,7 +219,40 @@ object ScalaPsiHost {
 
     val fileTypes = new CoreFileTypeRegistry
     fileTypes.registerFileType(org.jetbrains.plugins.scala.ScalaFileType.INSTANCE, "scala")
+    fileTypes.registerFileType(com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, "class")
     FileTypeRegistry.setInstanceSupplier(() => fileTypes, root)
+
+    // Class files become PSI as in the IDE: the first decompiler that accepts the file wins; the plugin's comes
+    // before the platform's Java decompiler.
+    val decompilers = declare("com.intellij.psi.classFileDecompiler")
+      .asInstanceOf[ExtensionPointImpl[com.intellij.psi.compiled.ClassFileDecompilers.Decompiler]]
+    decompilers.registerExtension(new org.jetbrains.plugins.scala.lang.psi.compiled.ScClassFileDecompiler, root)
+    decompilers.registerExtension(new com.intellij.psi.impl.compiled.ClsDecompilerImpl, root)
+    appServices.register(classOf[com.intellij.psi.compiled.ClassFileDecompilers])(newPrivate(classOf[com.intellij.psi.compiled.ClassFileDecompilers]))
+    // Stubs of library class files are built on demand from their bytes (the core loader kotlinc uses), through the
+    // platform's class-file stub builder, which defers to the same decompilers.
+    com.intellij.psi.stubs.BinaryFileStubBuilders.INSTANCE.addExplicitExtension(
+      com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, new com.intellij.psi.impl.compiled.ClassFileStubBuilder)
+    appServices.register(classOf[com.intellij.psi.stubs.StubTreeLoader])(new com.intellij.psi.stubs.CoreStubTreeLoader)
+    val libraryFiles = new LibraryFileSystem
+    // The platform's file-based indexes: only the file-name index exists in the host, answered from library roots.
+    appServices.register(classOf[com.intellij.util.indexing.FileBasedIndex])(new Host_FileBasedIndex(dispatch {
+      case ("FileBasedIndex.processFilesContainingAnyKey",
+            Array(id: com.intellij.util.indexing.ID[?, ?], names: java.util.Collection[?], scope: com.intellij.psi.search.GlobalSearchScope, _, _,
+                  processor: com.intellij.util.Processor[?])) if id == com.intellij.psi.search.FilenameIndex.NAME =>
+        val p = processor.asInstanceOf[com.intellij.util.Processor[VirtualFile]]
+        val matching = names.asScala.toSeq.flatMap(n => libraryFiles.filesNamed(n.toString)).filter(scope.contains)
+        java.lang.Boolean.valueOf(matching.forall(p.process))
+    }))
+    // Persistent file attributes: the plugin caches "is this class file Scala?" in them. The host persists nothing,
+    // so every read misses (the plugin recomputes) and writes are discarded.
+    appServices.register(classOf[com.intellij.openapi.vfs.newvfs.ManagingFS])(new Host_ManagingFS(dispatch {
+      case ("ManagingFS.readAttribute", _) => null
+      case ("ManagingFS.writeAttribute", _) =>
+        new com.intellij.openapi.vfs.newvfs.AttributeOutputStream(new com.intellij.openapi.util.io.BufferExposingByteArrayOutputStream()) {
+          override def writeEnumeratedString(value: String): Unit = writeUTF(value)
+        }
+    }))
 
     // ---- 3. Project object -----------------------------------------------------------------
     val psiModTracker: PsiModificationTracker = {
@@ -232,23 +278,49 @@ object ScalaPsiHost {
       case ("putUserData", Array(k: Key[?], v)) =>
         projectData.putUserData(k.asInstanceOf[Key[AnyRef]], v); null
     }
-    // The host's snapshot store: view providers keyed by (light) virtual file.
+    // The host's file store: view providers of light files (snapshots) and of library class files, keyed by
+    // virtual file; light files register themselves, library class files are created on first request.
     val viewProviders = new ConcurrentHashMap[VirtualFile, FileViewProvider]()
+    val directories = new ConcurrentHashMap[VirtualFile, com.intellij.psi.PsiDirectory]()
+    var psiManagerRef: PsiManager = null
+    def viewProvider(f: VirtualFile): FileViewProvider = viewProviders.computeIfAbsent(f, {
+      case lib: LibraryFile if lib.getName.endsWith(".class") =>
+        new com.intellij.psi.ClassFileViewProviderFactory().createFileViewProvider(lib, null, psiManagerRef, false)
+      case other => CallLog.unsupported(s"FileManager.findViewProvider for a file the host does not own: $other")
+    })
     val fileManager = tableProxy(classOf[com.intellij.psi.impl.file.impl.FileManager], "FileManager") {
       case ("findCachedViewProvider", Array(f: VirtualFile)) => viewProviders.get(f)
       case ("setViewProvider", Array(f: VirtualFile, vp)) =>
         if (vp == null) viewProviders.remove(f) else viewProviders.put(f, vp.asInstanceOf[FileViewProvider]); null
+      case ("findViewProvider", Array(f: VirtualFile)) => viewProvider(f)
+      case ("findFile", Array(f: VirtualFile)) =>
+        if (f.isDirectory) null else { val vp = viewProvider(f); vp.getPsi(vp.getBaseLanguage) }
+      case ("findDirectory", Array(f: VirtualFile)) =>
+        if (!f.isDirectory) null
+        else directories.computeIfAbsent(f, d => new com.intellij.psi.impl.file.PsiDirectoryImpl(psiManagerRef.asInstanceOf[com.intellij.psi.impl.PsiManagerEx], d))
     }
+    // Library class files live in the host's library file system; every other file is a source the host was given.
+    def isLibraryClass(f: VirtualFile) = f.getFileSystem.isInstanceOf[LibraryFileSystem]
     val fileIndex = tableProxy(classOf[com.intellij.openapi.roots.ProjectFileIndex], "ProjectFileIndex") {
+      case ("isInLibrary" | "isInLibraryClasses", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibraryClass(f))
+      // No library sources are attached yet, so no workspace library or SDK entity has any to offer.
+      case ("isInLibrarySource", _) => java.lang.Boolean.FALSE
+      case ("findContainingLibraries" | "findContainingSdks", _) => java.util.List.of()
       // No module model yet: language features are attached per file instead.
-      case ("isInLibrary" | "isInLibraryClasses" | "isInLibrarySource", _) => java.lang.Boolean.FALSE
       case ("getModuleForFile", _) => null
-      // Every file the host knows is a source file it was given.
-      case ("isInSourceContent" | "isInContent" | "isInSource", _) => java.lang.Boolean.TRUE
+      case ("isInSourceContent" | "isInContent" | "isInSource", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(!isLibraryClass(f))
       case ("isInTestSourceContent", _) => java.lang.Boolean.FALSE
     }
     projectServices.register(classOf[com.intellij.openapi.roots.ProjectFileIndex])(fileIndex)
+    // The same answers through the platform's facade (ClassFileViewProvider asks it before building Java PSI).
+    projectServices.register(classOf[com.intellij.openapi.roots.FileIndexFacade])(new Host_FileIndexFacade(project, dispatch {
+      case ("FileIndexFacade.isInLibraryClasses" | "FileIndexFacade.isInLibrary", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibraryClass(f))
+      case ("FileIndexFacade.isInLibrarySource", _) => java.lang.Boolean.FALSE
+      case ("FileIndexFacade.isInSource" | "FileIndexFacade.isInSourceContent" | "FileIndexFacade.isInContent", Array(f: VirtualFile)) =>
+        java.lang.Boolean.valueOf(!isLibraryClass(f))
+    }))
     val psiManager = new HostPsiManager(project, psiModTracker, fileManager)
+    psiManagerRef = psiManager
     projectServices.register(classOf[PsiManager])(psiManager)
     projectServices.register(classOf[PsiModificationTracker])(psiModTracker)
     // PSI <-> document synchronization: the core implementation used by headless compilers (package-private).
@@ -264,6 +336,10 @@ object ScalaPsiHost {
     // The host's indexes are always ready before it answers queries.
     projectServices.register(classOf[DumbService])(new Host_DumbService(dispatch {
       case ("DumbService.isDumb", _) => java.lang.Boolean.FALSE
+      // Index-free "alternative" resolution exists only for dumb mode, which the host never enters.
+      case ("DumbService.isAlternativeResolveEnabled", _) => java.lang.Boolean.FALSE
+      // No extension is dumb-aware-filtered away: the host is never dumb.
+      case ("DumbService.filterByDumbAwareness", Array(c: java.util.Collection[?])) => java.util.List.copyOf(c)
       case ("DumbService.getProject", _) => project
       // Dumb-mode tasks (synthetic class registration) run to completion on the caller's thread.
       case ("DumbService.queueTask", Array(task: DumbModeTask)) =>
@@ -279,18 +355,20 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.pom.PomModel])(new com.intellij.pom.core.impl.PomModelImpl(project))
     projectServices.register(classOf[com.intellij.pom.tree.TreeAspect])(new com.intellij.pom.tree.TreeAspect)
     projectServices.register(classOf[com.intellij.psi.SmartPointerManager])(new com.intellij.psi.impl.smartPointers.SmartPointerManagerImpl(project))
-    lazy val javaElementFactory = new com.intellij.psi.impl.PsiElementFactoryImpl(project)
+    projectServices.register(classOf[com.intellij.psi.PsiElementFactory])(new com.intellij.psi.impl.PsiElementFactoryImpl(project))
     projectServices.register(classOf[com.intellij.psi.search.ProjectScopeBuilder])(new Host_ProjectScopeBuilder(dispatch {
       case (m, _) if m.startsWith("ProjectScopeBuilder.build") => new com.intellij.psi.search.EverythingGlobalScope(project)
     }))
-    // Java/classpath symbols are not provided yet (phase F1): every query is recorded as a known gap.
-    projectServices.register(classOf[com.intellij.psi.JavaPsiFacade])(new Host_JavaPsiFacade(dispatch {
-      case ("JavaPsiFacade.getProject", _) => project
-      case ("JavaPsiFacade.getElementFactory", _) => javaElementFactory
-      case ("JavaPsiFacade.findClass", args) => CallLog.hit(s"GAP classpath findClass ${args(0)}"); null
-      case ("JavaPsiFacade.findClasses", args) => CallLog.hit(s"GAP classpath findClasses ${args(0)}"); Array.empty[com.intellij.psi.PsiClass]
-      case ("JavaPsiFacade.findPackage", args) => CallLog.hit(s"GAP classpath findPackage ${args(0)}"); null
-    }))
+    // Class and package lookup: the platform's JavaPsiFacadeImpl over element finders, as in the IDE. The plugin's
+    // finders come with the host's LibraryClassFinder, which takes the place of the IDE's PsiElementFinderImpl.
+    projectServices.register(classOf[com.intellij.psi.JvmPsiConversionHelper])(new com.intellij.psi.impl.JvmPsiConversionHelperImpl)
+    // JVM-language-neutral class lookup that JavaPsiFacadeImpl also consults; no other JVM language provides classes.
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.lang.jvm.facade.JvmElementProvider.EP_NAME.getName,
+      classOf[com.intellij.lang.jvm.facade.JvmElementProvider])
+    projectServices.register(classOf[com.intellij.lang.jvm.facade.JvmFacade])(new com.intellij.lang.jvm.facade.JvmFacadeImpl(project))
+    projectServices.register(classOf[com.intellij.psi.impl.file.impl.JavaFileManager])(
+      tableProxy(classOf[com.intellij.psi.impl.file.impl.JavaFileManager], "JavaFileManager")(PartialFunction.empty))
+    projectServices.register(classOf[com.intellij.psi.JavaPsiFacade])(new com.intellij.psi.impl.JavaPsiFacadeImpl(project, null))
     // ScalaDocParserDefinition reads TAB_SIZE from code style: one fixed settings object, never the scheme manager.
     projectServices.register(classOf[com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager]) {
       val m = new com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager(project, /* loadExtensions = */ false)
@@ -335,11 +413,19 @@ object ScalaPsiHost {
       projectServices.register(cls)(newPrivate(cls))
     }
 
+    // Element finders are built last: their constructors fetch project services.
+    CoreApplicationEnvironment.registerExtensionPoint(area, "com.intellij.java.elementFinder", classOf[com.intellij.psi.PsiElementFinder])
+    val finders = area.getExtensionPoint[com.intellij.psi.PsiElementFinder]("com.intellij.java.elementFinder")
+      .asInstanceOf[ExtensionPointImpl[com.intellij.psi.PsiElementFinder]]
+    finders.registerExtension(new LibraryClassFinder(project, libraryFiles), root)
+    finders.registerExtension(new org.jetbrains.plugins.scala.finder.ScalaClassFinder(project), root)
+    finders.registerExtension(new org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.SyntheticClassElementFinder(project), root)
+
     // ---- 4. Project startup the PSI depends on -------------------------------------------------
     // The plugin's own activity registers the synthetic classes (Any, Int, ...) through DumbService.queueTask.
     new org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.RegisterSyntheticClassesProjectActivity().execute(project)
 
-    new ScalaPsiHost(project, libraryIndex)
+    new ScalaPsiHost(project, libraryIndex, libraryFiles)
   }
 
   private def newPrivate[T](cls: Class[T], args: AnyRef*): T = {

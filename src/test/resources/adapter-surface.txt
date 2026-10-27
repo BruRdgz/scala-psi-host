@@ -1,3 +1,4 @@
+Application.assertReadAccessAllowed
 Application.getExtensionArea
 Application.getLockProhibitedAdvice (default)
 Application.getMessageBus
@@ -14,11 +15,16 @@ Application.service com.intellij.openapi.command.CommandProcessor
 Application.service com.intellij.openapi.fileEditor.FileDocumentManager
 Application.service com.intellij.openapi.progress.ProgressManager
 Application.service com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
+Application.service com.intellij.openapi.vfs.newvfs.ManagingFS
 Application.service com.intellij.psi.ExternalChangeActionUtil$PsiExternalChangeService
 Application.service com.intellij.psi.LanguageSubstitutors
 Application.service com.intellij.psi.codeStyle.CodeStyleSettingsService
+Application.service com.intellij.psi.compiled.ClassFileDecompilers
+Application.service com.intellij.psi.impl.java.stubs.JavaStubElementTypePsiElementMappingRegistry
 Application.service com.intellij.psi.stubs.StubElementRegistryService
 Application.service com.intellij.psi.stubs.StubIndex
+Application.service com.intellij.psi.stubs.StubTreeLoader
+Application.service com.intellij.util.indexing.FileBasedIndex
 Application.service org.jetbrains.plugins.scala.lang.psi.api.expr.ExpectedTypes
 Application.service org.jetbrains.plugins.scala.scalaMeta.ScalaMetaApi
 Application.service org.jetbrains.plugins.scala.settings.ScalaApplicationSettings
@@ -29,20 +35,23 @@ AsyncExecutionService.buildNonBlockingReadAction
 CodeStyleSettingsService.addListener
 CodeStyleSettingsService.getCustomCodeStyleSettingsFactories
 CodeStyleSettingsService.getLanguageCodeStyleProviders
+DumbService.isAlternativeResolveEnabled
 DumbService.isDumb
 DumbService.queueTask
+FileBasedIndex.processFilesContainingAnyKey
+FileIndexFacade.isInLibraryClasses
 FileManager.findCachedViewProvider
+FileManager.findDirectory
+FileManager.findFile
 FileManager.setViewProvider
-JavaPsiFacade.findClass
-JavaPsiFacade.findClasses
-JavaPsiFacade.findPackage
-JavaPsiFacade.getElementFactory
-JavaPsiFacade.getProject
 LibraryTable.addListener
 LibraryTablesRegistrar.getLibraryTable
+ManagingFS.readAttribute
+ManagingFS.writeAttribute
 MessageBusOwner.isDisposed
 ModuleManager.getModules
 NonBlockingReadAction.executeSynchronously
+Project.getExtensionArea
 Project.getMessageBus
 Project.getService
 Project.getUserData
@@ -50,22 +59,25 @@ Project.isDefault
 Project.isDisposed
 Project.putUserData
 Project.service com.intellij.ide.util.PropertiesComponent
+Project.service com.intellij.lang.jvm.facade.JvmFacade
 Project.service com.intellij.openapi.module.ModuleManager
 Project.service com.intellij.openapi.project.DumbService
+Project.service com.intellij.openapi.roots.FileIndexFacade
 Project.service com.intellij.openapi.roots.ProjectFileIndex
 Project.service com.intellij.openapi.roots.ProjectRootManager
 Project.service com.intellij.pom.PomModel
 Project.service com.intellij.pom.tree.TreeAspect
 Project.service com.intellij.psi.JavaPsiFacade
+Project.service com.intellij.psi.JvmPsiConversionHelper
 Project.service com.intellij.psi.PsiDocumentManager
 Project.service com.intellij.psi.PsiFileFactory
 Project.service com.intellij.psi.PsiManager
 Project.service com.intellij.psi.SmartPointerManager
 Project.service com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager
 Project.service com.intellij.psi.impl.ResolveScopeManager
+Project.service com.intellij.psi.impl.file.impl.JavaFileManager
 Project.service com.intellij.psi.search.ProjectScopeBuilder
 Project.service com.intellij.psi.util.CachedValuesManager
-Project.service com.intellij.psi.util.PsiModificationTracker
 Project.service org.jetbrains.plugins.scala.caches.ScalaShortNamesCacheManager
 Project.service org.jetbrains.plugins.scala.components.libextensions.LibraryExtensionsManager
 Project.service org.jetbrains.plugins.scala.lang.macros.evaluator.ScalaMacroEvaluator
@@ -75,12 +87,17 @@ Project.service org.jetbrains.plugins.scala.lang.psi.types.api.ParameterizedType
 Project.service org.jetbrains.plugins.scala.lang.psi.types.api.StdTypes
 Project.service org.jetbrains.plugins.scala.settings.ScalaProjectSettings
 Project.service org.jetbrains.plugins.scala.util.UnloadAwareDisposable$UnloadAwareDisposableService
+ProjectFileIndex.findContainingLibraries
+ProjectFileIndex.findContainingSdks
+ProjectFileIndex.isInLibrary
 ProjectFileIndex.isInLibraryClasses
 ProjectFileIndex.isInSourceContent
 ProjectRootManager.getFileIndex
 ProjectScopeBuilder.buildAllScope
 PsiManager.afterChange
 PsiManager.beforeChange
+PsiManager.findDirectory
+PsiManager.findFile
 PsiManager.getFileManager
 PsiManager.getModificationTracker
 PsiManager.getProject
