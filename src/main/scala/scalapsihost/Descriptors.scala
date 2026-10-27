@@ -19,24 +19,32 @@ final case class EpDecl(name: String, className: String, kind: ExtensionPoint.Ki
  */
 object Descriptors {
 
-  def extensionPoints(classpathJars: Seq[Path], scalaPluginJars: Set[Path]): Map[String, EpDecl] = {
+  /**
+   * Declarations from the Scala plugin's jars and from the other classpath jars. Classpath entries are told apart
+   * from the plugin's by file name, because launchers may run from copies of the jars (sbt's `run` does).
+   */
+  def extensionPoints(classpathJars: Seq[Path], scalaPluginJars: Seq[Path]): Map[String, EpDecl] = {
+    val pluginJarNames = scalaPluginJars.map(_.getFileName.toString).toSet
+    val platformJars = classpathJars.filterNot(jar => pluginJarNames.contains(jar.getFileName.toString))
+    (declarations(platformJars, fromScala = false) ++ declarations(scalaPluginJars, fromScala = true)).toMap
+  }
+
+  private def declarations(jars: Seq[Path], fromScala: Boolean): Seq[(String, EpDecl)] = {
     val factory = DocumentBuilderFactory.newInstance()
-    val decls = for {
-      jar <- classpathJars
-      fromScala = scalaPluginJars.contains(jar)
+    val prefix = if (fromScala) "org.intellij.scala." else "com.intellij."
+    for {
+      jar <- jars
       (_, bytes) <- xmlEntries(jar) if new String(bytes, StandardCharsets.UTF_8).contains("<extensionPoint ")
       // Some jars ship XML that is not a descriptor (or not well-formed on its own); those declare no extension points.
       doc <- scala.util.Try(factory.newDocumentBuilder().parse(new java.io.ByteArrayInputStream(bytes))).toOption.toSeq
       nodes = doc.getElementsByTagName("extensionPoint")
       i <- 0 until nodes.getLength
       e = nodes.item(i).asInstanceOf[org.w3c.dom.Element]
-      prefix = if (fromScala) "org.intellij.scala." else "com.intellij."
       name = Option(e.getAttribute("qualifiedName")).filter(_.nonEmpty).getOrElse(prefix + e.getAttribute("name"))
       (cls, kind) = Option(e.getAttribute("interface")).filter(_.nonEmpty)
         .map(_ -> ExtensionPoint.Kind.INTERFACE).getOrElse(e.getAttribute("beanClass") -> ExtensionPoint.Kind.BEAN_CLASS)
       if cls.nonEmpty
     } yield name -> EpDecl(name, cls, kind, e.getAttribute("dynamic") == "true", fromScala)
-    decls.toMap
   }
 
   /** `<registryKey>` defaults declared by the Scala plugin's descriptors. */

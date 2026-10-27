@@ -15,7 +15,7 @@ import scala.jdk.CollectionConverters.*
  * Classes and packages of the library roots, for `JavaPsiFacadeImpl` — the role the IDE's `PsiElementFinderImpl`
  * plays over its Java indexes:
  *
- *  - classes the plugin indexed under `JavaStubIndexKeys.CLASS_FQN` (Scala library classes, see [[LibraryIndex]]);
+ *  - classes the plugin indexed under `JavaStubIndexKeys.CLASS_FQN` (Scala library classes and project sources, see [[SymbolIndex]]);
  *  - Java class files, looked up by path on demand instead of indexed, because the JDK alone has tens of
  *    thousands of them and resolution only ever asks for qualified names;
  *  - packages, which are the directories of the class roots.

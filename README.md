@@ -32,8 +32,8 @@ Platform jars come from the IntelliJ snapshots repository at the version pinned 
 
 - `ScalaPsiHost` — bootstrap: the three tables, service registrations, startup of synthetic classes.
 - `LibraryFileSystem` — library class roots (jars via zipfs, JDK modules via `jrt:`) as read-only VirtualFiles.
-- `LibraryIndex` — the symbol index: library class files → the plugin's decompiler (through the platform's
-  class-file view providers) → PSI → the plugin's stub builder and indexers → an in-memory map answering `StubIndex`.
+- `SymbolIndex` — the stub index: library class files (through the plugin's decompiler) and project source files
+  → the plugin's stub builder and indexers → an in-memory map answering `StubIndex`, kept per file.
 - `LibraryClassFinder` — classes and packages of the library roots for the platform's `JavaPsiFacadeImpl`,
   next to the plugin's own element finders.
 - `Descriptors` — extension-point declarations and registry keys read from descriptor XML.

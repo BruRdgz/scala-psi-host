@@ -38,11 +38,13 @@ object TestHost {
       |}
       |""".stripMargin
 
-  /** Parses the scenario with the library indexed, so every query sees the same symbols. */
-  def scenarioFile(): ScalaFile = {
+  /** The scenario as the project's one source file, opened after the libraries so every query sees the same symbols. */
+  private lazy val scenario: ScalaFile = {
     libraryReport
-    host.parse(scenarioSource)
+    host.openSource(scenarioSource)
   }
+
+  def scenarioFile(): ScalaFile = scenario
 
   def references(file: ScalaFile): Seq[ScReferenceExpression] =
     PsiTreeUtil.findChildrenOfType(file, classOf[ScReferenceExpression]).asScala.toSeq

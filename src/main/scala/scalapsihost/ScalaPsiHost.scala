@@ -40,14 +40,40 @@ final case class HostConfig(stateDir: Path, scalaPluginJars: Seq[Path])
  * tables — an `Application` object, a root extension area and a `Project` object — and then only consumes the
  * plugin's PSI. Whatever is not in a table fails loudly and is recorded in [[CallLog]].
  */
-final class ScalaPsiHost private (val project: Project, libraryIndex: LibraryIndex, libraryFiles: LibraryFileSystem) {
+final class ScalaPsiHost private (
+  val project: Project,
+  symbolIndex: SymbolIndex,
+  libraryFiles: LibraryFileSystem,
+  psiChanged: () => Unit,
+) {
 
+  /** A file outside the project: parsed, but invisible to symbol lookups (as the IDE's non-physical files). */
   def parse(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile =
     ScalaPsiElementFactory.createScalaFileFromText(text, features)(using new ProjectContext(project))
 
+  /**
+   * A project source file: its declarations are indexed, so other files and the file itself find them by name,
+   * as for a file under an IDE source root. Fails when its stubs cannot be paired with its PSI.
+   */
+  def openSource(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile = {
+    val file = parse(text, features)
+    if (!symbolIndex.indexScalaFile(file)) throw new IllegalStateException("source file stubs could not be paired with its PSI")
+    psiChanged()
+    file
+  }
+
+  /** Removes a source file opened with [[openSource]] from the project. */
+  def closeSource(file: ScalaFile): Unit = {
+    symbolIndex.removeFile(file)
+    psiChanged()
+  }
+
   /** Mounts a library jar and indexes its Scala class files accepted by `includeEntry` (e.g. `scala/Option.class`). */
-  def addLibrary(jar: Path, includeEntry: String => Boolean = _ => true): LibraryIndexReport =
-    libraryIndex.index(project, libraryFiles.mountJar(jar), includeEntry)
+  def addLibrary(jar: Path, includeEntry: String => Boolean = _ => true): LibraryIndexReport = {
+    val report = symbolIndex.indexLibrary(project, libraryFiles.mountJar(jar), includeEntry)
+    psiChanged()
+    report
+  }
 
   /** Mounts the JDK's modules. Java classes are read on demand, not indexed. */
   def addJdk(javaHome: Path): Unit = libraryFiles.mountJdk(javaHome)
@@ -113,14 +139,17 @@ object ScalaPsiHost {
 
     val classpathJars = System.getProperty("java.class.path").split(File.pathSeparator).toSeq
       .filter(_.endsWith(".jar")).map(Path.of(_))
-    val epDecls = Descriptors.extensionPoints(classpathJars, config.scalaPluginJars.toSet)
+    val epDecls = Descriptors.extensionPoints(classpathJars, config.scalaPluginJars)
     def declare(name: String): ExtensionPointImpl[?] = {
       val d = epDecls.getOrElse(name, throw new IllegalStateException(s"extension point is not declared on the classpath: $name"))
       area.registerExtensionPoint(d.name, d.className, d.kind, d.dynamic)
       area.getExtensionPoint(name).asInstanceOf[ExtensionPointImpl[?]]
     }
     // The plugin's own extension points, with no extensions.
-    epDecls.values.filter(_.fromScalaPlugin).foreach(d => declare(d.name))
+    val pluginEps = epDecls.values.filter(_.fromScalaPlugin)
+    if (pluginEps.isEmpty)
+      throw new IllegalStateException(s"no extension points declared by the Scala plugin jars ${config.scalaPluginJars.mkString(", ")}; are they on the classpath?")
+    pluginEps.foreach(d => declare(d.name))
     // Platform extension points the plugin's PSI queries, with no extensions. Their declarations live in IDE
     // descriptors that are not on this classpath; the platform's own core environment declares them in code too.
     CoreApplicationEnvironment.registerExtensionPoint(area, FileIndentOptionsProvider.EP_NAME, classOf[FileIndentOptionsProvider])
@@ -162,8 +191,8 @@ object ScalaPsiHost {
               new org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings(s)
           })
       })
-    val libraryIndex = new LibraryIndex
-    appServices.register(classOf[com.intellij.psi.stubs.StubIndex])(libraryIndex.stubIndex)
+    val symbolIndex = new SymbolIndex
+    appServices.register(classOf[com.intellij.psi.stubs.StubIndex])(symbolIndex.stubIndex)
     // The project library table, which the host never changes; LibraryExtensionsManager subscribes to it.
     lazy val libraryTable = tableProxy(classOf[com.intellij.openapi.roots.libraries.LibraryTable], "LibraryTable") {
       case ("addListener", _) => null
@@ -177,6 +206,14 @@ object ScalaPsiHost {
     appServices.register(classOf[org.jetbrains.plugins.scala.lang.psi.api.expr.ExpectedTypes])(
       new org.jetbrains.plugins.scala.lang.psi.impl.expr.ExpectedTypesImpl)
     appServices.register(classOf[org.jetbrains.plugins.scala.scalaMeta.ScalaMetaApi])(new scala.meta.intellij.ScalaMetaApiImpl)
+    // The editor's read/write-action facade, reached from CodeStyle.getSettings: the host's callers may always read.
+    appServices.register(classOf[com.intellij.openapi.editor.elf.Elf])(tableProxy(classOf[com.intellij.openapi.editor.elf.Elf], "Elf") {
+      case ("runReadAction", Array(f: kotlin.jvm.functions.Function0[?])) => f.invoke().asInstanceOf[AnyRef]
+    })
+    // Platform library implementations used by Java PSI of library classes and by PSI copies.
+    appServices.register(classOf[com.intellij.psi.util.JavaClassSupers])(new com.intellij.psi.impl.JavaClassSupersImpl)
+    appServices.register(classOf[com.intellij.psi.PsiSubstitutorFactory])(new com.intellij.psi.impl.PsiSubstitutorFactoryImpl)
+    appServices.register(classOf[com.intellij.psi.impl.source.codeStyle.IndentHelper])(new com.intellij.psi.impl.source.codeStyle.IndentHelperImpl)
 
     // ---- 2. Language registries and stub schema: explicit extensions only ---------------------
     val parserDefinitions: Seq[ParserDefinition] = Seq(
@@ -255,12 +292,10 @@ object ScalaPsiHost {
     }))
 
     // ---- 3. Project object -----------------------------------------------------------------
-    val psiModTracker: PsiModificationTracker = {
-      val counter = new SimpleModificationTracker
-      tableProxy(classOf[PsiModificationTracker], "PsiModificationTracker") {
-        case ("getModificationCount", _) => java.lang.Long.valueOf(counter.getModificationCount)
-        case ("getForLanguage" | "forLanguage", _) => counter
-      }
+    val psiModificationCount = new SimpleModificationTracker
+    val psiModTracker: PsiModificationTracker = tableProxy(classOf[PsiModificationTracker], "PsiModificationTracker") {
+      case ("getModificationCount", _) => java.lang.Long.valueOf(psiModificationCount.getModificationCount)
+      case ("getForLanguage" | "forLanguage", _) => psiModificationCount
     }
     lazy val projectBus = new MessageBusFactoryImpl().createMessageBus(busOwner, appBus)
     lazy val project: Project = tableProxy(classOf[Project], "Project") {
@@ -362,6 +397,20 @@ object ScalaPsiHost {
     // Class and package lookup: the platform's JavaPsiFacadeImpl over element finders, as in the IDE. The plugin's
     // finders come with the host's LibraryClassFinder, which takes the place of the IDE's PsiElementFinderImpl.
     projectServices.register(classOf[com.intellij.psi.JvmPsiConversionHelper])(new com.intellij.psi.impl.JvmPsiConversionHelperImpl)
+    projectServices.register(classOf[com.intellij.psi.impl.source.resolve.ResolveCache])(new com.intellij.psi.impl.source.resolve.ResolveCache(project))
+    // External (XML) annotations of library classes: the host attaches none.
+    projectServices.register(classOf[com.intellij.codeInsight.ExternalAnnotationsManager])(new Host_ExternalAnnotationsManager(dispatch {
+      case ("ExternalAnnotationsManager.findExternalAnnotationsFiles", _) => null
+    }))
+    // Nullability annotations of library Java types: the host configures none (the IDE's defaults come from settings).
+    projectServices.register(classOf[com.intellij.codeInsight.NullableNotNullManager])(new Host_NullableNotNullManager(project, dispatch {
+      case ("NullableNotNullManager.getNullityDefault", _) => com.intellij.codeInsight.ContextNullabilityInfo.EMPTY
+      case ("NullableNotNullManager.findEffectiveNullabilityInfo", _) => null
+    }))
+    // No language injection in the host: every file is its own top-level file.
+    projectServices.register(classOf[com.intellij.lang.injection.InjectedLanguageManager])(new Host_InjectedLanguageManager(dispatch {
+      case ("InjectedLanguageManager.getTopLevelFile", Array(e: com.intellij.psi.PsiElement)) => e.getContainingFile
+    }))
     // JVM-language-neutral class lookup that JavaPsiFacadeImpl also consults; no other JVM language provides classes.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.lang.jvm.facade.JvmElementProvider.EP_NAME.getName,
       classOf[com.intellij.lang.jvm.facade.JvmElementProvider])
@@ -408,6 +457,7 @@ object ScalaPsiHost {
     Seq(
       "org.jetbrains.plugins.scala.lang.psi.types.api.ParameterizedType$SubstitutorCacheService",
       "org.jetbrains.plugins.scala.util.UnloadAwareDisposable$UnloadAwareDisposableService",
+      "org.jetbrains.plugins.scala.lang.psi.types.ScMatchType$MatchTypeReductionCacheService",
     ).foreach { name =>
       val cls = Class.forName(name).asInstanceOf[Class[AnyRef]]
       projectServices.register(cls)(newPrivate(cls))
@@ -425,7 +475,15 @@ object ScalaPsiHost {
     // The plugin's own activity registers the synthetic classes (Any, Int, ...) through DumbService.queueTask.
     new org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.RegisterSyntheticClassesProjectActivity().execute(project)
 
-    new ScalaPsiHost(project, libraryIndex, libraryFiles)
+    // A source file was added or removed, or a library mounted: what the IDE's PsiModificationTrackerImpl and the
+    // plugin's ScalaPsiChangeListener do for a change under a directory (not a Scala element).
+    def psiChanged(): Unit = {
+      psiModificationCount.incModificationCount()
+      projectBus.syncPublisher(PsiModificationTracker.TOPIC).modificationCountChanged()
+      org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager.instance(project).clearOnNonScalaChange()
+    }
+
+    new ScalaPsiHost(project, symbolIndex, libraryFiles, () => psiChanged())
   }
 
   private def newPrivate[T](cls: Class[T], args: AnyRef*): T = {

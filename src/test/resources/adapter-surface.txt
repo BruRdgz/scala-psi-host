@@ -83,6 +83,7 @@ Project.service org.jetbrains.plugins.scala.components.libextensions.LibraryExte
 Project.service org.jetbrains.plugins.scala.lang.macros.evaluator.ScalaMacroEvaluator
 Project.service org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager
 Project.service org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.SyntheticClasses
+Project.service org.jetbrains.plugins.scala.lang.psi.types.ScMatchType$MatchTypeReductionCacheService
 Project.service org.jetbrains.plugins.scala.lang.psi.types.api.ParameterizedType$SubstitutorCacheService
 Project.service org.jetbrains.plugins.scala.lang.psi.types.api.StdTypes
 Project.service org.jetbrains.plugins.scala.settings.ScalaProjectSettings
