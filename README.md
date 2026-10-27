@@ -36,7 +36,9 @@ Platform jars come from the IntelliJ snapshots repository at the version pinned 
 - `Descriptors` — extension-point declarations and registry keys read from descriptor XML.
 - `Adapters` — `CallLog`, proxy and dispatch tables, `ServiceTable`.
 - `src/main/java` — host subclasses of abstract platform classes. `Host_*` files are generated:
-  `java -cp <compile classpath> tools/Gen.java src/main/java/scalapsihost <fqcn>...`
+  `java -cp <compile classpath> tools/Gen.java src/main/java/scalapsihost <fqcn>...`. `Host_StubIndex` also has
+  two hand-written overrides (concrete `StubIndex` overloads that delegate to each other); keep them when
+  regenerating it.
 
 ## Tests
 
