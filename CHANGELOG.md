@@ -6,6 +6,7 @@
 - Document highlights: a symbol's occurrences in the file, as reads or writes.
 - Document symbols, from the plugin's structure view.
 - Folding ranges, from the plugin's folding builder (with `//region` and `<editor-fold>` regions).
+- Semantic tokens: identifiers and soft keywords colored as the IDE colors them.
 
 ## 0.1.0-a1 — 2026-10-28
 

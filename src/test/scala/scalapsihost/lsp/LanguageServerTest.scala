@@ -74,6 +74,7 @@ class LanguageServerTest extends munit.FunSuite {
     assert(capabilities.getDocumentHighlightProvider.getLeft)
     assert(capabilities.getDocumentSymbolProvider.getLeft)
     assert(capabilities.getFoldingRangeProvider.getLeft)
+    assert(capabilities.getSemanticTokensProvider.getFull.getLeft)
     server.initialized(new InitializedParams)
   }
 
@@ -147,6 +148,26 @@ class LanguageServerTest extends munit.FunSuite {
     // The class's range is its whole definition, doc comment included (line 5), as LSP asks; its name's range, the name.
     assertEquals(symbols.head.getRange.getStart, new Position(5, 0))
     assertEquals(symbols.head.getSelectionRange, new Range(new Position(8, 6), new Position(8, 13)))
+  }
+
+  // Line 13, `    count = count + 1`: the assigned and the read variable; line 20, `  def zero: Counter = new Counter(0)`.
+  test("colors identifiers by what they declare or refer to") {
+    val data = server.getTextDocumentService.semanticTokensFull(new SemanticTokensParams(document(counter)))
+      .get(1, TimeUnit.MINUTES).getData.asScala.map(_.toInt).toSeq
+    val legend = SemanticColoring.legend
+    // Decoded: (line, column) -> (type, modifiers).
+    val tokens = data.grouped(5).foldLeft((Map.empty[(Int, Int), (String, Set[String])], 0, 0)) {
+      case ((found, line, column), Seq(deltaLine, deltaColumn, _, tokenType, bits)) =>
+        val l = line + deltaLine
+        val c = if (deltaLine == 0) column + deltaColumn else deltaColumn
+        val modifiers = legend.getTokenModifiers.asScala.zipWithIndex.collect { case (m, i) if (bits & (1 << i)) != 0 => m }.toSet
+        (found + ((l, c) -> (legend.getTokenTypes.get(tokenType), modifiers)), l, c)
+      case (state, _) => state
+    }._1
+    assertEquals(tokens.get((13, 4)).map(_._1), Some(SemanticTokenTypes.Variable))
+    assertEquals(tokens.get((13, 12)).map(_._1), Some(SemanticTokenTypes.Variable))
+    assertEquals(tokens.get((20, 6)), Some(SemanticTokenTypes.Method -> Set(SemanticTokenModifiers.Declaration)))
+    assertEquals(tokens.get((20, 12)).map(_._1), Some(SemanticTokenTypes.Class))
   }
 
   test("folds imports, doc comments and bodies, leaving closing braces visible") {

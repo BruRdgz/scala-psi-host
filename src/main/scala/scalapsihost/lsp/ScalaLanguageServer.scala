@@ -59,6 +59,7 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
     capabilities.setDocumentHighlightProvider(true)
     capabilities.setDocumentSymbolProvider(true)
     capabilities.setFoldingRangeProvider(true)
+    capabilities.setSemanticTokensProvider(new SemanticTokensWithRegistrationOptions(SemanticColoring.legend, /* full = */ true))
     CompletableFuture.completedFuture(new InitializeResult(capabilities, new ServerInfo("scala-psi-host", "0.1")))
   }
 
@@ -152,6 +153,12 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
       }
       s.outline(pathOf(params.getTextDocument.getUri)).map(o => LspEither.forRight[SymbolInformation, DocumentSymbol](symbol(o))).asJava
     }
+
+    override def semanticTokensFull(params: SemanticTokensParams): CompletableFuture[SemanticTokens] =
+      onDocuments { s =>
+        val data = SemanticColoring.encode(s.semanticTokens(pathOf(params.getTextDocument.getUri)))
+        new SemanticTokens(data.map(Integer.valueOf).asJava)
+      }
 
     override def foldingRange(params: FoldingRangeRequestParams): CompletableFuture[java.util.List[FoldingRange]] = onDocuments { s =>
       s.foldingRanges(pathOf(params.getTextDocument.getUri)).map { fold =>

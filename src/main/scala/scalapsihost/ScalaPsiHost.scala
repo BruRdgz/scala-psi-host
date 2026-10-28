@@ -255,6 +255,29 @@ final class ScalaPsiHost private (
         Diagnostic(a.getSeverity, new TextRange(a.getStartOffset, a.getEndOffset), a.getMessage)
     }
   }
+
+  /**
+   * The colors the IDE gives `file`'s identifiers and soft keywords beyond its lexer's: the plugin's syntax highlighting
+   * visitor (declarations, parameters, named arguments, annotations) and its color-scheme annotator (references, by
+   * what they resolve to), in that order, as the IDE's highlighting pass runs them.
+   */
+  def textAttributes(file: ScalaFile): Seq[(TextRange, com.intellij.openapi.editor.colors.TextAttributesKey)] = HostLock.query {
+    val elements = SyntaxTraverser.psiTraverser(file).asScala.toSeq
+    val holder = new com.intellij.codeInsight.daemon.impl.analysis.HighlightInfoHolder(file)
+    val visitor = new org.jetbrains.plugins.scala.highlighter.ScalaSyntaxHighlightingVisitor
+    visitor.analyze(file, /* updateWholeFile = */ true, holder, () => elements.foreach(visitor.visit))
+    val fromVisitor = (0 until holder.size).map(holder.get).flatMap { info =>
+      Option(info.forcedTextAttributesKey).orElse(Option(info.`type`.getAttributesKey))
+        .map(new TextRange(info.getStartOffset, info.getEndOffset) -> _)
+    }
+    val annotator = new org.jetbrains.plugins.scala.highlighter.ScalaColorSchemeAnnotator
+    val annotations = AnnotationSessionImpl.computeWithSession(file, /* batchMode = */ false, annotator, { holder =>
+      val impl = holder.asInstanceOf[AnnotationHolderImpl]
+      elements.foreach(e => impl.runAnnotatorWithContext(e))
+      impl.asScala.toSeq
+    })
+    fromVisitor ++ annotations.flatMap(a => Option(a.getTextAttributes).map(new TextRange(a.getStartOffset, a.getEndOffset) -> _))
+  }
 }
 
 final case class Diagnostic(severity: HighlightSeverity, range: TextRange, message: String)
@@ -391,6 +414,9 @@ object ScalaPsiHost {
       providers.registerExtension(new com.intellij.lang.customFolding.NetBeansCustomFoldingProvider, root)
       providers.registerExtension(new com.intellij.lang.customFolding.VisualStudioCustomFoldingProvider, root)
     }
+    // Filters of highlighting results (the IDE's hide some in debugger and diff views); the plugin registers none.
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.codeInsight.daemon.impl.HighlightInfoFilter.EXTENSION_POINT_NAME,
+      classOf[com.intellij.codeInsight.daemon.impl.HighlightInfoFilter])
     // Languages that stand for groups of languages in language extensions; none in the host.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.lang.MetaLanguage.EP_NAME, classOf[com.intellij.lang.MetaLanguage])
     // Smart pointers' anchors and element icons: no providers in the host.

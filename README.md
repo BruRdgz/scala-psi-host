@@ -8,10 +8,11 @@ A Scala language server built on the IntelliJ Scala plugin's PSI and type checke
 application container**. The plugin source is not modified: the host builds the plugin from intellij-scala and
 answers, through fixed tables, what the plugin and the IntelliJ platform's PSI libraries ask of their environment.
 
-It serves LSP diagnostics, hover, go to definition and type definition, document highlights, document symbols and
-folding ranges for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects. Symbols and folding
-are the plugin's structure view and folding builder; highlights and type definition, its access detector and
-type-declaration provider.
+It serves LSP diagnostics, hover, go to definition and type definition, document highlights, document symbols,
+folding ranges and semantic tokens for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
+Symbols and folding are the plugin's structure view and folding builder; highlights and type definition, its access
+detector and type-declaration provider; semantic tokens, the colors its highlighting visitor and color-scheme
+annotator give identifiers (the editor's grammar colors keywords, literals and comments).
 
 ## How it works
 

@@ -303,6 +303,19 @@ final class ProjectSession private (
     }
   }
 
+  /** The file's identifiers and soft keywords colored as the IDE colors them (see [[ScalaPsiHost.textAttributes]]). */
+  def semanticTokens(path: Path): Seq[SemanticColoring.Token] = file(path) match {
+    case scalaFile: ScalaFile =>
+      host.read {
+        val d = document(scalaFile)
+        host.textAttributes(scalaFile).collect {
+          case (range, key) if !range.isEmpty && d.getLineNumber(range.getStartOffset) == d.getLineNumber(range.getEndOffset) =>
+            SemanticColoring.Token(position(d, range.getStartOffset), range.getLength, key)
+        }
+      }
+    case _ => Seq.empty
+  }
+
   /** After a save: compiles the build and keeps its problems; returns the files whose compiler problems changed. */
   def compileBuild(): Set[Path] = {
     val before = buildProblems.get
