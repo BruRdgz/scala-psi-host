@@ -1,0 +1,35 @@
+{
+  "name": "scala-psi-host",
+  "displayName": "Scala (scala-psi-host)",
+  "description": "Scala diagnostics, hover and go-to-definition from the IntelliJ Scala plugin, through the scala-psi-host language server.",
+  "version": "0.1.0",
+  "publisher": "brurdgz",
+  "private": true,
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "https://github.com/BruRdgz/scala-psi-host" },
+  "engines": { "vscode": "^1.91.0" },
+  "categories": ["Programming Languages"],
+  "extensionDependencies": ["scala-lang.scala"],
+  "activationEvents": ["onLanguage:scala"],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "scala-psi-host",
+      "properties": {
+        "scalaPsiHost.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to bin/scala-psi-host of a built distribution (sbt dist)."
+        },
+        "scalaPsiHost.javaHome": {
+          "type": "string",
+          "default": "",
+          "description": "JDK 25 home for the server. Empty: the JAVA_HOME of VS Code's environment."
+        }
+      }
+    }
+  },
+  "dependencies": {
+    "vscode-languageclient": "11.0.0"
+  }
+}
