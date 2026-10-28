@@ -604,6 +604,14 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.psi.impl.JavaPsiImplementationHelper])(new Host_JavaPsiImplementationHelper(dispatch {
       case ("JavaPsiImplementationHelper.getClsFileNavigationElement", Array(f: com.intellij.psi.PsiJavaFile)) => f
     }))
+    // Java class-file parameters compiled without names get suggested names ("s", "i", ...) from code style.
+    projectServices.register(classOf[com.intellij.psi.codeStyle.JavaCodeStyleManager])(
+      new com.intellij.psi.impl.source.codeStyle.JavaCodeStyleManagerImpl(project))
+    // Java classes by short name, which auto-import fixes combine with the plugin's Scala index. The host has no
+    // Java short-name index yet (Java class files are read by qualified name): no Java class is offered.
+    projectServices.register(classOf[com.intellij.psi.search.PsiShortNamesCache])(new Host_PsiShortNamesCache(dispatch {
+      case ("PsiShortNamesCache.getClassesByName", _) => com.intellij.psi.PsiClass.EMPTY_ARRAY
+    }))
     // Auto-import exclusions, read by quick fixes that look for importable implicit instances: the defaults.
     projectServices.register(classOf[com.intellij.codeInsight.JavaProjectCodeInsightSettings])(new com.intellij.codeInsight.JavaProjectCodeInsightSettings)
     // No language injection in the host: every file is its own top-level file.

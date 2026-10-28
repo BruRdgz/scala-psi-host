@@ -45,6 +45,8 @@ lazy val root = (project in file("."))
       "com.jetbrains.intellij.platform" % "code-style-impl" % platformVersion intransitive(),
       // Java stub factories and serializers (JavaStubRegistryExtension): the stub schema of Java class files.
       "com.jetbrains.intellij.java" % "java-indexing-serializers" % platformVersion,
+      // PsiShortNamesCache, the Java short-name lookup auto-import fixes query. Only this jar.
+      "com.jetbrains.intellij.java" % "java-indexing" % platformVersion intransitive(),
       // Class-member model (PsiElementClassMember, ClassMemberWithElement): the plugin's members-to-implement
       // check, behind the "class needs to be abstract" error. Only these jars; nothing in them is registered.
       "com.jetbrains.intellij.java" % "java-impl" % platformVersion intransitive(),

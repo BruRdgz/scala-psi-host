@@ -42,13 +42,13 @@ class ModuleTest extends munit.FunSuite {
   }
 
   test("a module sees the sources of the modules it depends on, and no others") {
-    val core = host.addModule(ModuleSpec("core", "2.13.18", Seq.empty, Seq(library213)))
-    val app = host.addModule(ModuleSpec("app", "2.13.18", Seq.empty, Seq(library213), dependsOn = Seq("core")))
-    val coreFile = host.openSource("package core\nobject Core { val answer: Int = 42 }", core)
+    val lib = host.addModule(ModuleSpec("lib", "2.13.18", Seq.empty, Seq(library213)))
+    val client = host.addModule(ModuleSpec("client", "2.13.18", Seq.empty, Seq(library213), dependsOn = Seq("lib")))
+    val libFile = host.openSource("package lib\nobject Lib { val answer: Int = 42 }", lib)
     try {
-      val client = "object Client { val n: Int = core.Core.answer }"
-      assertEquals(errorsIn(app, client), Seq.empty)
-      assertEquals(errorsIn(scala213, client), Seq("Cannot resolve symbol core"))
-    } finally host.closeSource(coreFile)
+      val clientSource = "object Client { val n: Int = lib.Lib.answer }"
+      assertEquals(errorsIn(client, clientSource), Seq.empty)
+      assertEquals(errorsIn(scala213, clientSource), Seq("Cannot resolve symbol lib"))
+    } finally host.closeSource(libFile)
   }
 }
