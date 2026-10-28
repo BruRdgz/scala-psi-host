@@ -1,6 +1,10 @@
 package scalapsihost
 
+import com.intellij.codeInsight.daemon.impl.{AnnotationHolderImpl, AnnotationSessionImpl}
 import com.intellij.core.{CoreApplicationEnvironment, CoreFileTypeRegistry}
+import com.intellij.lang.annotation.HighlightSeverity
+import com.intellij.openapi.util.TextRange
+import com.intellij.psi.{PsiErrorElement, SyntaxTraverser}
 import com.intellij.psi.codeStyle.FileIndentOptionsProvider
 import com.intellij.psi.impl.source.tree.TreeCopyHandler
 import com.intellij.lang.{DefaultASTFactory, DefaultASTFactoryImpl, LanguageASTFactory, LanguageExtensionPoint, LanguageParserDefinitions, ParserDefinition, PsiBuilderFactory}
@@ -79,7 +83,30 @@ final class ScalaPsiHost private (
 
   /** Mounts the JDK's modules. Java classes are read on demand, not indexed. */
   def addJdk(javaHome: Path): Unit = libraryFiles.mountJdk(javaHome)
+
+  /**
+   * The problems the IDE's highlighting pass reports for `file`: syntax errors, and the plugin's `ScalaAnnotator`
+   * run over every element through the platform's annotation session. Presentation-only annotations (no message)
+   * are left out.
+   */
+  def diagnostics(file: ScalaFile): Seq[Diagnostic] = {
+    val syntaxErrors = SyntaxTraverser.psiTraverser(file).filter(classOf[PsiErrorElement]).asScala.toSeq.map { e =>
+      Diagnostic(HighlightSeverity.ERROR, e.getTextRange, e.getErrorDescription)
+    }
+    val annotator = new org.jetbrains.plugins.scala.annotator.ScalaAnnotator
+    val annotations = AnnotationSessionImpl.computeWithSession(file, /* batchMode = */ false, annotator, { holder =>
+      val impl = holder.asInstanceOf[AnnotationHolderImpl]
+      SyntaxTraverser.psiTraverser(file).forEach(e => impl.runAnnotatorWithContext(e))
+      impl.asScala.toSeq
+    })
+    syntaxErrors ++ annotations.collect {
+      case a if a.getMessage != null =>
+        Diagnostic(a.getSeverity, new TextRange(a.getStartOffset, a.getEndOffset), a.getMessage)
+    }
+  }
 }
+
+final case class Diagnostic(severity: HighlightSeverity, range: TextRange, message: String)
 
 object ScalaPsiHost {
   @volatile private var started: Option[ScalaPsiHost] = None
@@ -229,6 +256,12 @@ object ScalaPsiHost {
     appServices.register(classOf[com.intellij.openapi.editor.elf.Elf])(tableProxy(classOf[com.intellij.openapi.editor.elf.Elf], "Elf") {
       case ("runReadAction", Array(f: kotlin.jvm.functions.Function0[?])) => f.invoke().asInstanceOf[AnyRef]
     })
+    // The type-mismatch annotation fetches the global color scheme for its inlay hint, which the host turns off
+    // (ScalaProjectSettings below). The host has no colors: the scheme answers nothing.
+    lazy val noColors = tableProxy(classOf[com.intellij.openapi.editor.colors.EditorColorsScheme], "EditorColorsScheme")(PartialFunction.empty)
+    appServices.register(classOf[com.intellij.openapi.editor.colors.EditorColorsManager])(new Host_EditorColorsManager(dispatch {
+      case ("EditorColorsManager.getGlobalScheme", _) => noColors
+    }))
     // Platform library implementations used by Java PSI of library classes and by PSI copies.
     appServices.register(classOf[com.intellij.psi.util.JavaClassSupers])(new com.intellij.psi.impl.JavaClassSupersImpl)
     appServices.register(classOf[com.intellij.psi.PsiSubstitutorFactory])(new com.intellij.psi.impl.PsiSubstitutorFactoryImpl)
@@ -401,6 +434,16 @@ object ScalaPsiHost {
         finally Disposer.dispose(task)
         null
     }))
+    // The same holds for dependencies: libraries are indexed before the host answers, so highlighting is type-aware.
+    projectServices.register(classOf[com.intellij.openapi.project.IncompleteDependenciesService])(
+      tableProxy(classOf[com.intellij.openapi.project.IncompleteDependenciesService], "IncompleteDependenciesService") {
+        case ("getState" | "getStateUnsafe", _) => com.intellij.openapi.project.IncompleteDependenciesService.DependenciesState.COMPLETE
+      })
+    // Every file gets full highlighting ("All Problems"); the IDE's per-file level is a UI setting.
+    projectServices.register(classOf[com.intellij.codeInsight.daemon.impl.analysis.HighlightingLevelManager])(new Host_HighlightingLevelManager(dispatch {
+      case ("HighlightingLevelManager.shouldHighlight" | "HighlightingLevelManager.shouldInspect", _) => java.lang.Boolean.TRUE
+      case ("HighlightingLevelManager.runEssentialHighlightingOnly", _) => java.lang.Boolean.FALSE
+    }))
     // No module model yet.
     projectServices.register(classOf[com.intellij.openapi.module.ModuleManager])(new Host_ModuleManager(dispatch {
       case ("ModuleManager.getModules", _) => Array.empty[com.intellij.openapi.module.Module]
@@ -429,6 +472,7 @@ object ScalaPsiHost {
     // No language injection in the host: every file is its own top-level file.
     projectServices.register(classOf[com.intellij.lang.injection.InjectedLanguageManager])(new Host_InjectedLanguageManager(dispatch {
       case ("InjectedLanguageManager.getTopLevelFile", Array(e: com.intellij.psi.PsiElement)) => e.getContainingFile
+      case ("InjectedLanguageManager.isInjectedViewProvider", _) => java.lang.Boolean.FALSE
     }))
     // JVM-language-neutral class lookup that JavaPsiFacadeImpl also consults; no other JVM language provides classes.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.lang.jvm.facade.JvmElementProvider.EP_NAME.getName,
@@ -462,6 +506,8 @@ object ScalaPsiHost {
       val settings = new org.jetbrains.plugins.scala.settings.ScalaProjectSettings(project)
       // Library extensions are jars downloaded from build resolvers and loaded into the IDE: out of scope.
       settings.setEnableLibraryExtensions(false)
+      // Type mismatches as diagnostics on the expression, not as editor inlay hints (which LSP clients lack).
+      settings.setTypeMismatchHints(false)
       settings
     }
     projectServices.register(classOf[org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager])(
