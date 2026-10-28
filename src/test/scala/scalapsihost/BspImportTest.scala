@@ -29,12 +29,7 @@ class BspImportTest extends munit.FunSuite {
 
   test("the imported project highlights without errors") {
     TestHost.libraryReport // the JDK
-    // Dependencies before dependents, as the build lists them.
-    val ordered = Iterator.iterate((Seq.empty[ImportedModule], imported)) { (done, rest) =>
-      val (ready, waiting) = rest.partition(_.spec.dependsOn.forall(d => done.exists(_.spec.name == d)))
-      (done ++ ready, waiting)
-    }.dropWhile(_._2.nonEmpty).next()._1
-    val hostModules = ordered.map(m => m -> TestHost.host.addModule(m.spec))
+    val hostModules = imported.map(m => m -> TestHost.host.addModule(m.spec))
     val files = for ((m, hostModule) <- hostModules; source <- m.sources)
       yield fixture.relativize(source).toString -> TestHost.host.openSource(Files.readString(source), hostModule)
     try {

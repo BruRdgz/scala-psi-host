@@ -427,6 +427,13 @@ object ScalaPsiHost {
     val fileTypes = new CoreFileTypeRegistry
     fileTypes.registerFileType(org.jetbrains.plugins.scala.ScalaFileType.INSTANCE, "scala")
     fileTypes.registerFileType(com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, "class")
+    // Scala 3 library classes: the .tasty file is decompiled into Scala 3 PSI, its .class sibling is hidden.
+    fileTypes.registerFileType(org.jetbrains.plugins.scala.tasty.TastyFileType, "tasty")
+    // View providers of binary library files, by file type, as the IDE registers them.
+    com.intellij.psi.FileTypeFileViewProviders.INSTANCE.addExplicitExtension(
+      com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, new com.intellij.psi.ClassFileViewProviderFactory)
+    com.intellij.psi.FileTypeFileViewProviders.INSTANCE.addExplicitExtension(
+      org.jetbrains.plugins.scala.tasty.TastyFileType, new org.jetbrains.plugins.scala.tasty.TastyFileViewProviderFactory)
     FileTypeRegistry.setInstanceSupplier(() => fileTypes, root)
 
     // Class files become PSI as in the IDE: the first decompiler that accepts the file wins; the plugin's comes
@@ -438,6 +445,8 @@ object ScalaPsiHost {
     appServices.register(classOf[com.intellij.psi.compiled.ClassFileDecompilers])(newPrivate(classOf[com.intellij.psi.compiled.ClassFileDecompilers]))
     // Stubs of library class files are built on demand from their bytes (the core loader kotlinc uses), through the
     // platform's class-file stub builder, which defers to the same decompilers.
+    com.intellij.psi.stubs.BinaryFileStubBuilders.INSTANCE.addExplicitExtension(
+      org.jetbrains.plugins.scala.tasty.TastyFileType, new org.jetbrains.plugins.scala.tasty.TastyFileStubBuilder)
     com.intellij.psi.stubs.BinaryFileStubBuilders.INSTANCE.addExplicitExtension(
       com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, new com.intellij.psi.impl.compiled.ClassFileStubBuilder)
     appServices.register(classOf[com.intellij.psi.stubs.StubTreeLoader])(new com.intellij.psi.stubs.CoreStubTreeLoader)
@@ -490,8 +499,8 @@ object ScalaPsiHost {
     val directories = new ConcurrentHashMap[VirtualFile, com.intellij.psi.PsiDirectory]()
     var psiManagerRef: PsiManager = null
     def viewProvider(f: VirtualFile): FileViewProvider = viewProviders.computeIfAbsent(f, {
-      case lib: LibraryFile if lib.getName.endsWith(".class") =>
-        new com.intellij.psi.ClassFileViewProviderFactory().createFileViewProvider(lib, null, psiManagerRef, false)
+      case lib: LibraryFile if com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType) != null =>
+        com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType).createFileViewProvider(lib, null, psiManagerRef, false)
       case other => CallLog.unsupported(s"FileManager.findViewProvider for a file the host does not own: $other")
     })
     val fileManager = tableProxy(classOf[com.intellij.psi.impl.file.impl.FileManager], "FileManager") {
@@ -604,9 +613,12 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.psi.impl.JavaPsiImplementationHelper])(new Host_JavaPsiImplementationHelper(dispatch {
       case ("JavaPsiImplementationHelper.getClsFileNavigationElement", Array(f: com.intellij.psi.PsiJavaFile)) => f
     }))
-    // Java class-file parameters compiled without names get suggested names ("s", "i", ...) from code style.
-    projectServices.register(classOf[com.intellij.psi.codeStyle.JavaCodeStyleManager])(
-      new com.intellij.psi.impl.source.codeStyle.JavaCodeStyleManagerImpl(project))
+    // Java class-file parameters compiled without names: the IDE suggests names from Java code style (which needs
+    // Java code-style settings and IDE registry keys); without a suggestion the platform names them `p`, `p1`, ...
+    projectServices.register(classOf[com.intellij.psi.codeStyle.JavaCodeStyleManager])(new Host_JavaCodeStyleManager(dispatch {
+      // suggestCompiledParameterName takes the first suggestion: none.
+      case ("JavaCodeStyleManager.suggestVariableName", _) => com.intellij.psi.codeStyle.SuggestedNameInfo.NULL_INFO
+    }))
     // Java classes by short name, which auto-import fixes combine with the plugin's Scala index. The host has no
     // Java short-name index yet (Java class files are read by qualified name): no Java class is offered.
     projectServices.register(classOf[com.intellij.psi.search.PsiShortNamesCache])(new Host_PsiShortNamesCache(dispatch {
@@ -655,6 +667,10 @@ object ScalaPsiHost {
       val settings = new org.jetbrains.plugins.scala.settings.ScalaProjectSettings(project)
       // Library extensions are jars downloaded from build resolvers and loaded into the IDE: out of scope.
       settings.setEnableLibraryExtensions(false)
+      // The host has no compiler: errors always come from the plugin's own (type-aware) highlighting, also for Scala 3,
+      // where the IDE defaults to compiler-based highlighting.
+      settings.setCompilerHighlightingScala3(false)
+      settings.setCompilerHighlightingScala2(false)
       // Type mismatches as diagnostics on the expression, not as editor inlay hints (which LSP clients lack).
       settings.setTypeMismatchHints(false)
       settings
@@ -665,6 +681,9 @@ object ScalaPsiHost {
       new org.jetbrains.plugins.scala.lang.psi.types.api.StdTypes(using new ProjectContext(project)))
     projectServices.register(classOf[org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.SyntheticClasses])(
       new org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.SyntheticClasses(project))
+    // Scala 3 type operations (union joins).
+    projectServices.register(classOf[org.jetbrains.plugins.scala.lang.psi.types.Scala3Bounds])(
+      org.jetbrains.plugins.scala.lang.psi.types.Scala3Bounds(project))
     projectServices.register(classOf[org.jetbrains.plugins.scala.lang.macros.evaluator.ScalaMacroEvaluator])(
       new org.jetbrains.plugins.scala.lang.macros.evaluator.ScalaMacroEvaluator(project))
     // Private light services (@Service): the container builds them by class name, and so does the host.

@@ -63,7 +63,8 @@ lazy val root = (project in file("."))
       "com.jetbrains.intellij.xml" % "xml-syntax" % platformVersion intransitive(),
       // Libraries the plugin jars expect from the IDE distribution.
       "org.apache.maven" % "maven-artifact" % "3.9.9" intransitive(),
-      "org.jetbrains" % "markdown-jvm" % "0.7.3" intransitive(),
+      // The version the IDE bundles (lib/intellij.libraries.markdown.jar): same MarkdownParser API as 0.7.17.
+      "org.jetbrains" % "markdown-jvm" % "0.7.17" intransitive(),
       "org.apache.commons" % "commons-text" % "1.12.0" intransitive(),
       "org.scalameta" %% "munit" % "1.3.4" % Test,
       // 2.13.18 is the plugin's latest 2.13 (ScalaVersion.Latest): its library-highlighting test data is for these sources.

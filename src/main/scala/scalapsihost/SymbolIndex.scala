@@ -17,9 +17,10 @@ import scala.jdk.CollectionConverters.*
 /**
  * Outcome of indexing one library root.
  *
- * @param scalaIndexed top-level Scala class files whose decompiled PSI went into the index
+ * @param classFiles   class and TASTy files
+ * @param scalaIndexed top-level Scala class files and TASTy files whose decompiled PSI went into the index
  * @param javaClasses  Java class files: not indexed, the host's class finder reads them by path on demand
- * @param notTopLevel  class files without a PSI file of their own (inner and companion classes)
+ * @param notTopLevel  class files without a PSI file of their own (inner and companion classes, classes of TASTy files)
  * @param refused      Scala class files whose stubs could not be paired with their PSI; left out of the index
  */
 final case class LibraryIndexReport(
@@ -75,7 +76,7 @@ final class SymbolIndex {
   })
 
   /**
-   * Indexes the class files under `root` accepted by `includeEntry` (a path relative to the root, such as
+   * Indexes the class and TASTy files under `root` accepted by `includeEntry` (a path relative to the root, such as
    * `scala/Option.class`). PSI files come from the PsiManager, i.e. from the plugin's class-file decompiler.
    */
   def indexLibrary(project: Project, root: VirtualFile, includeEntry: String => Boolean): LibraryIndexReport = {
@@ -86,7 +87,7 @@ final class SymbolIndex {
       for (file <- dir.getChildren) {
         val relative = relativeDir + file.getName
         if (file.isDirectory) visit(file, relative + "/")
-        else if (file.getName.endsWith(".class") && includeEntry(relative)) {
+        else if ((file.getName.endsWith(".class") || file.getName.endsWith(".tasty")) && includeEntry(relative)) {
           classFiles += 1
           psiManager.findFile(file) match {
             case scalaFile: ScalaFile => if (indexScalaFile(scalaFile)) scalaIndexed += 1 else refused += relative

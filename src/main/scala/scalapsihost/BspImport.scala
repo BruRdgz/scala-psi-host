@@ -31,6 +31,7 @@ object BspImport {
   trait HostBuildServer extends BuildServer with ScalaBuildServer
 
   /**
+   * @return the Scala modules, each after the modules it depends on
    * @param connection the connection file's name (e.g. `sbt`) when `.bsp` has several; with one it may be omitted
    */
   def importBuild(projectDir: Path, connection: Option[String] = None, timeoutMinutes: Long = 10): Seq[ImportedModule] = {
@@ -84,10 +85,23 @@ object BspImport {
       }
       await(server.buildShutdown())
       server.onBuildExit()
-      modules
+      dependenciesFirst(modules)
     } finally {
       if (!process.waitFor(30, TimeUnit.SECONDS)) process.destroyForcibly()
     }
+  }
+
+  /** Each module after the modules it depends on, so they can be added to the host in order. */
+  private def dependenciesFirst(modules: Seq[ImportedModule]): Seq[ImportedModule] = {
+    val ordered = scala.collection.mutable.LinkedHashMap.empty[String, ImportedModule]
+    var waiting = modules
+    while (waiting.nonEmpty) {
+      val (ready, blocked) = waiting.partition(_.spec.dependsOn.forall(ordered.contains))
+      if (ready.isEmpty) throw new IllegalStateException(s"cyclic module dependencies among ${blocked.map(_.spec.name).mkString(", ")}")
+      ready.foreach(m => ordered(m.spec.name) = m)
+      waiting = blocked
+    }
+    ordered.values.toSeq
   }
 
   private def connectionDetails(projectDir: Path, connection: Option[String]): BspConnectionDetails = {

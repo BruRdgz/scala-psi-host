@@ -49,6 +49,7 @@ LibraryTablesRegistrar.getLibraryTable
 ManagingFS.readAttribute
 ManagingFS.writeAttribute
 MessageBusOwner.isDisposed
+MessageBusOwner.isParentLazyListenersIgnored (default)
 ModuleManager.getModules
 NonBlockingReadAction.executeSynchronously
 Project.getExtensionArea
