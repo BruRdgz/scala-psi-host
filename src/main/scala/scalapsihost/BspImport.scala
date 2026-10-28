@@ -250,5 +250,11 @@ object BspImport {
     override def onBuildTaskProgress(params: TaskProgressParams): Unit = ()
     override def onBuildTaskFinish(params: TaskFinishParams): Unit = ()
     override def onBuildTargetDidChange(params: DidChangeBuildTarget): Unit = ()
+
+    // sbt's own notifications, outside BSP: received so that the JSON-RPC layer does not report them as unsupported.
+    @org.eclipse.lsp4j.jsonrpc.services.JsonNotification("sbt/exec")
+    def onSbtExec(params: AnyRef): Unit = ()
+    @org.eclipse.lsp4j.jsonrpc.services.JsonNotification("shutdown")
+    def onSbtShutdown(params: AnyRef): Unit = ()
   }
 }

@@ -91,6 +91,13 @@ class LanguageServerTest extends munit.FunSuite {
     assert(hover.getContents.getRight.getValue.contains("def text: String"), hover.getContents.getRight.getValue)
   }
 
+  // The cursor on a declaration's own name (`Greeting` on line 2 of Greeting.scala).
+  test("shows the signature of the declaration under the cursor") {
+    val hover = server.getTextDocumentService.hover(new HoverParams(document(greeting), new Position(2, 20))).get(1, TimeUnit.MINUTES)
+    assert(hover != null, "no hover on a declaration's name")
+    assert(hover.getContents.getRight.getValue.contains("case class Greeting"), hover.getContents.getRight.getValue)
+  }
+
   test("goes to the declaration of the symbol under the cursor") {
     val locations = server.getTextDocumentService.definition(new DefinitionParams(document(main), new Position(6, 50)))
       .get(1, TimeUnit.MINUTES).getLeft.asScala.toSeq

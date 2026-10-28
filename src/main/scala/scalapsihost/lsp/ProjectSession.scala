@@ -96,12 +96,23 @@ final class ProjectSession private (
    */
   def hover(path: Path, at: LineColumn): Option[String] = host.read {
     val f = file(path)
+    val atOffset = offset(document(f), at)
+    // The referenced symbol, or the one declared at `at` when the cursor is on a declaration's name.
+    val subject = Option(f.findReferenceAt(atOffset)) match {
+      case Some(reference) => Option(reference.resolve()).map(_ -> reference.getElement)
+      case None => declarationNamedAt(f, atOffset).map(declaration => declaration -> declaration)
+    }
     for {
-      reference <- Option(f.findReferenceAt(offset(document(f), at)))
-      target <- Option(reference.resolve())
-      html <- ScalaDocQuickInfoGenerator.getQuickNavigateInfo(target, reference.getElement)
+      (target, original) <- subject
+      html <- ScalaDocQuickInfoGenerator.getQuickNavigateInfo(target, original)
     } yield StringUtil.unescapeXmlEntities(StringUtil.removeHtmlTags(html, true)).trim
   }
+
+  private def declarationNamedAt(file: PsiFile, at: Int): Option[PsiNameIdentifierOwner] =
+    Option(file.findElementAt(at)).flatMap { leaf =>
+      Option(com.intellij.psi.util.PsiTreeUtil.getParentOfType(leaf, classOf[PsiNameIdentifierOwner]))
+        .filter(owner => owner.getNameIdentifier != null && owner.getNameIdentifier.getTextRange.contains(at))
+    }
 
   /**
    * Where the symbol referenced at `at` is declared: its file and the position of its name. Only declarations in
