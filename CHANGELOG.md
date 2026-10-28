@@ -9,6 +9,8 @@
 - Document symbols, from the plugin's structure view.
 - Folding ranges, from the plugin's folding builder (with `//region` and `<editor-fold>` regions).
 - Semantic tokens: identifiers and soft keywords colored as the IDE colors them.
+- Build changes: the build is imported again after a change to its definition, or when source files are created or
+  deleted.
 
 ## 0.1.0-a1 — 2026-10-28
 

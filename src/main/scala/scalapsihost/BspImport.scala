@@ -61,10 +61,16 @@ final class BuildConnection private[scalapsihost] (
 
   private def await[T](f: java.util.concurrent.CompletableFuture[T]): T = f.get(timeoutMinutes, TimeUnit.MINUTES)
 
-  private lazy val scalaTargets: Seq[BuildTarget] =
-    await(server.workspaceBuildTargets()).getTargets.asScala.toSeq
+  // The build's Scala targets, asked for once per build definition (again after a reload).
+  @volatile private var targets: Option[Seq[BuildTarget]] = None
+
+  private def scalaTargets: Seq[BuildTarget] = targets.getOrElse {
+    val found = await(server.workspaceBuildTargets()).getTargets.asScala.toSeq
       .filter(_.getDataKind == BuildTargetDataKind.SCALA)
       .sortBy(_.getId.getUri)
+    targets = Some(found)
+    found
+  }
 
   /** The Scala modules, each after the modules it depends on. */
   def modules(): Seq[ImportedModule] = {
@@ -98,6 +104,12 @@ final class BuildConnection private[scalapsihost] (
       ImportedModule(spec, sourcesById.get(target.getId).toSeq.flatMap(BspImport.sourceFiles), compile)
     }
     BspImport.dependenciesFirst(modules)
+  }
+
+  /** Reloads the build's definition (after a change to it); the next [[modules]] describe the reloaded build. */
+  def reload(): Unit = {
+    await(server.workspaceReload())
+    targets = None
   }
 
   /**

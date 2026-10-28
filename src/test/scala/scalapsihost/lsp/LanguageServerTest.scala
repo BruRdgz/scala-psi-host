@@ -197,4 +197,55 @@ class LanguageServerTest extends munit.FunSuite {
       (19, 20, None),
     ))
   }
+
+  private def filesChanged(changes: (Path, FileChangeType)*): Unit = {
+    server.getWorkspaceService.didChangeWatchedFiles(new DidChangeWatchedFilesParams(
+      changes.map((path, kind) => new FileEvent(path.toUri.toString, kind)).asJava))
+  }
+
+  test("opens a source file created after the import, and lets it go when it is deleted") {
+    val added = fixture.resolve("core/src/main/scala/core/Added.scala")
+    Files.writeString(added, "package core\n\nobject Added {\n  val n: Int = Counter.zero.current\n}\n")
+    try {
+      filesChanged(added -> FileChangeType.Created)
+      server.getTextDocumentService.didOpen(new DidOpenTextDocumentParams(
+        new TextDocumentItem(added.toUri.toString, "scala", 1, Files.readString(added))))
+      assertEquals(errors(diagnosticsOf(added, 1)), Seq.empty)
+      // `zero` (line 3) is Counter's, on line 20 of Counter.scala.
+      val locations = server.getTextDocumentService.definition(new DefinitionParams(document(added), new Position(3, 23)))
+        .get(1, TimeUnit.MINUTES).getLeft.asScala.toSeq
+      assertEquals(locations.map(l => (l.getUri, l.getRange.getStart)), Seq((counter.toUri.toString, new Position(20, 6))))
+    } finally Files.delete(added)
+    filesChanged(added -> FileChangeType.Deleted)
+    // No longer a source: its problems are cleared, and nothing is answered about it.
+    assertEquals(diagnosticsOf(added, 1), Seq.empty)
+    assertEquals(server.getTextDocumentService.hover(new HoverParams(document(added), new Position(3, 23))).get(1, TimeUnit.MINUTES), null)
+  }
+
+  // Main.scala still has the unsaved change of the diagnostics test (`String` became `Int`). Without `-Xsource:3`,
+  // its `import core.*` is no wildcard import: the module's new options must reach the plugin.
+  test("imports the build again after a change to its definition, keeping unsaved changes") {
+    val buildFile = fixture.resolve("build.sbt")
+    val original = Files.readString(buildFile)
+    val typeMismatch = Seq("Type mismatch. Required: Int, found: String")
+    // A change that leaves the text as it is, under a new version: the server handles it after the build change
+    // (documents are handled in order), so its problems are those of the imported build.
+    def problemsAfterImport(version: Int) = {
+      val unchanged = new TextDocumentContentChangeEvent(new Range(new Position(6, 14), new Position(6, 17)), "Int")
+      server.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
+        new VersionedTextDocumentIdentifier(main.toUri.toString, version), java.util.List.of(unchanged)))
+      errors(diagnosticsOf(main, version))
+    }
+    try {
+      Files.writeString(buildFile, original.replace("""scalacOptions += "-Xsource:3"""", """scalacOptions += "-deprecation""""))
+      filesChanged(buildFile -> FileChangeType.Changed)
+      val withoutSource3 = problemsAfterImport(3)
+      assert(withoutSource3.nonEmpty && withoutSource3 != typeMismatch, withoutSource3)
+    } finally {
+      Files.writeString(buildFile, original)
+      filesChanged(buildFile -> FileChangeType.Changed)
+    }
+    // Back to the original options; the editor's text was kept through both imports.
+    assertEquals(problemsAfterImport(4), typeMismatch)
+  }
 }

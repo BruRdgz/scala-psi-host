@@ -136,8 +136,20 @@ final class ScalaPsiHost private (
 
   /** Removes a source file opened with [[openSource]] or [[openFile]] from the project. */
   def closeSource(file: PsiFile): Unit = HostLock.write {
+    val virtualFile = file.getViewProvider.getVirtualFile
     symbolIndex.removeFile(file)
-    modules.removeSource(file.getViewProvider.getVirtualFile)
+    modules.removeSource(virtualFile)
+    // The file store lets go of its view provider (and PSI): a file opened again at the same path is a new file.
+    PsiManager.getInstance(project).asInstanceOf[com.intellij.psi.impl.PsiManagerEx].getFileManager.setViewProvider(virtualFile, null)
+    psiChanged()
+  }
+
+  /**
+   * Removes a module whose source files were closed (after a build change); a module that depends on it is removed
+   * too, or added again with it. Its libraries stay mounted, for other modules and for the module added again.
+   */
+  def removeModule(name: String): Unit = HostLock.write {
+    modules.remove(name)
     psiChanged()
   }
 

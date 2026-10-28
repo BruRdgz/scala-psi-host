@@ -29,6 +29,7 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
   private val DiagnosticsDelayMs = 200L
 
   @volatile private var client: LanguageClient = scala.compiletime.uninitialized
+  @volatile private var watchesFiles = false
   @volatile private var shutdownRequested = false
   private val documents = Executors.newSingleThreadExecutor(daemon("scala-psi-host-documents"))
   private val diagnostics = Executors.newSingleThreadScheduledExecutor(daemon("scala-psi-host-diagnostics"))
@@ -45,6 +46,8 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
   override def connect(client: LanguageClient): Unit = this.client = client
 
   override def initialize(params: InitializeParams): CompletableFuture[InitializeResult] = {
+    watchesFiles = Option(params.getCapabilities).flatMap(c => Option(c.getWorkspace)).flatMap(w => Option(w.getDidChangeWatchedFiles))
+      .flatMap(w => Option(w.getDynamicRegistration)).exists(_.booleanValue)
     val folders = Option(params.getWorkspaceFolders).map(_.asScala.toSeq).getOrElse(Seq.empty)
     val rootUri = folders.headOption.map(_.getUri).orElse(Option(params.getRootUri))
       .getOrElse(throw new IllegalArgumentException("the client sent no workspace folder or root URI"))
@@ -63,7 +66,20 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
     CompletableFuture.completedFuture(new InitializeResult(capabilities, new ServerInfo("scala-psi-host", "0.1")))
   }
 
-  override def initialized(params: InitializedParams): Unit = ()
+  /**
+   * Asks the client to report changes to the build's definition (sbt files, `project/`) and created or deleted source
+   * files: either makes the server import the build again (see [[ProjectSession.importBuild]]).
+   */
+  override def initialized(params: InitializedParams): Unit =
+    if (watchesFiles) {
+      val changes = WatchKind.Create | WatchKind.Change | WatchKind.Delete
+      val watchers = Seq(
+        BuildDefinition.SbtFiles -> changes, BuildDefinition.ProjectFiles -> changes, BuildDefinition.BuildProperties -> changes,
+        "**/*.{scala,java}" -> (WatchKind.Create | WatchKind.Delete),
+      ).map((glob, kind) => new FileSystemWatcher(LspEither.forLeft[String, RelativePattern](glob), kind))
+      client.registerCapability(new RegistrationParams(java.util.List.of(new Registration(
+        "scala-psi-host-build-files", "workspace/didChangeWatchedFiles", new DidChangeWatchedFilesRegistrationOptions(watchers.asJava)))))
+    }
 
   override def shutdown(): CompletableFuture[AnyRef] = {
     shutdownRequested = true
@@ -98,9 +114,16 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
     onDocuments(s => sourcePath(s, document.getUri).fold(outside)(request(s, _)))
 
   private object TextDocuments extends LspServices.TextDocuments {
-    // Documents that are not project sources are not tracked.
+    // Documents that are not project sources are not tracked. A Scala or Java file that is not one yet may have just
+    // been created (the editor may open it before reporting its creation): the build is imported again first.
     override def didOpen(params: DidOpenTextDocumentParams): Unit = onDocuments { s =>
-      sourcePath(s, params.getTextDocument.getUri).foreach { path =>
+      val uri = params.getTextDocument.getUri
+      if (uri.startsWith("file:") && sourcePath(s, uri).isEmpty) {
+        val path = pathOf(uri)
+        val name = path.getFileName.toString
+        if ((name.endsWith(".scala") || name.endsWith(".java")) && !path.startsWith(host.stateDir)) s.importBuild(reload = false)
+      }
+      sourcePath(s, uri).foreach { path =>
         versions.put(path, params.getTextDocument.getVersion)
         // The editor's buffer may differ from the file on disk (unsaved changes).
         if (s.text(path) != params.getTextDocument.getText) s.change(path, None, params.getTextDocument.getText)
@@ -198,7 +221,8 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
   private def publishDiagnostics(path: Path, version: Integer): Unit =
     if (isCurrent(path, version)) {
       try {
-        val problems = session.join().problems(path)
+        // A file the build no longer has (deleted, or out of every module) has no problems left.
+        val problems = if (session.join().isSource(path)) session.join().problems(path) else Seq.empty
         if (isCurrent(path, version))
           client.publishDiagnostics(new PublishDiagnosticsParams(path.toUri.toString, problems.map(diagnostic).asJava, version))
       } catch {
@@ -226,6 +250,26 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
 
   private object Workspace extends LspServices.Workspace {
     override def didChangeConfiguration(params: DidChangeConfigurationParams): Unit = ()
-    override def didChangeWatchedFiles(params: DidChangeWatchedFilesParams): Unit = ()
+
+    // The build's definition changed (reload it), or source files were created or deleted: import the build again.
+    // Every open document's problems may change with it.
+    override def didChangeWatchedFiles(params: DidChangeWatchedFilesParams): Unit = onDocuments { s =>
+      val paths = params.getChanges.asScala.toSeq.map(_.getUri).filter(_.startsWith("file:")).map(pathOf)
+      s.importBuild(reload = paths.exists(BuildDefinition.isPart))
+      versions.keySet.forEach(scheduleDiagnostics)
+    }
+  }
+}
+
+/** Which files define an sbt build: the client watches them, and a change to one reloads the build. */
+private object BuildDefinition {
+  val SbtFiles = "**/*.sbt"
+  val ProjectFiles = "**/project/*.scala"
+  val BuildProperties = "**/project/build.properties"
+
+  def isPart(path: Path): Boolean = {
+    val name = path.getFileName.toString
+    val inProject = Option(path.getParent).exists(_.getFileName.toString == "project")
+    name.endsWith(".sbt") || (inProject && (name.endsWith(".scala") || name == "build.properties"))
   }
 }

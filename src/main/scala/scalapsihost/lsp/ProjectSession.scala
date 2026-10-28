@@ -70,16 +70,21 @@ object Fold {
 }
 
 /**
- * An open project: its build (kept connected, to compile on save), its modules in the host and every source file
- * of them, loaded from disk and then kept in step with the editor's changes. Positions are 0-based lines and
- * columns in UTF-16 code units, as LSP counts them and as documents index their text.
+ * An open project: its build (kept connected, to compile on save and to import again after a build change), its
+ * modules in the host and every source file of them, loaded from disk and then kept in step with the editor's
+ * changes. Positions are 0-based lines and columns in UTF-16 code units, as LSP counts them and as documents index
+ * their text.
  */
 final class ProjectSession private (
   host: ScalaPsiHost,
   build: BuildConnection,
-  files: ConcurrentHashMap[Path, PsiFile],
-  compileSpecs: Map[String, CompileSpec],
 ) extends AutoCloseable {
+  private val files = new ConcurrentHashMap[Path, PsiFile]()
+  // The build's modules as last imported (changed only by `importBuild`, on the session's thread).
+  @volatile private var imported: Seq[ImportedModule] = Seq.empty
+  @volatile private var compileSpecs: Map[String, CompileSpec] = Map.empty
+  // Classpath jars whose sources were asked for, attached or not.
+  private var sourcesAskedFor = Set.empty[Path]
   private val documentCompiler = new DocumentCompiler
   // The build's compiler problems from its last compile, by file (for files the document compiler does not cover).
   private val buildProblems = new AtomicReference[Map[Path, Seq[CompilerDiagnostic]]](Map.empty)
@@ -351,6 +356,55 @@ final class ProjectSession private (
     case _ => Seq.empty
   }
 
+  /**
+   * Imports the build's modules and applies them to the host: on opening, every module and its sources; after a
+   * build change, the difference. Sources the build added are opened (from disk) and those it removed closed; a
+   * module whose definition changed (Scala version, options, classpath, dependencies), and every module that
+   * depends on it, is removed and added again, its files reopened with their current text (unsaved editor changes
+   * are kept). `reload` first reloads the build's definition (after a change to it).
+   */
+  def importBuild(reload: Boolean): Unit = {
+    if (reload) build.reload()
+    val next = build.modules()
+    val before = imported.map(m => m.spec.name -> m).toMap
+    val after = next.map(m => m.spec.name -> m).toMap
+    val changed = before.keySet.filter(name => !after.get(name).exists(_.spec == before(name).spec))
+    // A module's dependents see it through their scopes: they are added again with it.
+    def dependents(names: Set[String]): Set[String] = {
+      val more = names ++ before.values.filter(_.spec.dependsOn.exists(names)).map(_.spec.name)
+      if (more == names) names else dependents(more)
+    }
+    val replaced = dependents(changed)
+    // Removed dependents first (reverse of the dependencies-first import order), keeping their files' text.
+    val reopened = scala.collection.mutable.Map.empty[Path, String]
+    for (m <- imported.reverse if replaced(m.spec.name)) {
+      for (source <- m.sources; file <- Option(files.remove(source))) {
+        reopened(source) = host.read(file.getText)
+        host.closeSource(file)
+      }
+      host.removeModule(m.spec.name)
+    }
+    for (m <- next) {
+      if (!before.contains(m.spec.name) || replaced(m.spec.name)) {
+        val module = host.addModule(m.spec)
+        for (source <- m.sources) open(source, reopened.getOrElse(source, Files.readString(source)), module)
+      } else {
+        val module = host.modules.named(m.spec.name).get
+        val (kept, now) = (before(m.spec.name).sources.toSet, m.sources.toSet)
+        for (source <- kept -- now; file <- Option(files.remove(source))) host.closeSource(file)
+        for (source <- now -- kept) open(source, Files.readString(source), module)
+      }
+    }
+    imported = next
+    compileSpecs = next.map(m => m.spec.name -> m.compile).toMap
+    // Library sources, as the IDE attaches them on import: the build's source jars (for jars not asked for before).
+    val classpath = next.flatMap(_.spec.classpath).toSet -- sourcesAskedFor
+    if (classpath.nonEmpty) for ((jar, sources) <- build.librarySources(classpath)) host.addLibrarySources(jar, sources)
+    sourcesAskedFor ++= classpath
+  }
+
+  private def open(source: Path, text: String, module: HostModule): Unit = files.put(source, host.openFile(source, text, module))
+
   /** After a save: compiles the build and keeps its problems; returns the files whose compiler problems changed. */
   def compileBuild(): Set[Path] = {
     val before = buildProblems.get
@@ -367,18 +421,13 @@ object ProjectSession {
   def open(host: ScalaPsiHost, root: Path, connection: Option[String] = None): ProjectSession = {
     val build = BspImport.connect(root, connection)
     try {
-      val imported = build.modules()
       val javaHome = Path.of(System.getProperty("java.home"))
       host.addJdk(javaHome)
-      val files = new ConcurrentHashMap[Path, PsiFile]()
-      for (m <- imported) {
-        val module = host.addModule(m.spec)
-        for (source <- m.sources) files.put(source, host.openFile(source, Files.readString(source), module))
-      }
-      // Library sources, as the IDE attaches them on import: the build's source jars, and the JDK's src.zip.
-      for ((jar, sources) <- build.librarySources(imported.flatMap(_.spec.classpath).toSet)) host.addLibrarySources(jar, sources)
+      // The JDK's sources, as the IDE attaches them to the JDK.
       Some(javaHome.resolve("lib/src.zip")).filter(Files.isRegularFile(_)).foreach(host.addJdkSources)
-      new ProjectSession(host, build, files, imported.map(m => m.spec.name -> m.compile).toMap)
+      val session = new ProjectSession(host, build)
+      session.importBuild(reload = false)
+      session
     } catch {
       case e: Throwable =>
         build.close()

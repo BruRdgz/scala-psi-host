@@ -32,6 +32,11 @@ What the host provides instead of the IDE:
 - **Project model** from the build, over BSP: one module per Scala build target, with its Scala version (a Scala SDK
   library), compiler options (a compiler-settings profile), classpath jars and module dependencies, and a resolve
   scope per module.
+- **Build changes**: the client watches the build's definition (`*.sbt`, `project/`) and created or deleted source
+  files; on a change the server imports the build again (reloading its definition first when it changed) and
+  applies the difference: new sources are opened, removed ones closed, and a module whose definition changed is
+  added again with the modules that depend on it, its files reopened with the editor's text. Requests wait while
+  the build reloads.
 - **Files**: library jars and the JDK as read-only virtual files (`LibraryFileSystem`); project sources as physical
   files (`SourceFile`) whose text is the editor's. Library PSI is stub-based, as in the IDE (Scala 3 libraries from
   TASTy); source syntax trees can be dropped and rebuilt under memory pressure.

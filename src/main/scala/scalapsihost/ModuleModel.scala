@@ -57,6 +57,14 @@ final class ModuleModel(project: Project) {
       throw new IllegalArgumentException(s"module ${hostModule.spec.name} already exists")
   }
 
+  /** Removes a module whose sources were removed; modules that depend on it must be removed or added again too. */
+  private[scalapsihost] def remove(name: String): Unit = {
+    val removed = Option(modules.remove(name)).getOrElse(throw new IllegalArgumentException(s"no module named $name"))
+    if (!removed.sources.isEmpty) throw new IllegalStateException(s"module $name still has sources")
+    // Scopes of the modules that depend on it reach it.
+    scopes.clear()
+  }
+
   private[scalapsihost] def addSource(file: VirtualFile, hostModule: HostModule): Unit = {
     hostModule.sources.add(file)
     moduleOfFile.put(file, hostModule)

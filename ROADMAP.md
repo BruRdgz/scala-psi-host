@@ -24,7 +24,6 @@ agrees with the host, and the cases that do not agree are explained in the READM
 
 - Measurements: hover and definition latency, memory over long sessions.
 - A real Scala 2 project as an acceptance test.
-- Reacting to build changes (reimport).
 
 ## Alpha 3 — project-wide search
 
