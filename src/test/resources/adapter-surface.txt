@@ -9,6 +9,7 @@ Application.isInternal
 Application.isReadAccessAllowed
 Application.isUnitTestMode
 Application.loadClass
+Application.service com.intellij.lang.DefaultASTFactory
 Application.service com.intellij.lang.PsiBuilderFactory
 Application.service com.intellij.openapi.application.AsyncExecutionService
 Application.service com.intellij.openapi.command.CommandProcessor

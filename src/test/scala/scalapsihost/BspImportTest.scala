@@ -61,6 +61,12 @@ class BspImportTest extends munit.FunSuite {
         TestHost.host.diagnostics(file).filter(_.severity == HighlightSeverity.ERROR).map(d => s"$path ${d.range}: ${d.message}")
       }
       assertEquals(errors, Seq.empty)
+      // Java source PSI has its typed leaves (the class name is a PsiIdentifier).
+      val javaClasses = files.collect { case (_, file: com.intellij.psi.PsiJavaFile) => file.getClasses.toSeq.map(_.getName) }.flatten
+      assertEquals(javaClasses, Seq("Shout"))
+      // Nothing left the host's tables or was logged as an error on the way (both would hide problems).
+      val swallowed = CallLog.snapshot.map(_._1).filter(e => e.startsWith("UNSUPPORTED ") || e.startsWith("LOGGED ERROR "))
+      assertEquals(swallowed, Seq.empty)
     } finally files.foreach((_, file) => TestHost.host.closeSource(file))
   }
 }

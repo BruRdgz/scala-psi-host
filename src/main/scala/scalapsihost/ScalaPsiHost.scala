@@ -420,6 +420,9 @@ object ScalaPsiHost {
       })
     // Annotations carry their quick fixes, which the platform wraps as intentions when the annotation is created.
     appServices.register(classOf[com.intellij.modcommand.ModCommandService])(new com.intellij.lang.impl.modcommand.ModCommandServiceImpl)
+    // Java module (JPMS) accessibility: the host has no module-info graph (its modules come from the build), so the
+    // platform's graph-less implementation, which treats every class as accessible.
+    appServices.register(classOf[com.intellij.psi.JavaModuleGraphHelper])(new com.intellij.psi.DumbJavaModuleGraphHelper)
     // Platform library implementations used by Java PSI of library classes and by PSI copies.
     appServices.register(classOf[com.intellij.psi.util.JavaClassSupers])(new com.intellij.psi.impl.JavaClassSupersImpl)
     appServices.register(classOf[com.intellij.psi.PsiSubstitutorFactory])(new com.intellij.psi.impl.PsiSubstitutorFactoryImpl)
@@ -437,6 +440,8 @@ object ScalaPsiHost {
     parserDefinitions.foreach(pd => LanguageParserDefinitions.INSTANCE.addExplicitExtension(pd.getFileNodeType.getLanguage, pd))
     // Java sources of mixed projects.
     LanguageParserDefinitions.INSTANCE.addExplicitExtension(com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.lang.java.JavaParserDefinition)
+    // Java's typed leaves (PsiIdentifier, PsiKeyword, ...): Java PSI casts its tokens to them.
+    LanguageASTFactory.INSTANCE.addExplicitExtension(com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.psi.impl.source.tree.JavaASTFactory)
     com.intellij.platform.syntax.psi.LanguageSyntaxDefinitions.getINSTANCE.addExplicitExtension(
       com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.java.frontback.psi.impl.syntax.JavaSyntaxDefinitionExtension)
     com.intellij.platform.syntax.psi.ElementTypeConverters.getInstance.addExplicitExtension(
@@ -695,6 +700,8 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.psi.impl.file.impl.JavaFileManager])(
       tableProxy(classOf[com.intellij.psi.impl.file.impl.JavaFileManager], "JavaFileManager")(PartialFunction.empty))
     projectServices.register(classOf[com.intellij.psi.JavaPsiFacade])(new com.intellij.psi.impl.JavaPsiFacadeImpl(project, null))
+    // Resolution inside Java sources (mixed projects).
+    projectServices.register(classOf[com.intellij.psi.PsiResolveHelper])(new com.intellij.psi.impl.source.resolve.PsiResolveHelperImpl(project))
     // ScalaDocParserDefinition reads TAB_SIZE from code style: one fixed settings object, never the scheme manager.
     projectServices.register(classOf[com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager]) {
       val m = new com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager(project, /* loadExtensions = */ false)
