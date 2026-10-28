@@ -14,6 +14,7 @@ import com.intellij.openapi.application.{Application, ApplicationManager, Modali
 import com.intellij.openapi.extensions.{DefaultPluginDescriptor, Extensions, PluginId}
 import com.intellij.openapi.extensions.impl.{ExtensionPointImpl, ExtensionsAreaImpl}
 import com.intellij.openapi.fileTypes.FileTypeRegistry
+import com.intellij.openapi.module.Module
 import com.intellij.openapi.progress.{EmptyProgressIndicator, ProgressManager}
 import com.intellij.openapi.progress.impl.CoreProgressManager
 import com.intellij.openapi.project.{DumbModeTask, DumbService, Project}
@@ -50,8 +51,11 @@ final class ScalaPsiHost private (
   val project: Project,
   symbolIndex: SymbolIndex,
   libraryFiles: LibraryFileSystem,
+  val modules: ModuleModel,
   psiChanged: () => Unit,
 ) {
+  // Library jars by real path: a jar on the classpath of several modules is mounted and indexed once.
+  private val libraryRoots = new ConcurrentHashMap[Path, VirtualFile]()
 
   /** A file outside the project: parsed, but invisible to symbol lookups (as the IDE's non-physical files). */
   def parse(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile =
@@ -61,9 +65,27 @@ final class ScalaPsiHost private (
    * A project source file: its declarations are indexed, so other files and the file itself find them by name,
    * as for a file under an IDE source root. Fails when its stubs cannot be paired with its PSI.
    */
-  def openSource(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile = {
-    val file = parse(text, features)
-    if (!symbolIndex.indexScalaFile(file)) throw new IllegalStateException("source file stubs could not be paired with its PSI")
+  def openSource(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile =
+    index(parse(text, features))
+
+  /**
+   * A source file of `module`: parsed with the module's language features (Scala version, compiler options) and
+   * resolved in the module's scope.
+   */
+  def openSource(text: String, module: HostModule): ScalaFile = {
+    val file = parse(text, org.jetbrains.plugins.scala.project.ModuleExt(module.module).features)
+    // The file is non-physical (no PsiFile.getVirtualFile): the platform finds its module through this key, as for
+    // code fragments.
+    file.putUserData(com.intellij.openapi.module.ModuleUtilCore.KEY_MODULE, module.module)
+    modules.addSource(file.getViewProvider.getVirtualFile, module)
+    index(file)
+  }
+
+  private def index(file: ScalaFile): ScalaFile = {
+    if (!symbolIndex.indexScalaFile(file)) {
+      modules.removeSource(file.getViewProvider.getVirtualFile)
+      throw new IllegalStateException("source file stubs could not be paired with its PSI")
+    }
     psiChanged()
     file
   }
@@ -71,20 +93,88 @@ final class ScalaPsiHost private (
   /** Removes a source file opened with [[openSource]] from the project. */
   def closeSource(file: ScalaFile): Unit = {
     symbolIndex.removeFile(file)
+    modules.removeSource(file.getViewProvider.getVirtualFile)
     psiChanged()
   }
 
   /** Mounts a library jar and indexes its Scala class files accepted by `includeEntry` (e.g. `scala/Option.class`). */
   def addLibrary(jar: Path, includeEntry: String => Boolean = _ => true): LibraryIndexReport = {
-    val report = symbolIndex.indexLibrary(project, libraryFiles.mountJar(jar), includeEntry)
+    val root = libraryFiles.mountJar(jar)
+    libraryRoots.put(jar.toRealPath(), root)
+    val report = symbolIndex.indexLibrary(project, root, includeEntry)
     psiChanged()
     report
   }
 
-  /** Mounts the JDK's modules. Java classes are read on demand, not indexed. */
+  /** Mounts the JDK's modules. Java classes are read on demand, not indexed. Every module sees the JDK. */
   def addJdk(javaHome: Path): Unit = {
-    libraryFiles.mountJdk(javaHome)
+    modules.setJdkRoots(libraryFiles.mountJdk(javaHome))
     psiChanged()
+  }
+
+  /**
+   * Adds a module as an IDE module after a build import: the jars of its classpath are mounted and indexed (each
+   * jar once, however many modules use it), its Scala version becomes a Scala SDK library and its compiler options
+   * a compiler-settings profile, from which the plugin derives the module's language features.
+   * Classpath entries must be jars; the class directories of other modules are given by `dependsOn`.
+   */
+  def addModule(spec: ModuleSpec): HostModule = {
+    val notJars = spec.classpath.filterNot(_.getFileName.toString.endsWith(".jar"))
+    if (notJars.nonEmpty) throw new IllegalArgumentException(s"module ${spec.name}: classpath entries are not jars: ${notJars.mkString(", ")}")
+    val roots = spec.classpath.map { jar =>
+      Option(libraryRoots.get(jar.toRealPath())).getOrElse { addLibrary(jar); libraryRoots.get(jar.toRealPath()) }
+    }
+    val hostModule = new HostModule(spec, roots.toSet)
+    hostModule.module = newModule(hostModule)
+    modules.add(hostModule)
+    org.jetbrains.plugins.scala.project.settings.ScalaCompilerConfiguration.instanceIn(project).configureSettingsForModule(
+      spec.name, "bsp",
+      org.jetbrains.plugins.scala.project.settings.ScalaCompilerSettings.fromOptions(
+        spec.scalacOptions, org.jetbrains.plugins.scala.compiler.data.CompileOrder.Mixed))
+    org.jetbrains.plugins.scala.project.settings.ScalaCompilerConfiguration.incModificationCount()
+    psiChanged()
+    hostModule
+  }
+
+  /**
+   * The IDE `Module` object of a host module. Its only order entry the plugin reads is the Scala SDK library, which
+   * carries the module's Scala version; the classpath jars are not presented as libraries (scopes come from
+   * [[ModuleModel]]).
+   */
+  private def newModule(hostModule: HostModule): Module = {
+    val data = new UserDataHolderBase
+    val sdkProperties = org.jetbrains.plugins.scala.project.ScalaLibraryProperties(
+      Some(hostModule.spec.scalaVersion), Seq.empty, Seq.empty, None, org.jetbrains.plugins.scala.project.ReplClasspath.Bundled)
+    lazy val scalaSdk: com.intellij.openapi.roots.impl.libraries.LibraryEx =
+      tableProxy(classOf[com.intellij.openapi.roots.impl.libraries.LibraryEx], "ScalaSdkLibrary") {
+        // ScalaModuleSettings reads the compiler version from the library name, as for an imported "scala-sdk-x.y.z".
+        case ("getName", _) => s"scala-sdk-${hostModule.spec.scalaVersion}"
+        case ("getKind", _) => org.jetbrains.plugins.scala.project.ScalaLibraryType.Kind
+        case ("getProperties", _) => sdkProperties
+        case ("isDisposed", _) => java.lang.Boolean.FALSE
+      }
+    lazy val orderEntries: com.intellij.openapi.roots.OrderEnumerator = new Host_OrderEnumerator(dispatch {
+      // Filters that keep libraries leave the one entry in place.
+      case ("OrderEnumerator.withoutSdk" | "OrderEnumerator.withoutDepModules" | "OrderEnumerator.withoutModuleSourceEntries"
+            | "OrderEnumerator.recursively" | "OrderEnumerator.exportedOnly" | "OrderEnumerator.compileOnly"
+            | "OrderEnumerator.productionOnly", _) => orderEntries
+      case ("OrderEnumerator.forEachLibrary", Array(p: com.intellij.util.Processor[?])) =>
+        p.asInstanceOf[com.intellij.util.Processor[com.intellij.openapi.roots.libraries.Library]].process(scalaSdk); null
+    })
+    lazy val rootManager: com.intellij.openapi.roots.ModuleRootManager = new Host_ModuleRootManager(dispatch {
+      case ("ModuleRootManager.orderEntries", _) => orderEntries
+      case ("ModuleRootManager.getModule", _) => module
+    })
+    lazy val module: Module = tableProxy(classOf[Module], "Module") {
+      case ("getName", _) => hostModule.spec.name
+      case ("getProject", _) => project
+      case ("isDisposed", _) => java.lang.Boolean.FALSE
+      case ("getModuleTypeName", _) => "JAVA_MODULE"
+      case ("getService", Array(c: Class[?])) if c == classOf[com.intellij.openapi.roots.ModuleRootManager] => rootManager
+      case ("getUserData", Array(k: Key[?])) => data.getUserData(k).asInstanceOf[AnyRef]
+      case ("putUserData", Array(k: Key[?], v)) => data.putUserData(k.asInstanceOf[Key[AnyRef]], v); null
+    }
+    module
   }
 
   /**
@@ -378,6 +468,7 @@ object ScalaPsiHost {
       case ("getForLanguage" | "forLanguage", _) => psiModificationCount
     }
     lazy val projectBus = new MessageBusFactoryImpl().createMessageBus(busOwner, appBus)
+    lazy val moduleModel = new ModuleModel(project)
     lazy val project: Project = tableProxy(classOf[Project], "Project") {
       case ("getService", Array(c: Class[?])) => projectServices.get(c)
       case ("getServiceIfCreated", Array(c: Class[?])) => projectServices.get(c)
@@ -421,10 +512,13 @@ object ScalaPsiHost {
       // No library sources are attached yet, so no workspace library or SDK entity has any to offer.
       case ("isInLibrarySource", _) => java.lang.Boolean.FALSE
       case ("findContainingLibraries" | "findContainingSdks", _) => java.util.List.of()
-      // No module model yet: language features are attached per file instead.
-      case ("getModuleForFile", _) => null
+      // Files opened in a module; other files (light files, libraries) have none.
+      case ("getModuleForFile", Array(f: VirtualFile, _*)) => moduleModel.ofFile(f).map(_.module).orNull
       case ("isInSourceContent" | "isInContent" | "isInSource", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(!isLibraryClass(f))
       case ("isInTestSourceContent", _) => java.lang.Boolean.FALSE
+      // Every source file the host was given is a production source; the plugin's filter scopes ask by root type.
+      case ("isUnderSourceRootOfType", Array(f: VirtualFile, types: java.util.Set[?])) =>
+        java.lang.Boolean.valueOf(!isLibraryClass(f) && types.contains(org.jetbrains.jps.model.java.JavaSourceRootType.SOURCE))
     }
     projectServices.register(classOf[com.intellij.openapi.roots.ProjectFileIndex])(fileIndex)
     // The same answers through the platform's facade (ClassFileViewProvider asks it before building Java PSI).
@@ -449,6 +543,9 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.psi.PsiFileFactory])(new com.intellij.psi.impl.PsiFileFactoryImpl(psiManager))
     projectServices.register(classOf[com.intellij.openapi.roots.ProjectRootManager])(new Host_ProjectRootManager(dispatch {
       case ("ProjectRootManager.getFileIndex", _) => fileIndex
+      // Each host module carries its root manager (see ScalaPsiHost.newModule).
+      case ("ProjectRootManager.getModuleRootManager", Array(m: Module)) =>
+        m.getService(classOf[com.intellij.openapi.roots.ModuleRootManager])
     }))
     // The host's indexes are always ready before it answers queries.
     projectServices.register(classOf[DumbService])(new Host_DumbService(dispatch {
@@ -474,10 +571,13 @@ object ScalaPsiHost {
       case ("HighlightingLevelManager.shouldHighlight" | "HighlightingLevelManager.shouldInspect", _) => java.lang.Boolean.TRUE
       case ("HighlightingLevelManager.runEssentialHighlightingOnly", _) => java.lang.Boolean.FALSE
     }))
-    // No module model yet.
     projectServices.register(classOf[com.intellij.openapi.module.ModuleManager])(new Host_ModuleManager(dispatch {
-      case ("ModuleManager.getModules", _) => Array.empty[com.intellij.openapi.module.Module]
+      case ("ModuleManager.getModules", _) => moduleModel.all.map(_.module).toArray
+      case ("ModuleManager.findModuleByName", Array(name: String)) => moduleModel.named(name).map(_.module).orNull
     }))
+    // Compiler settings per module, configured from the build's scalac options as the plugin's importers do.
+    projectServices.register(classOf[org.jetbrains.plugins.scala.project.settings.ScalaCompilerConfiguration])(
+      new org.jetbrains.plugins.scala.project.settings.ScalaCompilerConfiguration(project))
     // PSI write path: the plugin edits non-physical copies (e.g. for-comprehension desugaring).
     projectServices.register(classOf[com.intellij.pom.PomModel])(new com.intellij.pom.core.impl.PomModelImpl(project))
     projectServices.register(classOf[com.intellij.pom.tree.TreeAspect])(new com.intellij.pom.tree.TreeAspect)
@@ -525,9 +625,13 @@ object ScalaPsiHost {
       m
     }
     projectServices.register(classOf[com.intellij.psi.impl.ResolveScopeManager])(new Host_ResolveScopeManager(dispatch {
-      // One scope for everything until build targets exist (phase F2).
-      case ("ResolveScopeManager.getResolveScope" | "ResolveScopeManager.getDefaultResolveScope" | "ResolveScopeManager.getUseScope", _) =>
-        new com.intellij.psi.search.EverythingGlobalScope(project)
+      // A module's files resolve in the module's scope; files outside modules (light files, library classes) see
+      // everything.
+      case ("ResolveScopeManager.getResolveScope" | "ResolveScopeManager.getUseScope", Array(e: com.intellij.psi.PsiElement)) =>
+        val file = Option(e.getContainingFile).map(_.getOriginalFile.getViewProvider.getVirtualFile)
+        file.flatMap(moduleModel.ofFile).map(moduleModel.resolveScope).getOrElse(new com.intellij.psi.search.EverythingGlobalScope(project))
+      case ("ResolveScopeManager.getDefaultResolveScope", Array(f: VirtualFile)) =>
+        moduleModel.ofFile(f).map(moduleModel.resolveScope).getOrElse(new com.intellij.psi.search.EverythingGlobalScope(project))
     }))
     // Index-backed Scala symbol lookup: the real class, answered by the host's StubIndex.
     projectServices.register(classOf[org.jetbrains.plugins.scala.caches.ScalaShortNamesCacheManager])(
@@ -585,7 +689,7 @@ object ScalaPsiHost {
       org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager.instance(project).clearOnNonScalaChange()
     }
 
-    new ScalaPsiHost(project, symbolIndex, libraryFiles, () => psiChanged())
+    new ScalaPsiHost(project, symbolIndex, libraryFiles, moduleModel, () => psiChanged())
   }
 
   private def newPrivate[T](cls: Class[T], args: AnyRef*): T = {

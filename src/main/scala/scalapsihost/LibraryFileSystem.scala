@@ -116,19 +116,18 @@ final class LibraryFile private[scalapsihost] (
   override def isValid: Boolean = true
   override def getParent: VirtualFile = parent
 
-  override def getChildren: Array[VirtualFile] =
-    if (!directory) VirtualFile.EMPTY_ARRAY
+  // Listed once: library contents do not change while mounted, and class lookup asks every root for every
+  // package segment, which through the zip and jrt file systems dominated highlighting time.
+  private lazy val childrenByName: Map[String, LibraryFile] =
+    if (!directory) Map.empty
     else Using.resource(Files.list(nioPath)) { entries =>
-      entries.iterator().asScala.toVector.sortBy(_.getFileName.toString).map(p => fs.child(this, p): VirtualFile).toArray
+      entries.iterator().asScala.map(p => p.getFileName.toString.stripSuffix("/") -> fs.child(this, p)).toMap
     }
 
-  // Direct lookup: large packages (java.util, scala.collection) would make the default child scan quadratic.
-  override def findChild(name: String): VirtualFile =
-    if (!directory) null
-    else {
-      val p = nioPath.resolve(name)
-      if (Files.exists(p)) fs.child(this, p) else null
-    }
+  override def getChildren: Array[VirtualFile] =
+    childrenByName.toVector.sortBy(_._1).map(_._2: VirtualFile).toArray
+
+  override def findChild(name: String): VirtualFile = childrenByName.getOrElse(name, null)
 
   override def contentsToByteArray(): Array[Byte] = Files.readAllBytes(nioPath)
   override def getInputStream: InputStream = Files.newInputStream(nioPath)

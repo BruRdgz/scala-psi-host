@@ -50,6 +50,10 @@ lazy val root = (project in file("."))
       "com.jetbrains.intellij.java" % "java-impl" % platformVersion intransitive(),
       "com.jetbrains.intellij.platform" % "lang-impl" % platformVersion intransitive(),
       "com.jetbrains.intellij.platform" % "lang" % platformVersion intransitive(),
+      // External-system data model (model.Key, model.project.*): the plugin's sbt constants, read when it checks for sbt build
+      // modules. Only this jar; no external system runs.
+      "com.jetbrains.intellij.platform" % "external-system" % platformVersion intransitive(),
+      "com.jetbrains.intellij.platform" % "external-system-rt" % platformVersion intransitive(),
       // XML PSI: ScalaDoc and XML literals parse through it.
       "com.jetbrains.intellij.xml" % "xml-psi" % platformVersion intransitive(),
       "com.jetbrains.intellij.xml" % "xml-psi-impl" % platformVersion intransitive(),

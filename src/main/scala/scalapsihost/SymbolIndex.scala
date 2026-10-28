@@ -5,6 +5,7 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.SimpleModificationTracker
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.{PsiElement, PsiFile, PsiJavaFile, PsiManager}
+import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.stubs.{IndexSink, ObjectStubSerializer, StubElement, StubElementRegistryService, StubIndex, StubIndexKey}
 import com.intellij.util.Processor
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
@@ -53,13 +54,18 @@ final class SymbolIndex {
       CallLog.hit(s"GAP index files ${args(0)} key=${args(1)}"); java.util.Collections.emptyIterator()
     case ("StubIndex.getAllKeys", Array(k: StubIndexKey[?, ?], _*)) =>
       java.util.List.copyOf(keys.getOrDefault(k.getName, java.util.Set.of()))
-    case ("StubIndex.processElements", Array(k: StubIndexKey[?, ?], key, _, _, _, required: Class[?], proc: Processor[?])) =>
+    case ("StubIndex.processElements", Array(k: StubIndexKey[?, ?], key, _, scope, _, required: Class[?], proc: Processor[?])) =>
       val found = elements.get((k.getName, normKey(key)))
       if (found == null) { CallLog.hit(s"GAP index ${k.getName}"); java.lang.Boolean.TRUE }
       else {
         CallLog.hit(s"HIT index ${k.getName}")
+        // Only elements of files in the caller's scope (a module's dependencies), as the IDE's index filters them.
+        def inScope(e: PsiElement) = scope match {
+          case s: GlobalSearchScope => s.contains(e.getContainingFile.getViewProvider.getVirtualFile)
+          case _ => true
+        }
         val p = proc.asInstanceOf[Processor[PsiElement]]
-        java.lang.Boolean.valueOf(found.asScala.filter(required.isInstance).forall(p.process))
+        java.lang.Boolean.valueOf(found.asScala.filter(e => required.isInstance(e) && inScope(e)).forall(p.process))
       }
     case ("StubIndex.processAllKeys", Array(k: StubIndexKey[?, ?], proc: Processor[?], _*)) =>
       val p = proc.asInstanceOf[Processor[AnyRef]]
