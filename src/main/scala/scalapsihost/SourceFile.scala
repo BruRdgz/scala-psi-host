@@ -15,4 +15,8 @@ final class SourceFile(val path: Path, fileType: FileType, text: String)
   setCharset(java.nio.charset.StandardCharsets.UTF_8)
 
   override def getPath: String = path.toString
+
+  // No assigned language, unlike other light files (e.g. the plugin's REPL input): as for an IDE file, the language
+  // comes from the file type through language substitution, which picks Scala 3 for a Scala 3 module's file.
+  override def getLanguage: com.intellij.lang.Language = null
 }

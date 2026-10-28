@@ -19,6 +19,16 @@ class EditingTest extends munit.FunSuite {
   private def errors(file: ScalaFile): Seq[String] =
     host.diagnostics(file).filter(_.severity == HighlightSeverity.ERROR).map(_.message)
 
+  // The platform picks a physical file's language; for a module on Scala 3 the plugin's substitutor makes it Scala 3.
+  test("a source of a Scala 3 module is Scala 3") {
+    val scala3 = host.addModule(ModuleSpec("editing3", "3.3.4", Seq.empty, Seq(Path.of(sys.props("scalapsihost.fixture.scalaLibrary")))))
+    val file = host.openFile(Path.of("/editing3/C.scala"), "object C:\n  def f(b: Boolean): Int = if b then 1 else 2\n", scala3)
+    try {
+      assertEquals(file.getLanguage, org.jetbrains.plugins.scala.Scala3Language.INSTANCE)
+      assertEquals(errors(file.asInstanceOf[ScalaFile]), Seq.empty)
+    } finally host.closeSource(file)
+  }
+
   test("an edit is reparsed in place and changes what other files see") {
     val aText = "object A { def f: Int = 1 }\n"
     val a = host.openFile(Path.of("/editing/A.scala"), aText, module).asInstanceOf[ScalaFile]

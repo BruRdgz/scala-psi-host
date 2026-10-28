@@ -49,12 +49,8 @@ object ProjectHighlighting {
 
     val t2 = System.nanoTime()
     // Java sources are opened so Scala code resolves their classes; only Scala files are highlighted.
-    val opened = for ((m, hostModule) <- modules; source <- m.sources) yield {
-      val text = Files.readString(source)
-      val path = projectDir.relativize(source).toString
-      if (source.toString.endsWith(".java")) path -> host.openJavaSource(source.getFileName.toString, text, hostModule)
-      else path -> host.openSource(text, hostModule)
-    }
+    val opened = for ((m, hostModule) <- modules; source <- m.sources)
+      yield projectDir.relativize(source).toString -> host.openFile(source, Files.readString(source), hostModule)
     val files = opened.collect { case (path, file: org.jetbrains.plugins.scala.lang.psi.api.ScalaFile) => path -> file }
     val openMs = millisSince(t2)
 

@@ -9,6 +9,7 @@ Application.isDisposed
 Application.isInternal
 Application.isReadAccessAllowed
 Application.isUnitTestMode
+Application.isWriteAccessAllowed
 Application.loadClass
 Application.service com.intellij.lang.DefaultASTFactory
 Application.service com.intellij.lang.PsiBuilderFactory
@@ -47,6 +48,10 @@ FileManager.findCachedViewProvider
 FileManager.findDirectory
 FileManager.findFile
 FileManager.setViewProvider
+FileTypeManager.getFileTypeByExtension
+FileTypeManager.getFileTypeByFile
+FileTypeManager.getRegisteredFileTypes
+FileTypeManager.isFileIgnored
 LibraryTable.addListener
 LibraryTablesRegistrar.getLibraryTable
 ManagingFS.readAttribute

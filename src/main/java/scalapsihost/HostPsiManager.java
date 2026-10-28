@@ -83,7 +83,8 @@ public final class HostPsiManager extends PsiManagerEx {
   @Override public void cleanupForNextTest() { no("cleanupForNextTest"); }
   @Override public void dropResolveCacheRegularly(ProgressIndicator i) { no("dropResolveCacheRegularly"); }
   @Override public void setAssertOnFileLoadingFilter(VirtualFileFilter f, Disposable d) { no("setAssertOnFileLoadingFilter"); }
-  @Override public boolean isAssertOnFileLoading(VirtualFile f) { return no("isAssertOnFileLoading"); }
+  // A test-only guard against unexpected file loading; the host never sets one.
+  @Override public boolean isAssertOnFileLoading(VirtualFile f) { hit("isAssertOnFileLoading"); return false; }
   @Override public FileManager getFileManager() { hit("getFileManager"); return fileManager; }
   @Override public FileManagerEx getFileManagerEx() { hit("getFileManagerEx"); return fileManager; }
   @Override public void addTreeChangePreprocessor(PsiTreeChangePreprocessor p, Disposable d) { no("addTreeChangePreprocessor"); }

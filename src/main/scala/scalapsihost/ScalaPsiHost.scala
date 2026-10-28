@@ -390,6 +390,10 @@ object ScalaPsiHost {
     }
     // Languages that stand for groups of languages in language extensions; none in the host.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.lang.MetaLanguage.EP_NAME, classOf[com.intellij.lang.MetaLanguage])
+    // Smart pointers' anchors and element icons: no providers in the host.
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.impl.smartPointers.SmartPointerAnchorProvider.EP_NAME,
+      classOf[com.intellij.psi.impl.smartPointers.SmartPointerAnchorProvider])
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.ide.IconProvider.EXTENSION_POINT_NAME, classOf[com.intellij.ide.IconProvider])
     // Java class files look for their source mirror through these policies; the host attaches no library sources.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy.EP_NAME,
       classOf[com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy])
@@ -533,6 +537,8 @@ object ScalaPsiHost {
     val scalaLang = org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE
     val scala3Lang = org.jetbrains.plugins.scala.Scala3Language.INSTANCE
     LanguageASTFactory.INSTANCE.addExplicitExtension(scalaLang, new org.jetbrains.plugins.scala.lang.parser.ScalaASTFactory)
+    // A .scala file of a Scala 3 module is Scala 3 (the plugin's substitutor reads the file's module).
+    com.intellij.psi.LanguageSubstitutors.getInstance.addExplicitExtension(scalaLang, new org.jetbrains.plugins.scala.lang.parser.ScalaLanguageSubstitutor)
     val viewProviderFactory = new org.jetbrains.plugins.scala.lang.psi.ScFileViewProviderFactory
     LanguageFileViewProviders.INSTANCE.addExplicitExtension(scalaLang, viewProviderFactory)
     LanguageFileViewProviders.INSTANCE.addExplicitExtension(scala3Lang, viewProviderFactory)
@@ -573,7 +579,18 @@ object ScalaPsiHost {
       com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, new com.intellij.psi.ClassFileViewProviderFactory)
     com.intellij.psi.FileTypeFileViewProviders.INSTANCE.addExplicitExtension(
       org.jetbrains.plugins.scala.tasty.TastyFileType, new org.jetbrains.plugins.scala.tasty.TastyFileViewProviderFactory)
-    FileTypeRegistry.setInstanceSupplier(() => fileTypes, root)
+    // The registry is also the FileTypeManager: FileTypeManager.getInstance falls back to an empty manager (which
+    // answers a mock file type for everything) when the registry is not one. Lookups go to the core registry above.
+    val fileTypeManager = new Host_FileTypeManager(dispatch {
+      case ("FileTypeManager.getFileTypeByFileName", Array(name: String)) => fileTypes.getFileTypeByFileName(name)
+      case ("FileTypeManager.getFileTypeByExtension", Array(extension: String)) => fileTypes.getFileTypeByExtension(extension)
+      case ("FileTypeManager.getFileTypeByFile", Array(f: VirtualFile)) => fileTypes.getFileTypeByFile(f)
+      case ("FileTypeManager.findFileTypeByName", Array(name: String)) => fileTypes.findFileTypeByName(name)
+      case ("FileTypeManager.getRegisteredFileTypes", _) => fileTypes.getRegisteredFileTypes
+      // Files come from the build's source roots and library jars; none is ignored.
+      case ("FileTypeManager.isFileIgnored", _) => java.lang.Boolean.FALSE
+    })
+    FileTypeRegistry.setInstanceSupplier(() => fileTypeManager, root)
 
     // Class files become PSI as in the IDE: the first decompiler that accepts the file wins; the plugin's comes
     // before the platform's Java decompiler.
@@ -642,7 +659,9 @@ object ScalaPsiHost {
       // Project sources are physical too: their syntax tree follows document commits (reparse) and can be dropped
       // when no one holds it. The language's view provider when it has one (Scala), the platform's default otherwise.
       case source: SourceFile =>
-        val language = source.getFileType.asInstanceOf[com.intellij.openapi.fileTypes.LanguageFileType].getLanguage
+        // As the IDE's FileManagerImpl: the file type's language, as substituted for this file (Scala 3 modules).
+        val language = com.intellij.psi.LanguageSubstitutors.getInstance.substituteLanguage(
+          source.getFileType.asInstanceOf[com.intellij.openapi.fileTypes.LanguageFileType].getLanguage, source, project)
         Option(LanguageFileViewProviders.INSTANCE.forLanguage(language))
           .map(_.createFileViewProvider(source, language, psiManagerRef, true))
           .getOrElse(new com.intellij.psi.SingleRootFileViewProvider(psiManagerRef, source, true))
@@ -783,6 +802,11 @@ object ScalaPsiHost {
     // Java short-name index yet (Java class files are read by qualified name): no Java class is offered.
     projectServices.register(classOf[com.intellij.psi.search.PsiShortNamesCache])(new Host_PsiShortNamesCache(dispatch {
       case ("PsiShortNamesCache.getClassesByName", _) => com.intellij.psi.PsiClass.EMPTY_ARRAY
+    }))
+    // Annotation lookups cache by owner; the host has no mirrored elements (light copies of sources), so an owner is
+    // its own cache key.
+    projectServices.register(classOf[com.intellij.codeInsight.AnnotationCacheOwnerNormalizer])(new Host_AnnotationCacheOwnerNormalizer(dispatch {
+      case ("AnnotationCacheOwnerNormalizer.doNormalize", Array(owner)) => owner
     }))
     // Auto-import exclusions, read by quick fixes that look for importable implicit instances: the defaults.
     projectServices.register(classOf[com.intellij.codeInsight.JavaProjectCodeInsightSettings])(new com.intellij.codeInsight.JavaProjectCodeInsightSettings)
