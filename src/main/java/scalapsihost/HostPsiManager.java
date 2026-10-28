@@ -22,35 +22,51 @@ import com.intellij.psi.util.PsiModificationTracker;
 public final class HostPsiManager extends PsiManagerEx {
   private final Project project;
   private final PsiModificationTracker tracker;
-  private final FileManager fileManager;
+  private final FileManagerEx fileManager;
+  private final PsiTreeChangePreprocessor preprocessor;
+  private final java.util.List<PsiTreeChangeListener> listeners;
 
-  public HostPsiManager(Project project, PsiModificationTracker tracker, FileManager fileManager) {
+  /**
+   * @param preprocessor sees every tree change first (the IDE's PsiModificationTrackerImpl counts them there)
+   * @param listeners    then see it, as PsiTreeChangeListeners registered with the IDE's PsiManagerImpl
+   */
+  public HostPsiManager(Project project, PsiModificationTracker tracker, FileManagerEx fileManager,
+                        PsiTreeChangePreprocessor preprocessor, java.util.List<PsiTreeChangeListener> listeners) {
     this.project = project;
     this.tracker = tracker;
     this.fileManager = fileManager;
+    this.preprocessor = preprocessor;
+    this.listeners = listeners;
+  }
+
+  /** As PsiManagerImpl: the preprocessor, then each listener. */
+  private void fire(String name, PsiTreeChangeEventImpl e, java.util.function.Consumer<PsiTreeChangeListener> toListener) {
+    hit(name);
+    preprocessor.treeChanged(e);
+    listeners.forEach(toListener);
   }
 
   private static <T> T no(String name) { return CallLog.unsupported("PsiManager." + name); }
   private static void hit(String name) { CallLog.hit("PsiManager." + name); }
 
-  // Supported: identity, lifecycle and tree-change notifications (no listeners exist in the host).
+  // Supported: identity, lifecycle and tree-change notifications.
   @Override public Project getProject() { hit("getProject"); return project; }
   @Override public boolean isDisposed() { hit("isDisposed"); return false; }
   @Override public boolean areElementsEquivalent(PsiElement a, PsiElement b) { hit("areElementsEquivalent"); return a == b; }
   @Override public PsiModificationTracker getModificationTracker() { hit("getModificationTracker"); return tracker; }
   @Override public boolean isBatchFilesProcessingMode() { hit("isBatchFilesProcessingMode"); return false; }
-  @Override public void beforeChildAddition(PsiTreeChangeEventImpl e) { hit("beforeChildAddition"); }
-  @Override public void beforeChildRemoval(PsiTreeChangeEventImpl e) { hit("beforeChildRemoval"); }
-  @Override public void beforeChildReplacement(PsiTreeChangeEventImpl e) { hit("beforeChildReplacement"); }
-  @Override public void beforeChildrenChange(PsiTreeChangeEventImpl e) { hit("beforeChildrenChange"); }
-  @Override public void beforeChildMovement(PsiTreeChangeEventImpl e) { hit("beforeChildMovement"); }
-  @Override public void beforePropertyChange(PsiTreeChangeEventImpl e) { hit("beforePropertyChange"); }
-  @Override public void childAdded(PsiTreeChangeEventImpl e) { hit("childAdded"); }
-  @Override public void childRemoved(PsiTreeChangeEventImpl e) { hit("childRemoved"); }
-  @Override public void childReplaced(PsiTreeChangeEventImpl e) { hit("childReplaced"); }
-  @Override public void childMoved(PsiTreeChangeEventImpl e) { hit("childMoved"); }
-  @Override public void childrenChanged(PsiTreeChangeEventImpl e) { hit("childrenChanged"); }
-  @Override public void propertyChanged(PsiTreeChangeEventImpl e) { hit("propertyChanged"); }
+  @Override public void beforeChildAddition(PsiTreeChangeEventImpl e) { fire("beforeChildAddition", e, l -> l.beforeChildAddition(e)); }
+  @Override public void beforeChildRemoval(PsiTreeChangeEventImpl e) { fire("beforeChildRemoval", e, l -> l.beforeChildRemoval(e)); }
+  @Override public void beforeChildReplacement(PsiTreeChangeEventImpl e) { fire("beforeChildReplacement", e, l -> l.beforeChildReplacement(e)); }
+  @Override public void beforeChildrenChange(PsiTreeChangeEventImpl e) { fire("beforeChildrenChange", e, l -> l.beforeChildrenChange(e)); }
+  @Override public void beforeChildMovement(PsiTreeChangeEventImpl e) { fire("beforeChildMovement", e, l -> l.beforeChildMovement(e)); }
+  @Override public void beforePropertyChange(PsiTreeChangeEventImpl e) { fire("beforePropertyChange", e, l -> l.beforePropertyChange(e)); }
+  @Override public void childAdded(PsiTreeChangeEventImpl e) { fire("childAdded", e, l -> l.childAdded(e)); }
+  @Override public void childRemoved(PsiTreeChangeEventImpl e) { fire("childRemoved", e, l -> l.childRemoved(e)); }
+  @Override public void childReplaced(PsiTreeChangeEventImpl e) { fire("childReplaced", e, l -> l.childReplaced(e)); }
+  @Override public void childMoved(PsiTreeChangeEventImpl e) { fire("childMoved", e, l -> l.childMoved(e)); }
+  @Override public void childrenChanged(PsiTreeChangeEventImpl e) { fire("childrenChanged", e, l -> l.childrenChanged(e)); }
+  @Override public void propertyChanged(PsiTreeChangeEventImpl e) { fire("propertyChanged", e, l -> l.propertyChanged(e)); }
   @Override public void beforeChange(boolean physical) { hit("beforeChange"); }
   @Override public void afterChange(boolean physical) { hit("afterChange"); }
 
@@ -69,7 +85,7 @@ public final class HostPsiManager extends PsiManagerEx {
   @Override public void setAssertOnFileLoadingFilter(VirtualFileFilter f, Disposable d) { no("setAssertOnFileLoadingFilter"); }
   @Override public boolean isAssertOnFileLoading(VirtualFile f) { return no("isAssertOnFileLoading"); }
   @Override public FileManager getFileManager() { hit("getFileManager"); return fileManager; }
-  @Override public FileManagerEx getFileManagerEx() { return no("getFileManagerEx"); }
+  @Override public FileManagerEx getFileManagerEx() { hit("getFileManagerEx"); return fileManager; }
   @Override public void addTreeChangePreprocessor(PsiTreeChangePreprocessor p, Disposable d) { no("addTreeChangePreprocessor"); }
   @Override public void addTreeChangePreprocessor(PsiTreeChangePreprocessor p) { no("addTreeChangePreprocessor"); }
   @Override public void removeTreeChangePreprocessor(PsiTreeChangePreprocessor p) { no("removeTreeChangePreprocessor"); }

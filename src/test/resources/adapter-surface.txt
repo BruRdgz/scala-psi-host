@@ -1,4 +1,5 @@
 Application.assertReadAccessAllowed
+Application.assertWriteAccessAllowed
 Application.getExtensionArea
 Application.getLockProhibitedAdvice (default)
 Application.getMessageBus
@@ -12,6 +13,7 @@ Application.loadClass
 Application.service com.intellij.lang.DefaultASTFactory
 Application.service com.intellij.lang.PsiBuilderFactory
 Application.service com.intellij.openapi.application.AsyncExecutionService
+Application.service com.intellij.openapi.application.TransactionGuard
 Application.service com.intellij.openapi.command.CommandProcessor
 Application.service com.intellij.openapi.fileEditor.FileDocumentManager
 Application.service com.intellij.openapi.progress.ProgressManager
@@ -21,6 +23,7 @@ Application.service com.intellij.psi.ExternalChangeActionUtil$PsiExternalChangeS
 Application.service com.intellij.psi.LanguageSubstitutors
 Application.service com.intellij.psi.codeStyle.CodeStyleSettingsService
 Application.service com.intellij.psi.compiled.ClassFileDecompilers
+Application.service com.intellij.psi.impl.DocumentCommitProcessor
 Application.service com.intellij.psi.impl.java.stubs.JavaStubElementTypePsiElementMappingRegistry
 Application.service com.intellij.psi.stubs.StubElementRegistryService
 Application.service com.intellij.psi.stubs.StubIndex
@@ -30,7 +33,6 @@ Application.service org.jetbrains.plugins.scala.lang.psi.api.expr.ExpectedTypes
 Application.service org.jetbrains.plugins.scala.scalaMeta.ScalaMetaApi
 Application.service org.jetbrains.plugins.scala.settings.ScalaApplicationSettings
 Application.service(null) com.intellij.psi.ParsingDiagnostics$ParserDiagnosticsHandler
-Application.service(null) com.intellij.psi.impl.DocumentCommitProcessor
 Application.service(null) com.intellij.psi.impl.source.tree.mvcc.PsiVersioningGarbageCollector
 AsyncExecutionService.buildNonBlockingReadAction
 CodeStyleSettingsService.addListener
@@ -107,6 +109,5 @@ PsiManager.getModificationTracker
 PsiManager.getProject
 PsiManager.isBatchFilesProcessingMode
 PsiManager.isDisposed
-PsiModificationTracker.getModificationCount
 ResolveScopeManager.getResolveScope
 StubIndex.processElements

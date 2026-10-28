@@ -18,7 +18,7 @@ import com.intellij.openapi.module.Module
 import com.intellij.openapi.progress.{EmptyProgressIndicator, ProgressManager}
 import com.intellij.openapi.progress.impl.CoreProgressManager
 import com.intellij.openapi.project.{DumbModeTask, DumbService, Project}
-import com.intellij.openapi.util.{Disposer, Key, SimpleModificationTracker, UserDataHolderBase}
+import com.intellij.openapi.util.{Disposer, Key, UserDataHolderBase}
 import com.intellij.openapi.util.registry.Registry
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.{FileViewProvider, LanguageFileViewProviders, PsiManager}
@@ -112,7 +112,42 @@ final class ScalaPsiHost private (
     file
   }
 
-  /** Removes a source file opened with [[openSource]] from the project. */
+  /**
+   * Opens a project source file of `module` (Scala or Java, by extension) with the given text: a physical file whose
+   * PSI follows edits made with [[edit]], as a file open in an IDE editor.
+   */
+  def openFile(path: Path, text: String, module: HostModule): PsiFile = {
+    val fileType = FileTypeRegistry.getInstance.getFileTypeByFileName(path.getFileName.toString)
+    val source = new SourceFile(path, fileType, text)
+    modules.addSource(source, module)
+    val file = index(PsiManager.getInstance(project).findFile(source))
+    // The document manager learns of document changes as a document listener (in the IDE, through the editor's
+    // global event multicaster), so that a commit reparses what changed.
+    val documents = com.intellij.psi.PsiDocumentManager.getInstance(project)
+    documents.getDocument(file).addDocumentListener(documents.asInstanceOf[com.intellij.openapi.editor.event.DocumentListener])
+    file
+  }
+
+  /**
+   * Replaces `file`'s text between `start` and `end` (offsets) with `replacement`, as an editor change: the document
+   * changes and is committed, the platform reparses the changed range, and the resulting tree changes reach the
+   * plugin's caches. The file's index entries are then rebuilt.
+   */
+  def edit(file: PsiFile, start: Int, end: Int, replacement: String): Unit = {
+    val documents = com.intellij.psi.PsiDocumentManager.getInstance(project)
+    val document = documents.getDocument(file)
+    if (document == null) throw new IllegalArgumentException(s"$file has no document: only files opened with openFile can be edited")
+    ApplicationManager.getApplication.runWriteAction((() => {
+      document.replaceString(start, end, replacement)
+      documents.commitDocument(document)
+    }): Runnable)
+    // Work the commit scheduled for the UI thread (after-commit actions) runs before the edit returns.
+    HostDispatchThread.drain()
+    symbolIndex.removeFile(file)
+    if (!symbolIndex.indexSourceFile(file)) throw new IllegalStateException(s"stubs of the edited $file could not be paired with its PSI")
+  }
+
+  /** Removes a source file opened with [[openSource]] or [[openFile]] from the project. */
   def closeSource(file: PsiFile): Unit = {
     symbolIndex.removeFile(file)
     modules.removeSource(file.getViewProvider.getVirtualFile)
@@ -277,10 +312,20 @@ object ScalaPsiHost {
       case ("getExtensionArea", _) => area
       case ("getMessageBus", _) => appBus
       // The host has no UI thread and no write actions: every caller may read.
-      case ("isDispatchThread", _) => java.lang.Boolean.FALSE
+      case ("isDispatchThread", _) => java.lang.Boolean.valueOf(HostDispatchThread.isCurrent)
       case ("isWriteIntentLockAcquired", _) => java.lang.Boolean.FALSE
       case ("isReadAccessAllowed", _) => java.lang.Boolean.TRUE
-      case ("isWriteAccessAllowed", _) => java.lang.Boolean.FALSE
+      case ("isWriteAccessAllowed", _) => java.lang.Boolean.valueOf(HostWriteAction.isRunning)
+      // Work for the UI thread runs on the host's dispatch thread.
+      case ("invokeLater", Array(r: Runnable, _*)) => HostDispatchThread.invokeLater(r); null
+      // No modal dialogs exist in the host.
+      case ("getDefaultModalityState", _) => ModalityState.nonModal()
+      case ("assertWriteAccessAllowed", _) =>
+        if (!HostWriteAction.isRunning) throw new IllegalStateException("write access is allowed inside write actions only")
+        null
+      // Edits run in write actions on the caller's thread, one at a time (see HostWriteAction).
+      case ("runWriteAction", Array(r: Runnable)) => HostWriteAction.run(r.run()); null
+      case ("runWriteAction", Array(c: com.intellij.openapi.util.Computable[?])) => HostWriteAction.run(c.compute()).asInstanceOf[AnyRef]
       case ("assertReadAccessAllowed" | "assertIsNonDispatchThread" | "assertReadAccessNotAllowed", _) => null
       case ("isUnitTestMode", _) => java.lang.Boolean.valueOf(config.unitTestMode)
       case ("isInternal" | "isEAP" | "isDisposed", _) => java.lang.Boolean.FALSE
@@ -292,9 +337,10 @@ object ScalaPsiHost {
       case ("createError", Array(t: Throwable, _*)) => new RuntimeException(t)
       case ("runReadAction", Array(r: Runnable)) => r.run(); null
       case ("tryRunReadAction", Array(r: Runnable)) => r.run(); java.lang.Boolean.TRUE
-      // In unit-test mode the plugin runs some startup work on the UI thread; the host has none, so it runs here.
-      case ("invokeAndWait", Array(r: Runnable, _*)) if config.unitTestMode => r.run(); null
+      // In unit-test mode the plugin runs some startup work on the UI thread: the host's dispatch thread.
+      case ("invokeAndWait", Array(r: Runnable, _*)) if config.unitTestMode => HostDispatchThread.invokeAndWait(r); null
       case ("runReadAction", Array(c: com.intellij.openapi.util.Computable[?])) => c.compute().asInstanceOf[AnyRef]
+      case ("runReadAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) => c.compute().asInstanceOf[AnyRef]
     }
     ApplicationManager.setApplication(app, root)
     Extensions.setRootArea(area)
@@ -356,11 +402,24 @@ object ScalaPsiHost {
     appServices.register(classOf[DefaultASTFactory])(new DefaultASTFactoryImpl)
     // In-memory documents; in the LSP host these become the client's snapshots.
     appServices.register(classOf[com.intellij.openapi.fileEditor.FileDocumentManager])(
-      new com.intellij.mock.MockFileDocumentManagerImpl(null, (text: CharSequence) => new com.intellij.openapi.editor.impl.DocumentImpl(text)))
+      // Documents for use off the UI thread (the platform's option for background documents): the host has no UI
+      // thread, and its write action keeps writers apart.
+      new com.intellij.mock.MockFileDocumentManagerImpl(null, (text: CharSequence) =>
+        new com.intellij.openapi.editor.impl.DocumentImpl(text, /* forUseInNonAWTThread = */ true)))
     // PSI writes check command state; the core processor tracks it without UI or undo.
     appServices.register(classOf[com.intellij.openapi.command.CommandProcessor])(new com.intellij.openapi.command.impl.CoreCommandProcessor)
-    // The asynchronous document commit pipeline: the host commits synchronously and provides none.
-    appServices.registerNull(classOf[com.intellij.psi.impl.DocumentCommitProcessor])
+    // PSI versioning (MVCC): the platform's service, which with persistent syntax trees off (the registry default)
+    // creates plain PSI elements during reparses.
+    appServices.register(classOf[com.intellij.psi.util.PsiVersioningService])(new com.intellij.psi.impl.source.tree.mvcc.PsiVersioningServiceImpl)
+    // "Run on the UI thread, carrying the write action": the host has no UI thread and the caller already holds the
+    // write action, so the action runs where it is.
+    appServices.register(classOf[com.intellij.util.concurrency.TransferredWriteActionService])(
+      tableProxy(classOf[com.intellij.util.concurrency.TransferredWriteActionService], "TransferredWriteActionService") {
+        case ("runOnEdtWithTransferredWriteActionAndWait" | "runOnBackgroundThreadWithTransferredWriteActionAndWait", Array(r: Runnable)) =>
+          r.run(); null
+      })
+    // Document commits: synchronous, on the editing thread.
+    appServices.register(classOf[com.intellij.psi.impl.DocumentCommitProcessor])(new HostDocumentCommitProcessor)
     // Read through serviceOrNull: PSI MVCC is off by default (registry psi.enable.persistent.syntax.tree=false).
     appServices.registerNull(classOf[com.intellij.psi.impl.source.tree.mvcc.PsiVersioningGarbageCollector])
     // Optional diagnostics hook; the caller null-checks it.
@@ -402,6 +461,8 @@ object ScalaPsiHost {
     // The editor's read/write-action facade, reached from CodeStyle.getSettings: the host's callers may always read.
     appServices.register(classOf[com.intellij.openapi.editor.elf.Elf])(tableProxy(classOf[com.intellij.openapi.editor.elf.Elf], "Elf") {
       case ("runReadAction", Array(f: kotlin.jvm.functions.Function0[?])) => f.invoke().asInstanceOf[AnyRef]
+      // Documents are plain platform documents, outside the editor's Elf scope.
+      case ("isInElfScope", _) => java.lang.Boolean.FALSE
     })
     // Annotations fetch the global color scheme for presentation (inlay hints, error-stripe-only attributes). The
     // host presents nothing: every key has empty attributes.
@@ -418,6 +479,25 @@ object ScalaPsiHost {
         case ("createPluginExceptionByClass", Array(message: String, cause, _)) =>
           new com.intellij.diagnostic.PluginException(message, cause.asInstanceOf[Throwable], null)
       })
+    // Usage statistics (FUS), which the plugin logs while highlighting: turned off. Building an event would create a
+    // device id in the user's Java preferences, which the user's IntelliJ installations share. Every recorder gets
+    // no providers, so event logging has nothing to log to and builds no event. The provider map is private platform
+    // state; if it changes, this fails at startup.
+    locally {
+      val holder = new com.intellij.internal.statistic.eventLog.StatisticsEventLogProvidersHolder(
+        kotlinx.coroutines.CoroutineScopeKt.CoroutineScope(kotlin.coroutines.EmptyCoroutineContext.INSTANCE))
+      type Providers = java.util.Collection[com.intellij.internal.statistic.eventLog.StatisticsEventLoggerProvider]
+      val noProviders = new java.util.AbstractMap[String, Providers] {
+        override def get(recorder: Any): Providers = java.util.List.of()
+        override def entrySet(): java.util.Set[java.util.Map.Entry[String, Providers]] = java.util.Set.of()
+      }
+      val field = classOf[com.intellij.internal.statistic.eventLog.StatisticsEventLogProvidersHolder].getDeclaredField("eventLoggerProvidersExt")
+      field.setAccessible(true)
+      field.get(holder).asInstanceOf[java.util.concurrent.atomic.AtomicReference[java.util.Map[String, Providers]]].set(noProviders)
+      appServices.register(classOf[com.intellij.internal.statistic.eventLog.StatisticsEventLogProvidersHolder])(holder)
+    }
+    // Write-safety checks of PSI change notifications: they only check the UI thread, which the host never runs on.
+    appServices.register(classOf[com.intellij.openapi.application.TransactionGuard])(new com.intellij.openapi.application.TransactionGuardImpl)
     // Annotations carry their quick fixes, which the platform wraps as intentions when the annotation is created.
     appServices.register(classOf[com.intellij.modcommand.ModCommandService])(new com.intellij.lang.impl.modcommand.ModCommandServiceImpl)
     // Java module (JPMS) accessibility: the host has no module-info graph (its modules come from the build), so the
@@ -530,11 +610,8 @@ object ScalaPsiHost {
     }))
 
     // ---- 3. Project object -----------------------------------------------------------------
-    val psiModificationCount = new SimpleModificationTracker
-    val psiModTracker: PsiModificationTracker = tableProxy(classOf[PsiModificationTracker], "PsiModificationTracker") {
-      case ("getModificationCount", _) => java.lang.Long.valueOf(psiModificationCount.getModificationCount)
-      case ("getForLanguage" | "forLanguage", _) => psiModificationCount
-    }
+    // The platform's modification tracker: it counts the tree changes edits produce (see HostPsiManager).
+    lazy val psiModTracker = new com.intellij.psi.impl.PsiModificationTrackerImpl(project)
     lazy val projectBus = new MessageBusFactoryImpl().createMessageBus(busOwner, appBus)
     lazy val moduleModel = new ModuleModel(project)
     lazy val project: Project = tableProxy(classOf[Project], "Project") {
@@ -562,10 +639,21 @@ object ScalaPsiHost {
       // front, while a physical one stays stub-based until something navigates into it.
       case lib: LibraryFile if com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType) != null =>
         com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType).createFileViewProvider(lib, null, psiManagerRef, true)
+      // Project sources are physical too: their syntax tree follows document commits (reparse) and can be dropped
+      // when no one holds it. The language's view provider when it has one (Scala), the platform's default otherwise.
+      case source: SourceFile =>
+        val language = source.getFileType.asInstanceOf[com.intellij.openapi.fileTypes.LanguageFileType].getLanguage
+        Option(LanguageFileViewProviders.INSTANCE.forLanguage(language))
+          .map(_.createFileViewProvider(source, language, psiManagerRef, true))
+          .getOrElse(new com.intellij.psi.SingleRootFileViewProvider(psiManagerRef, source, true))
       case other => CallLog.unsupported(s"FileManager.findViewProvider for a file the host does not own: $other")
     })
-    val fileManager = tableProxy(classOf[com.intellij.psi.impl.file.impl.FileManager], "FileManager") {
+    val fileManager = tableProxy(classOf[com.intellij.psi.impl.file.impl.FileManagerEx], "FileManager") {
       case ("findCachedViewProvider", Array(f: VirtualFile)) => viewProviders.get(f)
+      // One view provider per file (no code-insight contexts).
+      case ("findCachedViewProviders", Array(f: VirtualFile)) => Option(viewProviders.get(f)).toList.asJava
+      case ("getCachedPsiFile", Array(f: VirtualFile, _*)) =>
+        Option(viewProviders.get(f)).map(vp => vp.getPsi(vp.getBaseLanguage)).orNull
       case ("setViewProvider", Array(f: VirtualFile, vp)) =>
         if (vp == null) viewProviders.remove(f) else viewProviders.put(f, vp.asInstanceOf[FileViewProvider]); null
       case ("findViewProvider", Array(f: VirtualFile)) => viewProvider(f)
@@ -596,18 +684,25 @@ object ScalaPsiHost {
       case ("FileIndexFacade.isInLibraryClasses" | "FileIndexFacade.isInLibrary", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibraryClass(f))
       case ("FileIndexFacade.isInLibrarySource", _) => java.lang.Boolean.FALSE
       // Roots change only when a library or the JDK is mounted, which also counts as a PSI change.
-      case ("FileIndexFacade.getRootModificationTracker", _) => psiModificationCount
+      case ("FileIndexFacade.getRootModificationTracker", _) => psiModTracker
       case ("FileIndexFacade.getModuleForFile", Array(f: VirtualFile)) => moduleModel.ofFile(f).map(_.module).orNull
       case ("FileIndexFacade.isInSource" | "FileIndexFacade.isInSourceContent" | "FileIndexFacade.isInContent", Array(f: VirtualFile)) =>
         java.lang.Boolean.valueOf(!isLibraryClass(f))
     }))
-    val psiManager = new HostPsiManager(project, psiModTracker, fileManager)
+    // Tree changes reach the plugin's listener, which decides which of its caches an edit invalidates.
+    val psiManager = new HostPsiManager(project, psiModTracker, fileManager, psiModTracker,
+      java.util.List.of(new org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiChangeListener(project)))
     psiManagerRef = psiManager
     projectServices.register(classOf[PsiManager])(psiManager)
     projectServices.register(classOf[PsiModificationTracker])(psiModTracker)
     // PSI <-> document synchronization: the core implementation used by headless compilers (package-private).
-    projectServices.register(classOf[com.intellij.psi.PsiDocumentManager])(
-      newPrivate(Class.forName("com.intellij.core.CorePsiDocumentManager"), project).asInstanceOf[com.intellij.psi.PsiDocumentManager])
+    projectServices.register(classOf[com.intellij.psi.PsiDocumentManager]) {
+      val documents = newPrivate(Class.forName("com.intellij.core.CorePsiDocumentManager"), project)
+        .asInstanceOf[com.intellij.psi.impl.PsiDocumentManagerBase]
+      // Commits are explicit and synchronous (ScalaPsiHost.edit), never the IDE's background commit after typing.
+      documents.disableBackgroundCommit(root)
+      documents
+    }
     // Platform library implementations, constructed by the host (no container wiring).
     projectServices.register(classOf[com.intellij.psi.util.CachedValuesManager])(
       new com.intellij.util.CachedValuesManagerImpl(project, new com.intellij.psi.impl.PsiCachedValuesFactory(project)))
@@ -691,6 +786,21 @@ object ScalaPsiHost {
     }))
     // Auto-import exclusions, read by quick fixes that look for importable implicit instances: the defaults.
     projectServices.register(classOf[com.intellij.codeInsight.JavaProjectCodeInsightSettings])(new com.intellij.codeInsight.JavaProjectCodeInsightSettings)
+    // Code-insight contexts (multiverse: one file seen from several modules): off, so every file is in the
+    // default context, as in the IDE without multiverse.
+    projectServices.register(classOf[com.intellij.codeInsight.multiverse.CodeInsightContextManager])(
+      tableProxy(classOf[com.intellij.codeInsight.multiverse.CodeInsightContextManager], "CodeInsightContextManager") {
+        case ("getCodeInsightContext" | "getCodeInsightContextRaw" | "getPreferredContext", _) =>
+          com.intellij.codeInsight.multiverse.CodeInsightContexts.defaultContext()
+        case ("getCodeInsightContexts", _) => java.util.List.of(com.intellij.codeInsight.multiverse.CodeInsightContexts.defaultContext())
+      })
+    // Code style: the host never formats, so actions "with the formatter disabled" (reparse results applied to the
+    // tree) just run.
+    projectServices.register(classOf[com.intellij.psi.codeStyle.CodeStyleManager])(new Host_CodeStyleManager(dispatch {
+      case ("CodeStyleManager.performActionWithFormatterDisabled", Array(r: Runnable)) => r.run(); null
+      case ("CodeStyleManager.performActionWithFormatterDisabled", Array(c: com.intellij.openapi.util.Computable[?])) =>
+        c.compute().asInstanceOf[AnyRef]
+    }))
     // No language injection in the host: every file is its own top-level file.
     projectServices.register(classOf[com.intellij.lang.injection.InjectedLanguageManager])(new Host_InjectedLanguageManager(dispatch {
       case ("InjectedLanguageManager.getTopLevelFile", Array(e: com.intellij.psi.PsiElement)) => e.getContainingFile
@@ -776,9 +886,8 @@ object ScalaPsiHost {
 
     // A source file was added or removed, or a library mounted: what the IDE's PsiModificationTrackerImpl and the
     // plugin's ScalaPsiChangeListener do for a change under a directory (not a Scala element).
-    def psiChanged(): Unit = {
-      psiModificationCount.incModificationCount()
-      projectBus.syncPublisher(PsiModificationTracker.TOPIC).modificationCountChanged()
+    def psiChanged(): Unit = HostWriteAction.run {
+      psiModTracker.incCounter()
       org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager.instance(project).clearOnNonScalaChange()
     }
 

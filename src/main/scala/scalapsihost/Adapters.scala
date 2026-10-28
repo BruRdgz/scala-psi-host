@@ -33,6 +33,52 @@ final class HostLogger(category: String) extends com.intellij.openapi.diagnostic
   }
 }
 
+/**
+ * The host's write action: one writer at a time, and `Application.isWriteAccessAllowed` is true on the writing
+ * thread, as PSI and documents require for changes.
+ */
+private[scalapsihost] object HostWriteAction {
+  private val lock = new java.util.concurrent.locks.ReentrantLock
+  private val writing = ThreadLocal.withInitial[java.lang.Boolean](() => java.lang.Boolean.FALSE)
+
+  def isRunning: Boolean = writing.get
+
+  def run[T](body: => T): T = {
+    lock.lock()
+    val outer = writing.get
+    writing.set(java.lang.Boolean.TRUE)
+    try body
+    finally {
+      writing.set(outer)
+      lock.unlock()
+    }
+  }
+}
+
+/**
+ * The host's event dispatch thread: a thread without UI where work the platform schedules for the IDE's UI thread
+ * (`invokeLater`, `invokeAndWait`) runs. It is declared to the platform as its EDT the way the IDE's event queue
+ * declares it (`EDT.updateEdt`), so the platform's EDT checks hold there.
+ */
+private[scalapsihost] object HostDispatchThread {
+  private val executor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable =>
+    val thread = new Thread(runnable, "scala-psi-host-dispatch")
+    thread.setDaemon(true)
+    thread
+  }
+  executor.submit((() => com.intellij.util.ui.EDT.updateEdt()): Runnable).get()
+
+  def isCurrent: Boolean = com.intellij.util.ui.EDT.isCurrentThreadEdt
+
+  def invokeLater(action: Runnable): Unit = executor.execute(action)
+
+  def invokeAndWait(action: Runnable): Unit =
+    if (isCurrent) action.run() else executor.submit(action).get()
+
+  /** Waits until the work scheduled so far has run. */
+  def drain(): Unit = invokeAndWait(() => ())
+}
+
 /** A fixed-table adapter: a Proxy that answers only what `answer` handles; default methods run as written. */
 def tableProxy[T](iface: Class[T], label: String)(answer: PartialFunction[(String, Array[AnyRef]), AnyRef]): T = {
   val handler: InvocationHandler = (proxy: AnyRef, m: Method, args0: Array[AnyRef]) => {
