@@ -3,6 +3,9 @@ val requiredJavaVersion = 25
 
 val platformVersion = "263.7307.44"
 
+// The intellij-scala revision the host is built and tested against (branch idea263.x).
+val scalaPluginRevision = "491569803c6c3c2f93a0bda51490425fda237fc0"
+
 // The Scala plugin's own jars, built from intellij-scala with `sbt packageArtifactZip`.
 val scalaPluginLib = settingKey[File]("Directory with the Scala plugin's jars (Scala/lib)")
 
@@ -27,7 +30,17 @@ lazy val root = (project in file("."))
       if (running.feature() < requiredJavaVersion)
         sys.error(s"scala-psi-host needs sbt to run on JDK $requiredJavaVersion+ (found $running); use `sbt --java-home <jdk25>`")
     },
-    scalaPluginLib := file(sys.env.getOrElse("SCALA_PLUGIN_LIB", "../intellij-scala/target/plugin/Scala/lib")).getCanonicalFile,
+    scalaPluginLib := (sys.env.get("SCALA_PLUGIN_LIB") match {
+      // A build of the plugin from elsewhere: its revision is the responsibility of whoever points to it.
+      case Some(lib) => file(lib)
+      case None =>
+        val checkout = file("../intellij-scala")
+        val head = scala.util.Try(scala.sys.process.Process(Seq("git", "-C", checkout.getPath, "rev-parse", "HEAD")).!!.trim)
+        if (!head.toOption.contains(scalaPluginRevision))
+          sys.error(s"$checkout must be at intellij-scala $scalaPluginRevision (found ${head.getOrElse("no git checkout")}); " +
+            "check it out and build the plugin there, or set SCALA_PLUGIN_LIB")
+        checkout / "target" / "plugin" / "Scala" / "lib"
+    }).getCanonicalFile,
     scalaPluginJars := {
       val lib = scalaPluginLib.value
       if (!lib.isDirectory) sys.error(s"Scala plugin jars not found at $lib (set SCALA_PLUGIN_LIB)")
@@ -103,6 +116,7 @@ lazy val root = (project in file("."))
         entry
       }
       IO.writeLines(out / "lib" / "classpath", entries)
+      for (legal <- Seq("LICENSE", "NOTICE")) IO.copyFile(baseDirectory.value / legal, out / legal)
       IO.copyFile(baseDirectory.value / "dist" / "scala-psi-host", out / "bin" / "scala-psi-host")
       (out / "bin" / "scala-psi-host").setExecutable(true)
       out

@@ -1,5 +1,9 @@
 # scala-psi-host
 
+> **Alpha.** Diagnostics, hover and go-to-definition work on real projects; much of what an editor expects
+> (completion, references, rename, formatting) does not exist yet. See [ROADMAP.md](ROADMAP.md) and
+> [Known limitations](#known-limitations).
+
 A Scala language server built on the IntelliJ Scala plugin's PSI and type checker, running **without an IntelliJ
 application container**. The plugin source is not modified: the host builds the plugin from intellij-scala and
 answers, through fixed tables, what the plugin and the IntelliJ platform's PSI libraries ask of their environment.
@@ -43,15 +47,21 @@ What the host provides instead of the IDE:
 
 Needs JDK 25 for sbt itself (the plugin and platform 263.x are class file 69):
 
+The host is built against one revision of intellij-scala, pinned in `build.sbt` (`scalaPluginRevision`, currently
+`491569803c` on branch `idea263.x`); the build checks that `../intellij-scala` is at it.
+
 ```sh
 # 1. The Scala plugin, from an intellij-scala checkout next to this repo (~10 min, ~6 GB RSS)
+git clone https://github.com/JetBrains/intellij-scala ../intellij-scala
+git -C ../intellij-scala checkout 491569803c6c3c2f93a0bda51490425fda237fc0
 (cd ../intellij-scala && sbt --java-home <jdk25> packageArtifactZip)
 
 # 2. The host, its tests and the distribution
 sbt --java-home <jdk25> test dist
 ```
 
-`SCALA_PLUGIN_LIB` points the build at another plugin build (default `../intellij-scala/target/plugin/Scala/lib`).
+`SCALA_PLUGIN_LIB` points the build at another build of the plugin's jars (default
+`../intellij-scala/target/plugin/Scala/lib`); its revision is then not checked.
 Platform jars come from the IntelliJ snapshots repository at the version pinned in `build.sbt`.
 
 The BSP tests use `fixtures/bsp-project`, an sbt build; create its connection file once with `sbt bspConfig` in that
@@ -129,3 +139,9 @@ Run them with `sbt "Test/runMain scalapsihost.oracle.<Name> ..."`.
 - Depends on platform `@Internal` APIs (`Extensions.setRootArea`, `ExtensionsAreaImpl`), constructs a few platform
   and plugin classes with non-public constructors, as the IDE container does, and sets one private field of the
   platform's statistics holder (no event providers).
+
+## License
+
+Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE). scala-psi-host builds on the Scala plugin for
+IntelliJ IDEA and the IntelliJ Platform, both Apache 2.0 by JetBrains. It is not affiliated with or endorsed by
+JetBrains; IntelliJ is a trademark of JetBrains s.r.o.
