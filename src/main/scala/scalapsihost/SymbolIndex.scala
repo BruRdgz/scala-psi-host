@@ -90,7 +90,7 @@ final class SymbolIndex {
         else if ((file.getName.endsWith(".class") || file.getName.endsWith(".tasty")) && includeEntry(relative)) {
           classFiles += 1
           psiManager.findFile(file) match {
-            case scalaFile: ScalaFile => if (indexScalaFile(scalaFile)) scalaIndexed += 1 else refused += relative
+            case scalaFile: ScalaFile => if (indexSourceFile(scalaFile)) scalaIndexed += 1 else refused += relative
             case _: PsiJavaFile => javaClasses += 1
             case _ => notTopLevel += 1
           }
@@ -102,10 +102,11 @@ final class SymbolIndex {
   }
 
   /**
-   * Indexes one Scala file; returns false, indexing nothing, when its stubs cannot be paired with its PSI.
+   * Indexes one source file (Scala or Java) or decompiled Scala library file; returns false, indexing nothing, when
+   * its stubs cannot be paired with its PSI.
    * The indexed elements are the file's own PSI, so lookups land on the same tree callers hold.
    */
-  def indexScalaFile(file: ScalaFile): Boolean = {
+  def indexSourceFile(file: PsiFile): Boolean = {
     val registry = StubElementRegistryService.Companion.getInstance()
     val builder = registry.getStubDescriptor(file.getLanguage).getStubDefinition.getBuilder
     def preorder(s: StubElement[?]): Seq[StubElement[?]] = s +: s.getChildrenStubs.asScala.toSeq.flatMap(preorder)

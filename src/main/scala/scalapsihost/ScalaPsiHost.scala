@@ -4,7 +4,7 @@ import com.intellij.codeInsight.daemon.impl.{AnnotationHolderImpl, AnnotationSes
 import com.intellij.core.{CoreApplicationEnvironment, CoreFileTypeRegistry}
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
-import com.intellij.psi.{PsiErrorElement, SyntaxTraverser}
+import com.intellij.psi.{PsiErrorElement, PsiFile, PsiJavaFile, SyntaxTraverser}
 import com.intellij.psi.codeStyle.FileIndentOptionsProvider
 import com.intellij.psi.impl.source.tree.TreeCopyHandler
 import com.intellij.lang.{DefaultASTFactory, DefaultASTFactoryImpl, LanguageASTFactory, LanguageExtensionPoint, LanguageParserDefinitions, ParserDefinition, PsiBuilderFactory}
@@ -81,8 +81,21 @@ final class ScalaPsiHost private (
    * A source file of `module`: parsed with the module's language features (Scala version, compiler options) and
    * resolved in the module's scope.
    */
-  def openSource(text: String, module: HostModule): ScalaFile = {
-    val file = parse(text, org.jetbrains.plugins.scala.project.ModuleExt(module.module).features)
+  def openSource(text: String, module: HostModule): ScalaFile =
+    openInModule(parse(text, org.jetbrains.plugins.scala.project.ModuleExt(module.module).features), module)
+
+  /**
+   * A Java source file of `module` (mixed Scala/Java modules): its classes are indexed, so the module's Scala code
+   * resolves them. `fileName` is the file's name (`Foo.java`), which Java ties to its public class.
+   */
+  def openJavaSource(fileName: String, text: String, module: HostModule): PsiJavaFile = {
+    val file = com.intellij.psi.PsiFileFactory.getInstance(project)
+      .createFileFromText(fileName, com.intellij.lang.java.JavaLanguage.INSTANCE, text)
+      .asInstanceOf[PsiJavaFile]
+    openInModule(file, module)
+  }
+
+  private def openInModule[F <: PsiFile](file: F, module: HostModule): F = {
     // The file is non-physical (no PsiFile.getVirtualFile): the platform finds its module through this key, as for
     // code fragments.
     file.putUserData(com.intellij.openapi.module.ModuleUtilCore.KEY_MODULE, module.module)
@@ -90,8 +103,8 @@ final class ScalaPsiHost private (
     index(file)
   }
 
-  private def index(file: ScalaFile): ScalaFile = {
-    if (!symbolIndex.indexScalaFile(file)) {
+  private def index[F <: PsiFile](file: F): F = {
+    if (!symbolIndex.indexSourceFile(file)) {
       modules.removeSource(file.getViewProvider.getVirtualFile)
       throw new IllegalStateException("source file stubs could not be paired with its PSI")
     }
@@ -100,7 +113,7 @@ final class ScalaPsiHost private (
   }
 
   /** Removes a source file opened with [[openSource]] from the project. */
-  def closeSource(file: ScalaFile): Unit = {
+  def closeSource(file: PsiFile): Unit = {
     symbolIndex.removeFile(file)
     modules.removeSource(file.getViewProvider.getVirtualFile)
     psiChanged()
@@ -329,12 +342,17 @@ object ScalaPsiHost {
           !org.jetbrains.plugins.scala.settings.ScalaHighlightingMode.isShowErrorsFromCompilerEnabled(element.getContainingFile)
       }, root)
     }
+    // Languages that stand for groups of languages in language extensions; none in the host.
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.lang.MetaLanguage.EP_NAME, classOf[com.intellij.lang.MetaLanguage])
     // Java class files look for their source mirror through these policies; the host attaches no library sources.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy.EP_NAME,
       classOf[com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy])
 
     appServices.register(classOf[ProgressManager])(new CoreProgressManager)
     appServices.register(classOf[PsiBuilderFactory])(new PsiBuilderFactoryImpl)
+    // The builder of the platform's newer syntax layer, which the Java parser uses.
+    appServices.register(classOf[com.intellij.platform.syntax.psi.PsiSyntaxBuilderFactory])(
+      new com.intellij.platform.syntax.psi.PsiSyntaxBuilderFactoryImpl)
     appServices.register(classOf[DefaultASTFactory])(new DefaultASTFactoryImpl)
     // In-memory documents; in the LSP host these become the client's snapshots.
     appServices.register(classOf[com.intellij.openapi.fileEditor.FileDocumentManager])(
@@ -417,6 +435,16 @@ object ScalaPsiHost {
       new org.jetbrains.plugins.scala.lang.scaladoc.reflinks.ScalaDocRefLinkParserDefinition,
     )
     parserDefinitions.foreach(pd => LanguageParserDefinitions.INSTANCE.addExplicitExtension(pd.getFileNodeType.getLanguage, pd))
+    // Java sources of mixed projects.
+    LanguageParserDefinitions.INSTANCE.addExplicitExtension(com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.lang.java.JavaParserDefinition)
+    com.intellij.platform.syntax.psi.LanguageSyntaxDefinitions.getINSTANCE.addExplicitExtension(
+      com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.java.frontback.psi.impl.syntax.JavaSyntaxDefinitionExtension)
+    com.intellij.platform.syntax.psi.ElementTypeConverters.getInstance.addExplicitExtension(
+      com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.lang.java.syntax.JavaElementTypeConverterExtension)
+    // Tokens every language shares (whitespace, bad characters): the converters of a language are all those
+    // registered for it, so the common one is registered for Java too.
+    com.intellij.platform.syntax.psi.ElementTypeConverters.getInstance.addExplicitExtension(
+      com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.platform.syntax.psi.CommonElementTypeConverterFactory)
     val scalaLang = org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE
     val scala3Lang = org.jetbrains.plugins.scala.Scala3Language.INSTANCE
     LanguageASTFactory.INSTANCE.addExplicitExtension(scalaLang, new org.jetbrains.plugins.scala.lang.parser.ScalaASTFactory)
@@ -442,6 +470,7 @@ object ScalaPsiHost {
     }
     stubDefinitions.registerExtension(stubDefinition("Scala", new org.jetbrains.plugins.scala.lang.psi.stubs.ScalaLanguageStubDefinition), scalaPlugin, root)
     stubDefinitions.registerExtension(stubDefinition("Scala 3", new org.jetbrains.plugins.scala.lang.psi.stubs.Scala3LanguageStubDefinition), scalaPlugin, root)
+    stubDefinitions.registerExtension(stubDefinition(com.intellij.lang.java.JavaLanguage.INSTANCE.getID, new com.intellij.psi.impl.java.stubs.JavaStubDefinition), scalaPlugin, root)
     appServices.register(classOf[StubElementRegistryService])(
       new com.intellij.psi.stubs.StubElementRegistryServiceImpl(kotlinx.coroutines.CoroutineScopeKt.CoroutineScope(kotlin.coroutines.EmptyCoroutineContext.INSTANCE)))
 
@@ -450,6 +479,7 @@ object ScalaPsiHost {
 
     val fileTypes = new CoreFileTypeRegistry
     fileTypes.registerFileType(org.jetbrains.plugins.scala.ScalaFileType.INSTANCE, "scala")
+    fileTypes.registerFileType(com.intellij.ide.highlighter.JavaFileType.INSTANCE, "java")
     fileTypes.registerFileType(com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, "class")
     // Scala 3 library classes: the .tasty file is decompiled into Scala 3 PSI, its .class sibling is hidden.
     fileTypes.registerFileType(org.jetbrains.plugins.scala.tasty.TastyFileType, "tasty")
@@ -636,6 +666,9 @@ object ScalaPsiHost {
     // own navigation element, as in the IDE for a library without sources.
     projectServices.register(classOf[com.intellij.psi.impl.JavaPsiImplementationHelper])(new Host_JavaPsiImplementationHelper(dispatch {
       case ("JavaPsiImplementationHelper.getClsFileNavigationElement", Array(f: com.intellij.psi.PsiJavaFile)) => f
+      // Java sources parse at the highest language level: it accepts the syntax of every Java release the build may
+      // target (the build's own release is not read yet).
+      case ("JavaPsiImplementationHelper.getEffectiveLanguageLevel", _) => com.intellij.pom.java.LanguageLevel.HIGHEST
     }))
     // Java class-file parameters compiled without names: the IDE suggests names from Java code style (which needs
     // Java code-style settings and IDE registry keys); without a suggestion the platform names them `p`, `p1`, ...

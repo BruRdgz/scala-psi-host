@@ -8,7 +8,8 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 /**
- * A real build through BSP: `fixtures/bsp-project` (sbt; `app` depends on `core` and compiles with `-Xsource:3`).
+ * A real build through BSP: `fixtures/bsp-project` (sbt; `app` depends on `core` and compiles with `-Xsource:3`;
+ * `core` mixes Scala and Java).
  * Needs the fixture's connection file: run `sbt bspConfig` in the fixture once. scalac compiles the fixture without
  * errors, so the host must report none.
  */
@@ -27,6 +28,7 @@ class BspImportTest extends munit.FunSuite {
     assert(app.spec.classpath.exists(_.getFileName.toString == "scala-library-2.13.18.jar"), app.spec.classpath)
     assertEquals(app.sources.map(fixture.relativize(_).toString), Seq("app/src/main/scala/app/Main.scala"))
     assert(!module("core").spec.scalacOptions.contains("-Xsource:3"))
+    assert(module("core").sources.map(fixture.relativize(_).toString).contains("core/src/main/java/core/Shout.java"))
   }
 
   test("compiling through the build server reports the compiler's errors by file and position") {
@@ -47,10 +49,15 @@ class BspImportTest extends munit.FunSuite {
   test("the imported project highlights without errors") {
     TestHost.libraryReport // the JDK
     val hostModules = imported.map(m => m -> TestHost.host.addModule(m.spec))
-    val files = for ((m, hostModule) <- hostModules; source <- m.sources)
-      yield fixture.relativize(source).toString -> TestHost.host.openSource(Files.readString(source), hostModule)
+    val files = for ((m, hostModule) <- hostModules; source <- m.sources) yield {
+      val text = Files.readString(source)
+      val file =
+        if (source.toString.endsWith(".java")) TestHost.host.openJavaSource(source.getFileName.toString, text, hostModule)
+        else TestHost.host.openSource(text, hostModule)
+      fixture.relativize(source).toString -> file
+    }
     try {
-      val errors = files.flatMap { (path, file) =>
+      val errors = files.collect { case (path, file: org.jetbrains.plugins.scala.lang.psi.api.ScalaFile) => path -> file }.flatMap { (path, file) =>
         TestHost.host.diagnostics(file).filter(_.severity == HighlightSeverity.ERROR).map(d => s"$path ${d.range}: ${d.message}")
       }
       assertEquals(errors, Seq.empty)

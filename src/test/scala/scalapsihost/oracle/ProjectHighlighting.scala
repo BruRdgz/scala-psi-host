@@ -48,8 +48,14 @@ object ProjectHighlighting {
     val heapAfterModulesMb = usedHeapMb()
 
     val t2 = System.nanoTime()
-    val files = for ((m, hostModule) <- modules; source <- m.sources)
-      yield projectDir.relativize(source).toString -> host.openSource(Files.readString(source), hostModule)
+    // Java sources are opened so Scala code resolves their classes; only Scala files are highlighted.
+    val opened = for ((m, hostModule) <- modules; source <- m.sources) yield {
+      val text = Files.readString(source)
+      val path = projectDir.relativize(source).toString
+      if (source.toString.endsWith(".java")) path -> host.openJavaSource(source.getFileName.toString, text, hostModule)
+      else path -> host.openSource(text, hostModule)
+    }
+    val files = opened.collect { case (path, file: org.jetbrains.plugins.scala.lang.psi.api.ScalaFile) => path -> file }
     val openMs = millisSince(t2)
 
     val t3 = System.nanoTime()
@@ -77,7 +83,7 @@ object ProjectHighlighting {
     lines += ""
     lines += s"JDK ${System.getProperty("java.version")}, production mode."
     lines += ""
-    lines += s"- modules: ${imported.size}; jars: ${imported.flatMap(_.spec.classpath).distinct.size}; Scala files: ${files.size}"
+    lines += s"- modules: ${imported.size}; jars: ${imported.flatMap(_.spec.classpath).distinct.size}; Scala files: ${files.size}; Java files: ${opened.size - files.size}"
     lines += s"- files without errors: ${results.count(r => r.outcome.exists(_.isEmpty))} / ${results.size}; crashed: ${results.count(_.outcome.isLeft)}"
     lines += s"- errors: ${results.map(_.outcome.fold(_ => 0, _.size)).sum}"
     lines += s"- errors from: ${if (compilerErrors) "the compiler for Scala 3 files (build compile status: " + compiled.map(c => if (c.succeeded) "OK" else "failed").getOrElse("-") + ")" else "the plugin's type-aware checks"}"
