@@ -11,8 +11,24 @@ import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
-/** A Scala build target of an imported build: the module to add, and its source files (Scala and Java). */
-final case class ImportedModule(spec: ModuleSpec, sources: Seq[Path])
+/**
+ * What compiling a file of a module needs, as the build describes it: the module's own compiler (its jars), the
+ * compile classpath including the class output of the modules it depends on, the module's class output (its other
+ * files' classes) and its scalac options.
+ */
+final case class CompileSpec(
+  scalaVersion: String,
+  compilerJars: Seq[Path],
+  classpath: Seq[Path],
+  classDirectory: Path,
+  scalacOptions: Seq[String],
+)
+
+/**
+ * A Scala build target of an imported build: the module to add, its source files (Scala and Java), and how to
+ * compile its files.
+ */
+final case class ImportedModule(spec: ModuleSpec, sources: Seq[Path], compile: CompileSpec)
 
 /** A 0-based line and column, as build servers (and LSP) report positions. */
 final case class LineColumn(line: Int, column: Int)
@@ -62,17 +78,23 @@ final class BuildConnection private[scalapsihost] (
       val scala = gson.fromJson(target.getData.asInstanceOf[JsonElement], classOf[ScalaBuildTarget])
       val options = optionsById.getOrElse(target.getId,
         throw new IllegalStateException(s"build server sent no scalac options for ${target.getId.getUri}"))
-      val classpath = options.getClasspath.asScala.toSeq.map(uri => Path.of(URI.create(uri)))
-        .filter(p => Files.isRegularFile(p) && p.getFileName.toString.endsWith(".jar"))
+      val fullClasspath = options.getClasspath.asScala.toSeq.map(uri => Path.of(URI.create(uri)))
       val spec = ModuleSpec(
         name = nameById(target.getId),
         scalaVersion = scala.getScalaVersion,
         scalacOptions = options.getOptions.asScala.toSeq,
-        classpath = classpath,
+        classpath = fullClasspath.filter(p => Files.isRegularFile(p) && p.getFileName.toString.endsWith(".jar")),
         // Dependencies on non-Scala targets have no module.
         dependsOn = target.getDependencies.asScala.toSeq.flatMap(nameById.get),
       )
-      ImportedModule(spec, sourcesById.get(target.getId).toSeq.flatMap(BspImport.sourceFiles))
+      val compile = CompileSpec(
+        scalaVersion = scala.getScalaVersion,
+        compilerJars = scala.getJars.asScala.toSeq.map(uri => Path.of(URI.create(uri))),
+        classpath = fullClasspath,
+        classDirectory = Path.of(URI.create(options.getClassDirectory)),
+        scalacOptions = options.getOptions.asScala.toSeq,
+      )
+      ImportedModule(spec, sourcesById.get(target.getId).toSeq.flatMap(BspImport.sourceFiles), compile)
     }
     BspImport.dependenciesFirst(modules)
   }
@@ -134,6 +156,9 @@ object BspImport {
       "scala-psi-host", "0.1", BspVersion, projectDir.toUri.toString,
       new BuildClientCapabilities(java.util.List.of("scala")))).get(timeoutMinutes, TimeUnit.MINUTES)
     server.onBuildInitialized()
+    // A build server that was already running (sbt keeps its server between clients) may hold an older build
+    // definition: reload it, as IDEs do on import.
+    server.workspaceReload().get(timeoutMinutes, TimeUnit.MINUTES)
     new BuildConnection(process, server, client, timeoutMinutes)
   }
 

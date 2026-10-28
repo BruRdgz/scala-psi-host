@@ -4,7 +4,6 @@ import com.intellij.lang.annotation.HighlightSeverity
 
 import java.nio.file.{Files, Path}
 import scala.concurrent.duration.*
-import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 /**
@@ -31,19 +30,31 @@ class BspImportTest extends munit.FunSuite {
     assert(module("core").sources.map(fixture.relativize(_).toString).contains("core/src/main/java/core/Shout.java"))
   }
 
+  // In the fixture itself, with a broken file for the duration of the test: a copy elsewhere would start another
+  // build server (sbt keeps one per build directory running after its clients leave).
   test("compiling through the build server reports the compiler's errors by file and position") {
-    val copy = Files.createTempDirectory("bsp-project")
-    for (source <- Files.walk(fixture).iterator().asScala.toSeq.filterNot(p => fixture.relativize(p).toString.split('/').contains("target"))) {
-      val target = copy.resolve(fixture.relativize(source).toString)
-      if (Files.isDirectory(source)) Files.createDirectories(target) else Files.copy(source, target)
-    }
-    val broken = copy.resolve("core/src/main/scala/core/Broken.scala")
+    val broken = fixture.resolve("core/src/main/scala/core/Broken.scala")
     Files.writeString(broken, "package core\n\nobject Broken {\n  val n: Int = \"one\"\n}\n")
-    val result = Using.resource(BspImport.connect(copy))(_.compile())
+    val result =
+      try Using.resource(BspImport.connect(fixture))(_.compile())
+      finally Files.delete(broken)
     assert(!result.succeeded)
     val errors = result.diagnostics.getOrElse(broken, Seq.empty).filter(_.severity == HighlightSeverity.ERROR)
     assertEquals(errors.map(_.start.line), Seq(3))
     assert(errors.head.message.contains("type mismatch"), errors)
+  }
+
+  test("compiles a document of a Scala 3 module with the module's compiler") {
+    val core3 = module("core3")
+    // The module's class output holds its other files' classes (Greet3), which the document uses.
+    Using.resource(BspImport.connect(fixture))(_.compile())
+    val compiler = new DocumentCompiler
+    def errors(text: String) = compiler.compile(core3.compile, "Use.scala", text).filter(_.severity == HighlightSeverity.ERROR)
+
+    assertEquals(errors("package core3\n\nobject Use:\n  val s: String = Greet3.hello(\"x\")\n"), Seq.empty)
+    val mismatch = errors("package core3\n\nobject Use:\n  val n: Int = Greet3.hello(\"x\")\n")
+    assertEquals(mismatch.map(_.start.line), Seq(3))
+    assert(mismatch.head.message.contains("Required: Int"), mismatch)
   }
 
   test("the imported project highlights without errors") {
