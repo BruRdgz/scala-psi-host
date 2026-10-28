@@ -76,6 +76,10 @@ object ProjectHighlighting {
     }
     val highlightMs = millisSince(t3)
     val heapAfterMb = usedHeapMb()
+    // What the heap holds at the end; soft-referenced caches stay until the heap limit forces them out.
+    val histogram = java.lang.management.ManagementFactory.getPlatformMBeanServer.invoke(
+      new javax.management.ObjectName("com.sun.management:type=DiagnosticCommand"), "gcClassHistogram",
+      Array[AnyRef](Array.empty[String]), Array(classOf[Array[String]].getName)).toString.linesIterator.take(33).toSeq
 
     val lines = Vector.newBuilder[String]
     def cell(s: String) = s.replace("|", "\\|").replace("\n", " ")
@@ -91,6 +95,13 @@ object ProjectHighlighting {
     lines += s"- opening sources (parse + index): $openMs ms"
     lines += s"- highlighting (one thread): $highlightMs ms, heap after: $heapAfterMb MB"
     lines += s"- slowest files: ${results.sortBy(-_.ms).take(5).map(r => s"${r.path} ${r.ms} ms").mkString(", ")}"
+    lines += s"- max heap: ${Runtime.getRuntime.maxMemory / (1024 * 1024)} MB"
+    lines += ""
+    lines += "## Heap histogram (top classes at the end)"
+    lines += ""
+    lines += "```"
+    lines ++= histogram
+    lines += "```"
     lines += ""
     lines += "## Jars"
     lines += ""

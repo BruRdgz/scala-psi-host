@@ -70,7 +70,14 @@ final class ModuleModel(project: Project) {
     seen.toSeq
   }
 
-  def resolveScope(hostModule: HostModule): GlobalSearchScope = new GlobalSearchScope(project) {
+  // One scope object per module, as the IDE's ModuleWithDependenciesScope: the plugin keys its caches by scope,
+  // so a new object per request would make every lookup miss and the caches grow without bound.
+  private val scopes = new ConcurrentHashMap[HostModule, GlobalSearchScope]()
+
+  def resolveScope(hostModule: HostModule): GlobalSearchScope = scopes.computeIfAbsent(hostModule, newScope)
+
+  // A module's dependencies are fixed when it is added; its sources and the JDK roots are read on each check.
+  private def newScope(hostModule: HostModule): GlobalSearchScope = new GlobalSearchScope(project) {
     private val reachable = withDependencies(hostModule)
     private val roots = reachable.flatMap(_.libraryRoots).toSet
 
