@@ -11,6 +11,11 @@
 - Semantic tokens: identifiers and soft keywords colored as the IDE colors them.
 - Build changes: the build is imported again after a change to its definition, or when source files are created or
   deleted.
+- Observability: a log (sent to the editor and written to a file) of startup, import, slow requests and the
+  platform's warnings and errors; progress while the project opens; an error message when it cannot; the server's
+  state (`scalaPsiHost/state`) and a status report (`scalaPsiHost/status`). The VS Code extension shows the state in
+  the status bar and has *Show Status* and *Show Log File* commands.
+- Memory: the platform's reparse copies of edited files are no longer kept.
 
 ## 0.1.0-a1 — 2026-10-28
 

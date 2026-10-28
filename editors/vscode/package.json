@@ -1,7 +1,7 @@
 {
   "name": "scala-psi-host",
   "displayName": "Scala (scala-psi-host)",
-  "description": "Scala diagnostics, hover and go-to-definition from the IntelliJ Scala plugin, through the scala-psi-host language server.",
+  "description": "Scala diagnostics, navigation, symbols and semantic colors from the IntelliJ Scala plugin, through the scala-psi-host language server.",
   "version": "0.1.0",
   "publisher": "brurdgz",
   "license": "Apache-2.0",
@@ -24,9 +24,18 @@
           "type": "string",
           "default": "",
           "description": "JDK 25 home for the server. Empty: the JAVA_HOME of VS Code's environment."
+        },
+        "scalaPsiHost.debugLog": {
+          "type": "boolean",
+          "default": false,
+          "description": "Log every request the server answers, with its time (SCALA_PSI_HOST_LOG=debug). Takes effect when the server restarts."
         }
       }
-    }
+    },
+    "commands": [
+      { "command": "scalaPsiHost.showStatus", "title": "Show Status", "category": "scala-psi-host" },
+      { "command": "scalaPsiHost.showLog", "title": "Show Log File", "category": "scala-psi-host" }
+    ]
   },
   "dependencies": {
     "vscode-languageclient": "11.0.0"

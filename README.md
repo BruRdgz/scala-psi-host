@@ -89,6 +89,24 @@ and stdout; an editor starts it in a project that has a BSP connection file (`.b
 - JDK 25: `JAVA_HOME`, or `java` on the `PATH`.
 - `SCALA_PSI_HOST_STATE`: the platform's state directory (default `$XDG_CACHE_HOME/scala-psi-host`).
 - `SCALA_PSI_HOST_HEAP`: maximum heap (default `2g`; a 500-file Scala 3 project fits in 1.5 GB).
+- `SCALA_PSI_HOST_LOG=debug`: log every request, with how long it ran and waited.
+
+### Is it working?
+
+- **Log**: what the server does — startup, the build server it starts (and where that server's own output goes),
+  each module imported with its time, library sources, "ready" with the total time and heap, slow requests (over
+  1 s), and the platform's and the plugin's warnings and errors. It is sent to the editor (`window/logMessage`: the
+  VS Code extension's output channel) and written to `$SCALA_PSI_HOST_STATE/logs/scala-psi-host-<start>.log` (the
+  latest ten are kept).
+- **Progress**: opening and importing the project are reported as LSP work-done progress.
+- **Failure**: when the project cannot be opened (no `.bsp/`, the build server fails), the editor shows an error
+  with the reason and the log file.
+- **State**: the notification `scalaPsiHost/state` (`starting`, `importing`, `ready`, `failed`, with a message) as
+  it changes; the VS Code extension shows it in the status bar.
+- **Status**: the request `scalaPsiHost/status` answers the state, the project (modules, source files), the heap,
+  request latencies by kind (count, p50, p95, max), how many warnings and errors were logged and the latest ones,
+  and adapter calls outside the host's tables. The extension's command *scala-psi-host: Show Status* prints it;
+  *Show Log File* opens the log.
 
 `dist/smoke-test.py <bin/scala-psi-host> <project> <file> <line> <column>` talks to a built distribution as an
 editor would (initialize, open, diagnostics, hover, definition, shutdown).

@@ -81,7 +81,7 @@ final class DocumentCompiler {
           else LineColumn(call(position.get, positionInterface, line).asInstanceOf[Int], call(position.get, positionInterface, column).asInstanceOf[Int])
         if (position.isPresent || level == HighlightSeverity.ERROR)
           reported += CompilerDiagnostic(level, at("startLine", "startColumn"), at("endLine", "endColumn"), message)
-        else System.err.println(s"scala-psi-host: compiler: $message")
+        else HostLog.debug(s"compiler: $message")
         null
       case "hashCode" => Integer.valueOf(System.identityHashCode(proxy))
       case "equals" => java.lang.Boolean.valueOf(proxy eq args(0))

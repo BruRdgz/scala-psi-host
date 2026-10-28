@@ -170,6 +170,7 @@ object BspImport {
   def connect(projectDir: Path, connection: Option[String] = None, timeoutMinutes: Long = 10): BuildConnection = {
     val details = connectionDetails(projectDir, connection)
     val log = Files.createTempFile("scala-psi-host-bsp", ".log")
+    HostLog.info(s"starting build server ${details.getName} ${details.getVersion}: ${details.getArgv.asScala.mkString(" ")} (its output: $log)")
     val process = new ProcessBuilder(details.getArgv)
       .directory(projectDir.toFile)
       .redirectError(ProcessBuilder.Redirect.to(log.toFile))

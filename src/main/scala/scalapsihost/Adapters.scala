@@ -20,17 +20,19 @@ object CallLog {
 }
 
 /**
- * The platform's and plugin's `Logger`: as in the IDE, `LOG.error` reports and execution continues (the platform's
- * `DefaultLogger` is the unit-test logger and throws instead). Each logged error is recorded in [[CallLog]], so a
- * run that logs one shows it in the adapter surface. Unsupported adapter calls are recorded before they throw, so a
- * caller that catches and logs one does not hide it.
+ * The platform's and plugin's `Logger`, writing to [[HostLog]]: as in the IDE, `LOG.error` reports and execution
+ * continues (the platform's `DefaultLogger` is the unit-test logger and throws instead). Each logged error is recorded
+ * in [[CallLog]], so a run that logs one shows it in the adapter surface. Unsupported adapter calls are recorded
+ * before they throw, so a caller that catches and logs one does not hide it. Their info and debug messages are not
+ * kept (the IDE's default log level).
  */
 final class HostLogger(category: String) extends com.intellij.openapi.diagnostic.DefaultLogger(category) {
   override def error(message: String, t: Throwable, details: String*): Unit = {
     CallLog.hit(s"LOGGED ERROR $category")
-    System.err.println(s"ERROR [$category] $message")
-    if (t != null) t.printStackTrace()
+    HostLog.error(s"[$category] $message", t)
   }
+
+  override def warn(message: String, t: Throwable): Unit = HostLog.warn(s"[$category] $message", t)
 }
 
 /**

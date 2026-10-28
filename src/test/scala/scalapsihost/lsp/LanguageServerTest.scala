@@ -2,7 +2,6 @@ package scalapsihost.lsp
 
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.launch.LSPLauncher
-import org.eclipse.lsp4j.services.LanguageServer
 import scalapsihost.TestHost
 
 import java.io.{PipedInputStream, PipedOutputStream}
@@ -24,27 +23,56 @@ class LanguageServerTest extends munit.FunSuite {
   private val greeting = fixture.resolve("core/src/main/scala/core/Greeting.scala")
   private val counter = fixture.resolve("core/src/main/scala/core/Counter.scala")
 
-  /** Records what the server publishes. */
-  private object Client extends ClientBase {
+  /** Records what the server sends. */
+  private final class RecordingClient extends ClientBase {
     val published = new LinkedBlockingQueue[PublishDiagnosticsParams]()
+    val states = new LinkedBlockingQueue[HostProtocol.ServerState]()
+    val logged = new LinkedBlockingQueue[MessageParams]()
+    val shown = new LinkedBlockingQueue[MessageParams]()
     override def publishDiagnostics(params: PublishDiagnosticsParams): Unit = published.add(params)
+    override def state(state: HostProtocol.ServerState): Unit = states.add(state)
     override def telemetryEvent(o: AnyRef): Unit = ()
-    override def showMessage(params: MessageParams): Unit = ()
+    override def showMessage(params: MessageParams): Unit = shown.add(params)
     override def showMessageRequest(params: ShowMessageRequestParams): CompletableFuture[MessageActionItem] =
       CompletableFuture.completedFuture(null)
-    override def logMessage(params: MessageParams): Unit = ()
+    override def logMessage(params: MessageParams): Unit = logged.add(params)
   }
 
-  private lazy val server: LanguageServer = {
+  /** A server for `client`, connected to it as an editor connects (the server's own messages included). */
+  private def connect(client: RecordingClient): HostProtocol.LanguageServerWithStatus = {
     val toServer = new PipedOutputStream
     val toClient = new PipedOutputStream
     val implementation = new ScalaLanguageServer(TestHost.host)
-    val serverSide = LSPLauncher.createServerLauncher(implementation, new PipedInputStream(toServer), toClient)
+    val serverSide = new LSPLauncher.Builder[HostProtocol.Client]().setLocalService(implementation)
+      .setRemoteInterface(classOf[HostProtocol.Client]).setInput(new PipedInputStream(toServer)).setOutput(toClient).create()
     implementation.connect(serverSide.getRemoteProxy)
     serverSide.startListening()
-    val clientSide = LSPLauncher.createClientLauncher(Client, new PipedInputStream(toClient), toServer)
+    val clientSide = new LSPLauncher.Builder[HostProtocol.LanguageServerWithStatus]().setLocalService(client)
+      .setRemoteInterface(classOf[HostProtocol.LanguageServerWithStatus]).setInput(new PipedInputStream(toClient)).setOutput(toServer).create()
     clientSide.startListening()
     clientSide.getRemoteProxy
+  }
+
+  private val Client = new RecordingClient
+  private lazy val server = connect(Client)
+
+  private def initialize(server: HostProtocol.LanguageServerWithStatus, root: Path): InitializeResult = {
+    val params = new InitializeParams
+    params.setWorkspaceFolders(java.util.List.of(new WorkspaceFolder(root.toUri.toString, root.getFileName.toString)))
+    server.initialize(params).get(1, TimeUnit.MINUTES)
+  }
+
+  /** The states the server reports until it reaches `last`. */
+  private def statesUntil(client: RecordingClient, last: String): Seq[String] = {
+    val seen = Seq.newBuilder[String]
+    var state = ""
+    while (state != last) {
+      val next = client.states.poll(5, TimeUnit.MINUTES)
+      if (next == null) fail(s"the server never reported '$last' (reported ${seen.result()})")
+      state = next.state
+      seen += state
+    }
+    seen.result()
   }
 
   private def diagnosticsOf(path: Path, version: Int): Seq[Diagnostic] = {
@@ -64,9 +92,7 @@ class LanguageServerTest extends munit.FunSuite {
   private def document(path: Path) = new TextDocumentIdentifier(path.toUri.toString)
 
   test("initializes on the workspace's build and announces its features") {
-    val params = new InitializeParams
-    params.setWorkspaceFolders(java.util.List.of(new WorkspaceFolder(fixture.toUri.toString, "bsp-project")))
-    val capabilities = server.initialize(params).get(1, TimeUnit.MINUTES).getCapabilities
+    val capabilities = initialize(server, fixture).getCapabilities
     assertEquals(capabilities.getTextDocumentSync.getLeft, TextDocumentSyncKind.Incremental)
     assert(capabilities.getHoverProvider.getLeft)
     assert(capabilities.getDefinitionProvider.getLeft)
@@ -88,6 +114,32 @@ class LanguageServerTest extends munit.FunSuite {
     server.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
       new VersionedTextDocumentIdentifier(main.toUri.toString, 2), java.util.List.of(change)))
     assertEquals(errors(diagnosticsOf(main, 2)), Seq("Type mismatch. Required: Int, found: String"))
+  }
+
+  test("reports its state, logs what it does and answers its status") {
+    assertEquals(statesUntil(Client, "ready"), Seq("importing", "ready"))
+    val logged = Client.logged.asScala.toSeq.map(_.getMessage)
+    assert(logged.exists(_.contains("ready in")), logged.mkString("\n"))
+    assert(logged.exists(_.contains("build imported in")), logged.mkString("\n"))
+    val status = server.status().get(1, TimeUnit.MINUTES).asScala
+    assertEquals(status("state"), "ready")
+    // The fixture's four projects (core, app, core3 and the root), main and test targets each; Gson reads numbers
+    // as doubles.
+    assertEquals(status("project").asInstanceOf[java.util.Map[String, AnyRef]].get("modules"), java.lang.Double.valueOf(8))
+    val requests = status("requests").asInstanceOf[java.util.Map[String, AnyRef]]
+    assert(requests.containsKey("didChange") && requests.containsKey("problems"), requests)
+  }
+
+  test("tells the user, and its status, when the project cannot be opened") {
+    val noBuild = Files.createTempDirectory("scala-psi-host-no-build")
+    val client = new RecordingClient
+    val other = connect(client)
+    initialize(other, noBuild)
+    assertEquals(statesUntil(client, "failed"), Seq("importing", "failed"))
+    val shown = client.shown.poll(1, TimeUnit.MINUTES)
+    assertEquals(shown.getType, MessageType.Error)
+    assert(shown.getMessage.contains("could not open the project"), shown.getMessage)
+    assertEquals(other.status().get(1, TimeUnit.MINUTES).get("state"), "failed")
   }
 
   // After the change above (`String` became `Int`), `.text` is at line 6, column 50: Greeting.text, declared on line 3

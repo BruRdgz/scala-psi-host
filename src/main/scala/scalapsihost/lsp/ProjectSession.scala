@@ -361,11 +361,17 @@ final class ProjectSession private (
    * build change, the difference. Sources the build added are opened (from disk) and those it removed closed; a
    * module whose definition changed (Scala version, options, classpath, dependencies), and every module that
    * depends on it, is removed and added again, its files reopened with their current text (unsaved editor changes
-   * are kept). `reload` first reloads the build's definition (after a change to it).
+   * are kept). `reload` first reloads the build's definition (after a change to it). Each step is logged, and
+   * reported to `progress` as it starts.
    */
-  def importBuild(reload: Boolean): Unit = {
-    if (reload) build.reload()
-    val next = build.modules()
+  def importBuild(reload: Boolean, progress: String => Unit = _ => ()): Unit = {
+    val start = System.nanoTime()
+    if (reload) {
+      progress("reloading the build definition")
+      HostLog.timed("build definition reloaded")(build.reload())
+    }
+    progress("importing the build's modules")
+    val next = HostLog.timed("modules described by the build")(build.modules())
     val before = imported.map(m => m.spec.name -> m).toMap
     val after = next.map(m => m.spec.name -> m).toMap
     val changed = before.keySet.filter(name => !after.get(name).exists(_.spec == before(name).spec))
@@ -384,24 +390,41 @@ final class ProjectSession private (
       }
       host.removeModule(m.spec.name)
     }
+    var added, opened, closed = 0
     for (m <- next) {
       if (!before.contains(m.spec.name) || replaced(m.spec.name)) {
-        val module = host.addModule(m.spec)
+        progress(s"module ${m.spec.name}: ${m.spec.classpath.size} jars, ${m.sources.size} sources")
+        val module = HostLog.timed(s"module ${m.spec.name} (Scala ${m.spec.scalaVersion}, ${m.spec.classpath.size} jars) added")(
+          host.addModule(m.spec))
         for (source <- m.sources) open(source, reopened.getOrElse(source, Files.readString(source)), module)
+        added += 1
+        opened += m.sources.size
       } else {
         val module = host.modules.named(m.spec.name).get
         val (kept, now) = (before(m.spec.name).sources.toSet, m.sources.toSet)
-        for (source <- kept -- now; file <- Option(files.remove(source))) host.closeSource(file)
-        for (source <- now -- kept) open(source, Files.readString(source), module)
+        for (source <- kept -- now; file <- Option(files.remove(source))) { host.closeSource(file); closed += 1 }
+        for (source <- now -- kept) { open(source, Files.readString(source), module); opened += 1 }
       }
     }
+    val removed = before.keySet -- after.keySet
     imported = next
     compileSpecs = next.map(m => m.spec.name -> m.compile).toMap
     // Library sources, as the IDE attaches them on import: the build's source jars (for jars not asked for before).
     val classpath = next.flatMap(_.spec.classpath).toSet -- sourcesAskedFor
-    if (classpath.nonEmpty) for ((jar, sources) <- build.librarySources(classpath)) host.addLibrarySources(jar, sources)
+    if (classpath.nonEmpty) {
+      progress(s"attaching library sources (${classpath.size} jars)")
+      val sources = HostLog.timed(s"source jars asked for ${classpath.size} jars")(build.librarySources(classpath))
+      for ((jar, jarSources) <- sources) host.addLibrarySources(jar, jarSources)
+      HostLog.info(s"library sources attached to ${sources.size} of ${classpath.size} jars")
+    }
     sourcesAskedFor ++= classpath
+    HostLog.info(s"build imported in ${(System.nanoTime() - start) / 1_000_000} ms: ${next.size} modules " +
+      s"(${added - (replaced -- removed).size} new, ${(replaced -- removed).size} added again, ${removed.size} removed), " +
+      s"$opened sources opened, $closed closed, ${files.size} in all")
   }
+
+  /** How many modules the build has (as last imported). */
+  def moduleCount: Int = imported.size
 
   private def open(source: Path, text: String, module: HostModule): Unit = files.put(source, host.openFile(source, text, module))
 
@@ -417,16 +440,20 @@ final class ProjectSession private (
 }
 
 object ProjectSession {
-  /** Imports the build at `root` over BSP, adds its modules to `host` and opens all their sources from disk. */
-  def open(host: ScalaPsiHost, root: Path, connection: Option[String] = None): ProjectSession = {
-    val build = BspImport.connect(root, connection)
+  /**
+   * Imports the build at `root` over BSP, adds its modules to `host` and opens all their sources from disk. Steps
+   * are logged and reported to `progress` as they start.
+   */
+  def open(host: ScalaPsiHost, root: Path, connection: Option[String] = None, progress: String => Unit = _ => ()): ProjectSession = {
+    progress("connecting to the build server")
+    val build = HostLog.timed(s"build server of $root connected")(BspImport.connect(root, connection))
     try {
       val javaHome = Path.of(System.getProperty("java.home"))
       host.addJdk(javaHome)
       // The JDK's sources, as the IDE attaches them to the JDK.
       Some(javaHome.resolve("lib/src.zip")).filter(Files.isRegularFile(_)).foreach(host.addJdkSources)
       val session = new ProjectSession(host, build)
-      session.importBuild(reload = false)
+      session.importBuild(reload = false, progress)
       session
     } catch {
       case e: Throwable =>

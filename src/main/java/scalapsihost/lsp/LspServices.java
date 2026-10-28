@@ -13,7 +13,7 @@ import org.eclipse.lsp4j.services.WorkspaceService;
 final class LspServices {
   private LspServices() {}
 
-  abstract static class Server implements LanguageServer, LanguageClientAware {}
+  abstract static class Server implements LanguageServer, LanguageClientAware, HostProtocol.Server {}
 
   abstract static class TextDocuments implements TextDocumentService {}
 
