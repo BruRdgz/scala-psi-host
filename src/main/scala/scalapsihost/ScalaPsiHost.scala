@@ -39,8 +39,17 @@ import scala.jdk.CollectionConverters.*
  * @param scalaPluginJars the Scala plugin's jars; they must also be on the classpath
  * @param unitTestMode    answer `isUnitTestMode` as the plugin's test fixture does; only for comparing with the
  *                        plugin's own tests, since the plugin changes behaviour in that mode
+ * @param compilerErrorsScala3 errors of Scala 3 files come from the build's compiler, as by default in the IDE: the
+ *                             plugin then reports only checks that do not need types (see [[ScalaPsiHost.isCompilerHighlighted]])
+ * @param compilerErrorsScala2 the same for Scala 2 files (off by default, as in the IDE)
  */
-final case class HostConfig(stateDir: Path, scalaPluginJars: Seq[Path], unitTestMode: Boolean = false)
+final case class HostConfig(
+  stateDir: Path,
+  scalaPluginJars: Seq[Path],
+  unitTestMode: Boolean = false,
+  compilerErrorsScala3: Boolean = true,
+  compilerErrorsScala2: Boolean = false,
+)
 
 /**
  * Scala PSI and type checker hosted without an IntelliJ application container. The host installs three fixed
@@ -178,6 +187,13 @@ final class ScalaPsiHost private (
   }
 
   /**
+   * Whether `file`'s errors come from the build's compiler (see [[HostConfig.compilerErrorsScala3]]). For such a file
+   * [[diagnostics]] has only the plugin's checks that do not need types, and the caller adds the compiler's problems.
+   */
+  def isCompilerHighlighted(file: ScalaFile): Boolean =
+    org.jetbrains.plugins.scala.settings.ScalaHighlightingMode.isShowErrorsFromCompilerEnabled(file)
+
+  /**
    * The problems the IDE's highlighting pass reports for `file`: syntax errors, and the plugin's `ScalaAnnotator`
    * run over every element through the platform's annotation session. Presentation-only annotations (no message)
    * are left out.
@@ -299,12 +315,20 @@ object ScalaPsiHost {
     CoreApplicationEnvironment.registerExtensionPoint(area, "com.intellij.multiverseEnabler", classOf[com.intellij.codeInsight.multiverse.MultiverseEnabler])
     // Java PSI of library classes asks for augmentations (Lombok-style); there are none.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.augment.PsiAugmentProvider.EP_NAME, classOf[com.intellij.psi.augment.PsiAugmentProvider])
-    // Which syntax errors are shown. Only the plugin's ScalaDoc filter: the compiler-highlighting filter defers to
-    // compiler output, which the host does not have.
+    // Which syntax errors are shown: not inside ScalaDoc, and not in files whose errors come from the compiler.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.codeInsight.highlighting.HighlightErrorFilter.EP_NAME.getName,
       classOf[com.intellij.codeInsight.highlighting.HighlightErrorFilter])
-    area.getExtensionPoint[com.intellij.codeInsight.highlighting.HighlightErrorFilter](com.intellij.codeInsight.highlighting.HighlightErrorFilter.EP_NAME.getName)
-      .registerExtension(new org.jetbrains.plugins.scala.codeInsight.highlighting.ScalaDocHighlightErrorFilter, root)
+    locally {
+      val filters = area.getExtensionPoint[com.intellij.codeInsight.highlighting.HighlightErrorFilter](
+        com.intellij.codeInsight.highlighting.HighlightErrorFilter.EP_NAME.getName)
+      filters.registerExtension(new org.jetbrains.plugins.scala.codeInsight.highlighting.ScalaDocHighlightErrorFilter, root)
+      // The plugin's CompilerHighlightingErrorFilter lives in its compiler-integration module (JPS, compile server),
+      // which the host does not load; this is the same rule, decided by the plugin's ScalaHighlightingMode.
+      filters.registerExtension(new com.intellij.codeInsight.highlighting.HighlightErrorFilter {
+        override def shouldHighlightErrorElement(element: com.intellij.psi.PsiErrorElement): Boolean =
+          !org.jetbrains.plugins.scala.settings.ScalaHighlightingMode.isShowErrorsFromCompilerEnabled(element.getContainingFile)
+      }, root)
+    }
     // Java class files look for their source mirror through these policies; the host attaches no library sources.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy.EP_NAME,
       classOf[com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy])
@@ -667,10 +691,9 @@ object ScalaPsiHost {
       val settings = new org.jetbrains.plugins.scala.settings.ScalaProjectSettings(project)
       // Library extensions are jars downloaded from build resolvers and loaded into the IDE: out of scope.
       settings.setEnableLibraryExtensions(false)
-      // The host has no compiler: errors always come from the plugin's own (type-aware) highlighting, also for Scala 3,
-      // where the IDE defaults to compiler-based highlighting.
-      settings.setCompilerHighlightingScala3(false)
-      settings.setCompilerHighlightingScala2(false)
+      // Where errors come from: the build's compiler (the caller adds its problems) or the plugin's type-aware checks.
+      settings.setCompilerHighlightingScala3(config.compilerErrorsScala3)
+      settings.setCompilerHighlightingScala2(config.compilerErrorsScala2)
       // Type mismatches as diagnostics on the expression, not as editor inlay hints (which LSP clients lack).
       settings.setTypeMismatchHints(false)
       settings
