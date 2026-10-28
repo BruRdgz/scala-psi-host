@@ -22,7 +22,7 @@ agrees with the host, and the cases that do not agree are explained in the READM
 
 ## Alpha 2 — read-only features, and the gaps of alpha 1
 
-- Measurements: hover and definition latency, memory over long sessions.
+- The memory held per edit (`SessionBenchmark --edit-file`, about 0.3 MB per edit): locate it and let it go.
 - A real Scala 2 project as an acceptance test.
 
 ## Alpha 3 — project-wide search

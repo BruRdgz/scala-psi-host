@@ -138,9 +138,36 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   errors, timings, heap and a class histogram. On a 522-file Scala 3 project: no errors with compiler errors (the
   default), 81 with the plugin's type-aware checks (the same the IDE shows in its built-in mode).
 
+- `oracle.SessionBenchmark <project> <report.md>` — latency and memory of a session as the language server runs it:
+  requests at identifiers sampled over the project's files, then rounds of edits with heap samples.
+
 Run them with `sbt "Test/runMain scalapsihost.oracle.<Name> ..."`.
 
+## Measurements
+
+`SessionBenchmark` on a 522-file Scala 3 project (2 GB heap, one thread, 2026-10-28):
+
+| Request | p50 ms | p95 ms | p99 ms |
+|---|---|---|---|
+| hover | 0 | 28 | 83 |
+| definition | 0 | 2 | 8 |
+| document highlights | 1 | 66 | 267 |
+| document symbols, folding ranges (per file) | 0 | 1 | 2 |
+| semantic tokens (per file, first time) | 41 | 775 | 1432 |
+| problems (per file, first time; plugin and Scala 3 compiler) | 261 | 1638 | 4248 |
+| problems after an edit | 142 | 328 | 589 |
+| semantic tokens after an edit | 29 | 64 | 71 |
+
+Opening the project takes 18–24 s (BSP import, library sources, modules, parsing and indexing the sources); the heap
+holds 650 MB after opening and 1.4 GB once every file was highlighted. Editing one file over and over, the heap
+after a full GC grows by about 0.3 MB per edit (see [Known limitations](#known-limitations)).
+
 ## Known limitations
+
+- Memory held per edit: about 0.3 MB stays reachable after each edit and the requests that follow it (a long day of
+  typing adds a few hundred MB). Not yet located.
+- Requests are answered one at a time, in order: while a file's problems or semantic tokens are computed (seconds
+  for the slowest files) or the build reloads, other requests wait.
 
 - Scala 2 has no document compilation (its compiler has no stable interface to call); Scala 2 errors come from the
   plugin, or from the build's compile when compiler errors are enabled for Scala 2.
