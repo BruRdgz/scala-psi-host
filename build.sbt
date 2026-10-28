@@ -60,7 +60,8 @@ lazy val root = (project in file("."))
       "org.jetbrains" % "markdown-jvm" % "0.7.3" intransitive(),
       "org.apache.commons" % "commons-text" % "1.12.0" intransitive(),
       "org.scalameta" %% "munit" % "1.3.4" % Test,
-      "org.scala-lang" % "scala-library" % "2.13.16" % Fixtures intransitive(),
+      // 2.13.18 is the plugin's latest 2.13 (ScalaVersion.Latest): its library-highlighting test data is for these sources.
+      ("org.scala-lang" % "scala-library" % "2.13.18" % Fixtures intransitive()).withSources(),
       // The plugin's type-inference tests run on Scala 2.12 by default (ScalaSdkOwner.defaultSdkVersion).
       "org.scala-lang" % "scala-library" % "2.12.21" % Fixtures212 intransitive(),
     ),
@@ -73,17 +74,22 @@ lazy val root = (project in file("."))
     Test / javaOptions ++= {
       val state = target.value / "host-state"
       val report = update.value
-      def fixture(configuration: Configuration) = report.select(configurationFilter(configuration.name)) match {
-        case Seq(jar) => jar
-        case other => sys.error(s"expected exactly one jar in ${configuration.name}, got: $other")
-      }
+      def fixture(configuration: Configuration, classifier: String = "") =
+        report.select(configurationFilter(configuration.name), moduleFilter(), artifactFilter(classifier = classifier)) match {
+          case Seq(jar) => jar
+          case other => sys.error(s"expected exactly one ${if (classifier.isEmpty) "jar" else classifier + " jar"} in ${configuration.name}, got: $other")
+        }
       Seq(
         // Indexed library PSI is AST-backed (the IDE keeps it stub-backed): the whole scala-library needs > 768 MB.
         "-Xmx2g",
         "-Djava.awt.headless=true",
+        // As the IDE's and the plugin's test JVMs: in unit-test mode the platform records annotation-builder creation
+        // traces through Throwable internals.
+        "--add-opens=java.base/java.lang=ALL-UNNAMED",
         s"-Dscalapsihost.stateDir=$state",
         s"-Dscalapsihost.scalaPluginJars=${scalaPluginJars.value.mkString(java.io.File.pathSeparator)}",
         s"-Dscalapsihost.fixture.scalaLibrary=${fixture(Fixtures)}",
+        s"-Dscalapsihost.fixture.scalaLibrarySources=${fixture(Fixtures, "sources")}",
         s"-Dscalapsihost.fixture.scalaLibrary212=${fixture(Fixtures212)}",
       )
     },

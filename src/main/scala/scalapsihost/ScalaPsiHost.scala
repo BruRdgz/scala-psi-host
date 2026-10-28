@@ -82,7 +82,10 @@ final class ScalaPsiHost private (
   }
 
   /** Mounts the JDK's modules. Java classes are read on demand, not indexed. */
-  def addJdk(javaHome: Path): Unit = libraryFiles.mountJdk(javaHome)
+  def addJdk(javaHome: Path): Unit = {
+    libraryFiles.mountJdk(javaHome)
+    psiChanged()
+  }
 
   /**
    * The problems the IDE's highlighting pass reports for `file`: syntax errors, and the plugin's `ScalaAnnotator`
@@ -90,9 +93,11 @@ final class ScalaPsiHost private (
    * are left out.
    */
   def diagnostics(file: ScalaFile): Seq[Diagnostic] = {
-    val syntaxErrors = SyntaxTraverser.psiTraverser(file).filter(classOf[PsiErrorElement]).asScala.toSeq.map { e =>
-      Diagnostic(HighlightSeverity.ERROR, e.getTextRange, e.getErrorDescription)
-    }
+    // As the IDE's highlighting visitor: error elements the filters reject (e.g. inside ScalaDoc) are not reported.
+    val errorFilters = com.intellij.codeInsight.highlighting.HighlightErrorFilter.EP_NAME.getExtensions(project).asScala
+    val syntaxErrors = SyntaxTraverser.psiTraverser(file).filter(classOf[PsiErrorElement]).asScala.toSeq
+      .filter(e => errorFilters.forall(_.shouldHighlightErrorElement(e)))
+      .map(e => Diagnostic(HighlightSeverity.ERROR, e.getTextRange, e.getErrorDescription))
     val annotator = new org.jetbrains.plugins.scala.annotator.ScalaAnnotator
     val annotations = AnnotationSessionImpl.computeWithSession(file, /* batchMode = */ false, annotator, { holder =>
       val impl = holder.asInstanceOf[AnnotationHolderImpl]
@@ -132,6 +137,7 @@ object ScalaPsiHost {
       Files.createDirectories(dir)
       System.setProperty(s"idea.$kind.path", dir.toString)
     }
+    com.intellij.openapi.diagnostic.Logger.setFactory((category: String) => new HostLogger(category))
     val root: Disposable = Disposer.newDisposable("scala-psi-host")
     val appServices = new ServiceTable("Application")
     val projectServices = new ServiceTable("Project")
@@ -203,6 +209,15 @@ object ScalaPsiHost {
     CoreApplicationEnvironment.registerExtensionPoint(area, "com.intellij.multiverseEnabler", classOf[com.intellij.codeInsight.multiverse.MultiverseEnabler])
     // Java PSI of library classes asks for augmentations (Lombok-style); there are none.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.augment.PsiAugmentProvider.EP_NAME, classOf[com.intellij.psi.augment.PsiAugmentProvider])
+    // Which syntax errors are shown. Only the plugin's ScalaDoc filter: the compiler-highlighting filter defers to
+    // compiler output, which the host does not have.
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.codeInsight.highlighting.HighlightErrorFilter.EP_NAME.getName,
+      classOf[com.intellij.codeInsight.highlighting.HighlightErrorFilter])
+    area.getExtensionPoint[com.intellij.codeInsight.highlighting.HighlightErrorFilter](com.intellij.codeInsight.highlighting.HighlightErrorFilter.EP_NAME.getName)
+      .registerExtension(new org.jetbrains.plugins.scala.codeInsight.highlighting.ScalaDocHighlightErrorFilter, root)
+    // Java class files look for their source mirror through these policies; the host attaches no library sources.
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy.EP_NAME,
+      classOf[com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy])
 
     appServices.register(classOf[ProgressManager])(new CoreProgressManager)
     appServices.register(classOf[PsiBuilderFactory])(new PsiBuilderFactoryImpl)
@@ -256,12 +271,23 @@ object ScalaPsiHost {
     appServices.register(classOf[com.intellij.openapi.editor.elf.Elf])(tableProxy(classOf[com.intellij.openapi.editor.elf.Elf], "Elf") {
       case ("runReadAction", Array(f: kotlin.jvm.functions.Function0[?])) => f.invoke().asInstanceOf[AnyRef]
     })
-    // The type-mismatch annotation fetches the global color scheme for its inlay hint, which the host turns off
-    // (ScalaProjectSettings below). The host has no colors: the scheme answers nothing.
-    lazy val noColors = tableProxy(classOf[com.intellij.openapi.editor.colors.EditorColorsScheme], "EditorColorsScheme")(PartialFunction.empty)
+    // Annotations fetch the global color scheme for presentation (inlay hints, error-stripe-only attributes). The
+    // host presents nothing: every key has empty attributes.
+    lazy val noColors = tableProxy(classOf[com.intellij.openapi.editor.colors.EditorColorsScheme], "EditorColorsScheme") {
+      case ("getAttributes", _) => new com.intellij.openapi.editor.markup.TextAttributes()
+    }
     appServices.register(classOf[com.intellij.openapi.editor.colors.EditorColorsManager])(new Host_EditorColorsManager(dispatch {
       case ("EditorColorsManager.getGlobalScheme", _) => noColors
     }))
+    // Plugin attribution of logged platform errors (e.g. an annotation range outside its element); the host does not
+    // track plugins, so the exception names none.
+    appServices.register(classOf[com.intellij.diagnostic.PluginProblemReporter])(
+      tableProxy(classOf[com.intellij.diagnostic.PluginProblemReporter], "PluginProblemReporter") {
+        case ("createPluginExceptionByClass", Array(message: String, cause, _)) =>
+          new com.intellij.diagnostic.PluginException(message, cause.asInstanceOf[Throwable], null)
+      })
+    // Annotations carry their quick fixes, which the platform wraps as intentions when the annotation is created.
+    appServices.register(classOf[com.intellij.modcommand.ModCommandService])(new com.intellij.lang.impl.modcommand.ModCommandServiceImpl)
     // Platform library implementations used by Java PSI of library classes and by PSI copies.
     appServices.register(classOf[com.intellij.psi.util.JavaClassSupers])(new com.intellij.psi.impl.JavaClassSupersImpl)
     appServices.register(classOf[com.intellij.psi.PsiSubstitutorFactory])(new com.intellij.psi.impl.PsiSubstitutorFactoryImpl)
@@ -273,6 +299,8 @@ object ScalaPsiHost {
       new org.jetbrains.plugins.scala.lang.parser.Scala3ParserDefinition,
       new org.jetbrains.plugins.scalaDoc.lang.parser.ScalaDocParserDefinition,
       new org.jetbrains.plugins.scalaDirective.lang.parser.ScalaDirectiveParserDefinition,
+      // The contents of ScalaDoc links ([[scala.Option]]), parsed lazily inside doc comments.
+      new org.jetbrains.plugins.scala.lang.scaladoc.reflinks.ScalaDocRefLinkParserDefinition,
     )
     parserDefinitions.foreach(pd => LanguageParserDefinitions.INSTANCE.addExplicitExtension(pd.getFileNodeType.getLanguage, pd))
     val scalaLang = org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE
@@ -403,6 +431,8 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.openapi.roots.FileIndexFacade])(new Host_FileIndexFacade(project, dispatch {
       case ("FileIndexFacade.isInLibraryClasses" | "FileIndexFacade.isInLibrary", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibraryClass(f))
       case ("FileIndexFacade.isInLibrarySource", _) => java.lang.Boolean.FALSE
+      // Roots change only when a library or the JDK is mounted, which also counts as a PSI change.
+      case ("FileIndexFacade.getRootModificationTracker", _) => psiModificationCount
       case ("FileIndexFacade.isInSource" | "FileIndexFacade.isInSourceContent" | "FileIndexFacade.isInContent", Array(f: VirtualFile)) =>
         java.lang.Boolean.valueOf(!isLibraryClass(f))
     }))
@@ -469,6 +499,13 @@ object ScalaPsiHost {
       case ("NullableNotNullManager.getNullityDefault", _) => com.intellij.codeInsight.ContextNullabilityInfo.EMPTY
       case ("NullableNotNullManager.findEffectiveNullabilityInfo", _) => null
     }))
+    // Java class files navigate to their sources through this helper; the host attaches none, so a class file is its
+    // own navigation element, as in the IDE for a library without sources.
+    projectServices.register(classOf[com.intellij.psi.impl.JavaPsiImplementationHelper])(new Host_JavaPsiImplementationHelper(dispatch {
+      case ("JavaPsiImplementationHelper.getClsFileNavigationElement", Array(f: com.intellij.psi.PsiJavaFile)) => f
+    }))
+    // Auto-import exclusions, read by quick fixes that look for importable implicit instances: the defaults.
+    projectServices.register(classOf[com.intellij.codeInsight.JavaProjectCodeInsightSettings])(new com.intellij.codeInsight.JavaProjectCodeInsightSettings)
     // No language injection in the host: every file is its own top-level file.
     projectServices.register(classOf[com.intellij.lang.injection.InjectedLanguageManager])(new Host_InjectedLanguageManager(dispatch {
       case ("InjectedLanguageManager.getTopLevelFile", Array(e: com.intellij.psi.PsiElement)) => e.getContainingFile
