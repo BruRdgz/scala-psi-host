@@ -53,6 +53,7 @@ final case class CompileResult(succeeded: Boolean, diagnostics: Map[Path, Seq[Co
 final class BuildConnection private[scalapsihost] (
   process: Process,
   server: BspImport.HostBuildServer,
+  capabilities: BuildServerCapabilities,
   client: BspImport.DiagnosticsClient,
   timeoutMinutes: Long,
 ) extends AutoCloseable {
@@ -98,6 +99,24 @@ final class BuildConnection private[scalapsihost] (
     }
     BspImport.dependenciesFirst(modules)
   }
+
+  /**
+   * The source jars of the Scala modules' classpath jars, as the build server provides them (sbt downloads them on
+   * this request): classpath jar → its source jar. A source jar is paired with the classpath jar of the same name
+   * without `-sources`, next to it (as dependency caches lay them out); the others are left out. Nothing when the
+   * server does not provide dependency sources.
+   */
+  def librarySources(classpath: Set[Path]): Map[Path, Path] =
+    if (!Option(capabilities.getDependencySourcesProvider).exists(_.booleanValue)) Map.empty
+    else {
+      val result = await(server.buildTargetDependencySources(new DependencySourcesParams(scalaTargets.map(_.getId).asJava)))
+      val sourceJars = result.getItems.asScala.toSeq.flatMap(_.getSources.asScala).map(uri => Path.of(URI.create(uri))).distinct
+      sourceJars.flatMap { sources =>
+        val name = sources.getFileName.toString
+        Option.when(name.endsWith("-sources.jar"))(sources.resolveSibling(name.stripSuffix("-sources.jar") + ".jar"))
+          .filter(classpath.contains).map(_ -> sources)
+      }.toMap
+    }
 
   /**
    * Compiles every Scala target (incrementally, as the build server does) and returns the compiler's problems by
@@ -152,14 +171,14 @@ object BspImport {
       .create()
     launcher.startListening()
     val server = launcher.getRemoteProxy
-    server.buildInitialize(new InitializeBuildParams(
+    val initialized = server.buildInitialize(new InitializeBuildParams(
       "scala-psi-host", "0.1", BspVersion, projectDir.toUri.toString,
       new BuildClientCapabilities(java.util.List.of("scala")))).get(timeoutMinutes, TimeUnit.MINUTES)
     server.onBuildInitialized()
     // A build server that was already running (sbt keeps its server between clients) may hold an older build
     // definition: reload it, as IDEs do on import.
     server.workspaceReload().get(timeoutMinutes, TimeUnit.MINUTES)
-    new BuildConnection(process, server, client, timeoutMinutes)
+    new BuildConnection(process, server, initialized.getCapabilities, client, timeoutMinutes)
   }
 
   /** Imports the build's Scala modules, each after the modules it depends on, and disconnects. */

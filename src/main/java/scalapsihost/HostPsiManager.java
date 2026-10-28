@@ -98,7 +98,8 @@ public final class HostPsiManager extends PsiManagerEx {
   @Override public void removePsiTreeChangeListener(PsiTreeChangeListener l) { no("removePsiTreeChangeListener"); }
   @Override public void startBatchFilesProcessingMode() { no("startBatchFilesProcessingMode"); }
   @Override public void finishBatchFilesProcessingMode() { no("finishBatchFilesProcessingMode"); }
-  @Override public <T> T runInBatchFilesMode(Computable<T> c) { return no("runInBatchFilesMode"); }
+  // A hint that many files are processed (the IDE then lets their PSI go sooner); the host has no such mode.
+  @Override public <T> T runInBatchFilesMode(Computable<T> c) { hit("runInBatchFilesMode"); return c.compute(); }
   @Override public void dropResolveCaches() { no("dropResolveCaches"); }
   @Override public void dropPsiCaches() { no("dropPsiCaches"); }
   @Override public boolean isInProject(PsiElement e) { return no("isInProject"); }

@@ -11,9 +11,10 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 /**
- * Library class roots as read-only VirtualFiles: jars through the JDK's zip file system, JDK modules through
- * `jrt:`. Files have parents and children, so the plugin's and the platform's library code can navigate from a
- * class file to its directory (inner classes, `.tasty` siblings, library source directories).
+ * Library roots as read-only VirtualFiles: class roots (jars through the JDK's zip file system, JDK modules through
+ * `jrt:`) and source roots (source jars, the JDK's `src.zip`), as the IDE attaches sources to libraries. Files have
+ * parents and children, so the plugin's and the platform's library code can navigate from a class file to its
+ * directory (inner classes, `.tasty` siblings) and to its sources.
  *
  * This is not the IDE's VFS: no persistence, no refresh, no events. Contents never change while mounted.
  */
@@ -29,8 +30,23 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem {
   /** Mounts a jar; returns its root directory. */
   def mountJar(jar: Path): VirtualFile = {
     val zip = FileSystems.newFileSystem(jar)
-    mount(jar.toAbsolutePath.toString, zip.getPath("/"))
+    mount(jar.toAbsolutePath.toString, zip.getPath("/"), sources = false)
   }
+
+  /**
+   * Mounts a source archive (a source jar, or a directory of one such as a JDK module's in `src.zip`) as a source
+   * root; returns its root directory. Mounting an archive twice mounts it once.
+   */
+  def mountSources(archive: Path, directory: String = ""): VirtualFile = synchronized {
+    val name = if (directory.isEmpty) archive.toAbsolutePath.toString else s"${archive.toAbsolutePath}!/$directory"
+    Option(roots.get(name)).getOrElse {
+      val zip = sourceArchives.computeIfAbsent(archive.toAbsolutePath, a => FileSystems.newFileSystem(a))
+      mount(name, zip.getPath("/" + directory), sources = true)
+    }
+  }
+
+  // Each archive's zip file system, opened once however many of its directories are mounted.
+  private val sourceArchives = new ConcurrentHashMap[Path, FileSystem]()
 
   /** Mounts every module of the JDK at `javaHome` as a class root (as the IDE does); returns the module roots. */
   def mountJdk(javaHome: Path): Seq[VirtualFile] = {
@@ -38,12 +54,17 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem {
       if (Files.isSameFile(javaHome, Path.of(System.getProperty("java.home")))) FileSystems.getFileSystem(URI.create("jrt:/"))
       else FileSystems.newFileSystem(URI.create("jrt:/"), Map("java.home" -> javaHome.toString).asJava)
     val modules = Using.resource(Files.list(jrt.getPath("/modules")))(_.iterator().asScala.toVector.sortBy(_.toString))
-    modules.map(module => mount(s"jrt:$javaHome!/${module.getFileName}", module))
+    modules.map(module => mount(s"jrt:$javaHome!/${module.getFileName}", module, sources = false))
   }
 
-  def classRoots: Seq[VirtualFile] = roots.synchronized(roots.values().asScala.toVector)
+  def classRoots: Seq[VirtualFile] = roots.synchronized(roots.values().asScala.toVector.filterNot(_.isLibrarySource))
 
-  /** File name → files, over every mounted root; rebuilt after a mount. What the IDE's FilenameIndex holds for jars. */
+  def sourceRoots: Seq[VirtualFile] = roots.synchronized(roots.values().asScala.toVector.filter(_.isLibrarySource))
+
+  /**
+   * File name → files, over every mounted root (classes and sources); rebuilt after a mount. What the IDE's
+   * FilenameIndex holds for libraries.
+   */
   @volatile private var byName: Map[String, Seq[VirtualFile]] = null
 
   def filesNamed(name: String): Seq[VirtualFile] = {
@@ -51,15 +72,15 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem {
     if (index == null) {
       val all = Vector.newBuilder[VirtualFile]
       def visit(f: VirtualFile): Unit = { all += f; if (f.isDirectory) f.getChildren.foreach(visit) }
-      classRoots.foreach(r => r.getChildren.foreach(visit))
+      roots.synchronized(roots.values().asScala.toVector).foreach(r => r.getChildren.foreach(visit))
       index = all.result().groupBy(_.getName)
       byName = index
     }
     index.getOrElse(name, Seq.empty)
   }
 
-  private def mount(name: String, rootPath: Path): VirtualFile = {
-    val root = new LibraryFile(this, ids.incrementAndGet(), rootPath, parent = null, rootName = name)
+  private def mount(name: String, rootPath: Path, sources: Boolean): VirtualFile = {
+    val root = new LibraryFile(this, ids.incrementAndGet(), rootPath, parent = null, rootName = name, sourcesRoot = sources)
     files.put(rootPath, root)
     roots.put(name, root)
     byName = null
@@ -67,7 +88,7 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem {
   }
 
   private[scalapsihost] def child(parent: LibraryFile, path: Path): LibraryFile =
-    files.computeIfAbsent(path, p => new LibraryFile(this, ids.incrementAndGet(), p, parent, rootName = null))
+    files.computeIfAbsent(path, p => new LibraryFile(this, ids.incrementAndGet(), p, parent, rootName = null, sourcesRoot = false))
 
   /** Paths look like `<root name>!/<entry>`, as for the IDE's jar file system. */
   override def findFileByPath(path: String): VirtualFile = {
@@ -98,8 +119,18 @@ final class LibraryFile private[scalapsihost] (
   val nioPath: Path,
   parent: LibraryFile,
   rootName: String,
+  sourcesRoot: Boolean,
 ) extends VirtualFile with VirtualFileWithId {
   override def getId: Int = id
+
+  /** Under a source root (library sources), not a class root. */
+  val isLibrarySource: Boolean = if (parent == null) sourcesRoot else parent.isLibrarySource
+
+  /** The root this file is under. */
+  def root: LibraryFile = if (parent == null) this else parent.root
+
+  /** The path from the root, `/`-separated (empty for the root). */
+  def entry: String = if (parent == null) "" else root.nioPath.relativize(nioPath).toString.stripSuffix("/")
 
   private lazy val directory = Files.isDirectory(nioPath)
 

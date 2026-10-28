@@ -86,6 +86,9 @@ final class ProjectSession private (
 
   def sourceFiles: Seq[Path] = files.keySet.toArray(Array.empty[Path]).toSeq
 
+  /** Whether `path` is a source file of the project (not, say, a library file the editor opened). */
+  def isSource(path: Path): Boolean = files.containsKey(path)
+
   private def file(path: Path): PsiFile =
     Option(files.get(path)).getOrElse(throw new IllegalArgumentException(s"not a source file of the project: $path"))
 
@@ -190,19 +193,51 @@ final class ProjectSession private (
     types.toSeq.flatten.flatMap(sourceLocation)
   }
 
-  // A declaration's file and the position of its name, when it is in the project's sources.
+  /**
+   * A declaration's file and the position of its name. A library declaration is in a file of the host's state
+   * directory (see [[libraryFileOnDisk]]): its library's attached source, found as the IDE finds it (the declaration's
+   * navigation element), or else its decompiled class file, as the IDE shows a library without sources.
+   */
   private def sourceLocation(declaration: PsiElement): Option[(Path, LineColumn)] = {
     val target = declaration.getNavigationElement
+    val nameOffset = target match {
+      case named: PsiNameIdentifierOwner if named.getNameIdentifier != null => named.getNameIdentifier.getTextOffset
+      case other => other.getTextOffset
+    }
     for {
       targetFile <- Option(target.getContainingFile)
-      source <- Option(targetFile.getViewProvider.getVirtualFile).collect { case s: SourceFile => s }
-    } yield {
-      val nameOffset = target match {
-        case named: PsiNameIdentifierOwner if named.getNameIdentifier != null => named.getNameIdentifier.getTextOffset
-        case other => other.getTextOffset
+      location <- targetFile.getViewProvider.getVirtualFile match {
+        case source: SourceFile => Some(source.path -> position(document(targetFile), nameOffset))
+        case library: LibraryFile =>
+          val text = targetFile.getText
+          val at = StringUtil.offsetToLineColumn(text, nameOffset)
+          Some(libraryFileOnDisk(library, targetFile, text) -> LineColumn(at.line, at.column))
+        case _ => None
       }
-      source.path -> position(document(targetFile), nameOffset)
+    } yield location
+  }
+
+  /**
+   * A library file's text written under the state directory, at its path inside its library (by root, so files
+   * of different jars stay apart): editors open plain files, not entries of jars. A class file is written as the
+   * source the IDE decompiles it to (`.scala`, or `.java` for Java classes). Written read-only, and again only when
+   * its text changed (a snapshot jar replaced in place).
+   */
+  private def libraryFileOnDisk(file: LibraryFile, psi: PsiFile, text: String): Path = {
+    val rootName = file.root.getName
+    val rootDirectory = s"${rootName.substring(rootName.lastIndexOf('/') + 1)}-${Integer.toHexString(rootName.hashCode)}"
+    val entry = if (file.isLibrarySource) file.entry else {
+      val extension = if (psi.isInstanceOf[ScalaFile]) ".scala" else ".java"
+      file.entry.substring(0, file.entry.lastIndexOf('.')) + extension
     }
+    val onDisk = host.stateDir.resolve("library-files").resolve(rootDirectory).resolve(entry)
+    if (!Files.exists(onDisk) || Files.readString(onDisk) != text) {
+      Files.createDirectories(onDisk.getParent)
+      onDisk.toFile.setWritable(true)
+      Files.writeString(onDisk, text)
+      onDisk.toFile.setReadOnly()
+    }
+    onDisk
   }
 
   /**
@@ -333,12 +368,16 @@ object ProjectSession {
     val build = BspImport.connect(root, connection)
     try {
       val imported = build.modules()
-      host.addJdk(Path.of(System.getProperty("java.home")))
+      val javaHome = Path.of(System.getProperty("java.home"))
+      host.addJdk(javaHome)
       val files = new ConcurrentHashMap[Path, PsiFile]()
       for (m <- imported) {
         val module = host.addModule(m.spec)
         for (source <- m.sources) files.put(source, host.openFile(source, Files.readString(source), module))
       }
+      // Library sources, as the IDE attaches them on import: the build's source jars, and the JDK's src.zip.
+      for ((jar, sources) <- build.librarySources(imported.flatMap(_.spec.classpath).toSet)) host.addLibrarySources(jar, sources)
+      Some(javaHome.resolve("lib/src.zip")).filter(Files.isRegularFile(_)).foreach(host.addJdkSources)
       new ProjectSession(host, build, files, imported.map(m => m.spec.name -> m.compile).toMap)
     } catch {
       case e: Throwable =>

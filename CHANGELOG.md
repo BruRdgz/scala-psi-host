@@ -2,7 +2,9 @@
 
 ## Unreleased
 
-- Go to type definition, as the IDE's "go to type declaration" (project sources).
+- Go to definition and type definition into libraries: their attached sources (the build's source jars, the JDK's
+  `src.zip`), or their decompiled class files.
+- Go to type definition, as the IDE's "go to type declaration".
 - Document highlights: a symbol's occurrences in the file, as reads or writes.
 - Document symbols, from the plugin's structure view.
 - Folding ranges, from the plugin's folding builder (with `//region` and `<editor-fold>` regions).

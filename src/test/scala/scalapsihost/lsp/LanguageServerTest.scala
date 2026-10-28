@@ -116,6 +116,21 @@ class LanguageServerTest extends munit.FunSuite {
     assertEquals(locations.map(l => (l.getUri, l.getRange.getStart)), Seq((greeting.toUri.toString, new Position(3, 6))))
   }
 
+  // `println` (line 7 of Main.scala): Predef's, in scala-library's source jar, which the build provides.
+  test("goes to a library declaration in the library's sources") {
+    val locations = server.getTextDocumentService.definition(new DefinitionParams(document(main), new Position(7, 4)))
+      .get(1, TimeUnit.MINUTES).getLeft.asScala.toSeq
+    assertEquals(locations.size, 1, locations)
+    val target = Path.of(java.net.URI.create(locations.head.getUri))
+    assert(target.toString.endsWith("scala/Predef.scala"), target)
+    val line = Files.readAllLines(target).get(locations.head.getRange.getStart.getLine)
+    assert(line.substring(locations.head.getRange.getStart.getCharacter).startsWith("println"), line)
+    // The editor may open it; it is not a project source, so the server answers nothing about it.
+    val hover = server.getTextDocumentService.hover(new HoverParams(new TextDocumentIdentifier(locations.head.getUri), new Position(0, 0)))
+      .get(1, TimeUnit.MINUTES)
+    assertEquals(hover, null)
+  }
+
   // `zero` (line 20) returns a Counter, declared on line 8.
   test("goes to the declaration of a symbol's type") {
     val locations = server.getTextDocumentService.typeDefinition(new TypeDefinitionParams(document(counter), new Position(20, 6)))

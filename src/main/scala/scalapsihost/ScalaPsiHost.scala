@@ -35,7 +35,8 @@ import java.util.concurrent.ConcurrentHashMap
 import scala.jdk.CollectionConverters.*
 
 /**
- * @param stateDir        the only place the platform writes to disk (index ID enumeration under `idea.system.path`)
+ * @param stateDir        where the host writes to disk: the platform's state (index ID enumeration under
+ *                        `idea.system.path`) and library files extracted for an editor to open
  * @param scalaPluginJars the Scala plugin's jars; they must also be on the classpath
  * @param unitTestMode    answer `isUnitTestMode` as the plugin's test fixture does; only for comparing with the
  *                        plugin's own tests, since the plugin changes behaviour in that mode
@@ -57,9 +58,11 @@ final case class HostConfig(
  * plugin's PSI. Whatever is not in a table fails loudly and is recorded in [[CallLog]].
  */
 final class ScalaPsiHost private (
+  val stateDir: Path,
   val project: Project,
   symbolIndex: SymbolIndex,
   libraryFiles: LibraryFileSystem,
+  librarySources: ConcurrentHashMap[VirtualFile, VirtualFile],
   val modules: ModuleModel,
   psiChanged: () => Unit,
 ) {
@@ -145,6 +148,27 @@ final class ScalaPsiHost private (
     val report = symbolIndex.indexLibrary(project, root, includeEntry)
     psiChanged()
     report
+  }
+
+  /**
+   * Attaches the sources of a mounted library jar (a source jar), as the IDE attaches library sources: navigation
+   * from the jar's classes leads to them. Source files are parsed when navigated to, never indexed.
+   */
+  def addLibrarySources(jar: Path, sources: Path): Unit = HostLock.write {
+    val root = Option(libraryRoots.get(jar.toRealPath())).getOrElse(throw new IllegalArgumentException(s"library jar is not mounted: $jar"))
+    librarySources.put(root, libraryFiles.mountSources(sources))
+    psiChanged()
+  }
+
+  /** Attaches the JDK's sources (its `lib/src.zip`, one directory per module) to the mounted JDK's modules. */
+  def addJdkSources(srcZip: Path): Unit = HostLock.write {
+    for (moduleRoot <- modules.jdkModuleRoots) {
+      val module = moduleRoot.getName.substring(moduleRoot.getName.lastIndexOf("!/") + 2)
+      val sources = libraryFiles.mountSources(srcZip, module)
+      // A JDK image may ship sources for some of its modules only.
+      if (sources.getChildren.nonEmpty) librarySources.put(moduleRoot, sources)
+    }
+    psiChanged()
   }
 
   /**
@@ -439,6 +463,16 @@ object ScalaPsiHost {
       // thread, and its write action keeps writers apart.
       new com.intellij.mock.MockFileDocumentManagerImpl(null, (text: CharSequence) =>
         new com.intellij.openapi.editor.impl.DocumentImpl(text, /* forUseInNonAWTThread = */ true)))
+    // Library source files are read as the IDE reads files from disk, guessing their charset: UTF-8 by default (the
+    // JDK's default since 18, and the build tools'), none set per file.
+    appServices.register(classOf[com.intellij.openapi.vfs.encoding.EncodingManager])(new Host_EncodingManager(dispatch {
+      case ("EncodingManager.getEncoding", _) => null
+      case ("EncodingManager.getDefaultCharset", _) => java.nio.charset.StandardCharsets.UTF_8
+    }))
+    // Transformations between a file's bytes and its text presentation, by file type; none for Scala or Java.
+    declare(com.intellij.openapi.vfs.transformer.TextPresentationTransformers.Companion.getEP.getName)
+    appServices.register(classOf[com.intellij.openapi.vfs.transformer.TextPresentationTransformers])(
+      new com.intellij.openapi.vfs.transformer.TextPresentationTransformers)
     // PSI writes check command state; the core processor tracks it without UI or undo.
     appServices.register(classOf[com.intellij.openapi.command.CommandProcessor])(new com.intellij.openapi.command.impl.CoreCommandProcessor)
     // PSI versioning (MVCC): the platform's service, which with persistent syntax trees off (the registry default)
@@ -644,7 +678,15 @@ object ScalaPsiHost {
     com.intellij.psi.stubs.BinaryFileStubBuilders.INSTANCE.addExplicitExtension(
       com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, new com.intellij.psi.impl.compiled.ClassFileStubBuilder)
     appServices.register(classOf[com.intellij.psi.stubs.StubTreeLoader])(new com.intellij.psi.stubs.CoreStubTreeLoader)
+    // File properties the IDE pushes to files (language levels), which stub builders read to version their stubs; the
+    // host pushes none.
+    appServices.register(classOf[com.intellij.openapi.roots.impl.PushedFilePropertiesRetriever])(
+      tableProxy(classOf[com.intellij.openapi.roots.impl.PushedFilePropertiesRetriever], "PushedFilePropertiesRetriever") {
+        case ("dumpSortedPushedProperties", _) => java.util.List.of()
+      })
     val libraryFiles = new LibraryFileSystem
+    // Class root → its attached source root.
+    val librarySources = new ConcurrentHashMap[VirtualFile, VirtualFile]()
     // The platform's file-based indexes: only the file-name index exists in the host, answered from library roots.
     appServices.register(classOf[com.intellij.util.indexing.FileBasedIndex])(new Host_FileBasedIndex(dispatch {
       case ("FileBasedIndex.processFilesContainingAnyKey",
@@ -694,17 +736,21 @@ object ScalaPsiHost {
       // front, while a physical one stays stub-based until something navigates into it.
       case lib: LibraryFile if com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType) != null =>
         com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType).createFileViewProvider(lib, null, psiManagerRef, true)
+      // Library sources, as project sources below (the plugin's substitutor reads Scala 3 from the source jar's name).
+      case lib: LibraryFile if lib.isLibrarySource => sourceViewProvider(lib)
       // Project sources are physical too: their syntax tree follows document commits (reparse) and can be dropped
       // when no one holds it. The language's view provider when it has one (Scala), the platform's default otherwise.
-      case source: SourceFile =>
-        // As the IDE's FileManagerImpl: the file type's language, as substituted for this file (Scala 3 modules).
-        val language = com.intellij.psi.LanguageSubstitutors.getInstance.substituteLanguage(
-          source.getFileType.asInstanceOf[com.intellij.openapi.fileTypes.LanguageFileType].getLanguage, source, project)
-        Option(LanguageFileViewProviders.INSTANCE.forLanguage(language))
-          .map(_.createFileViewProvider(source, language, psiManagerRef, true))
-          .getOrElse(new com.intellij.psi.SingleRootFileViewProvider(psiManagerRef, source, true))
+      case source: SourceFile => sourceViewProvider(source)
       case other => CallLog.unsupported(s"FileManager.findViewProvider for a file the host does not own: $other")
     })
+    // As the IDE's FileManagerImpl: the file type's language, as substituted for this file (Scala 3 modules).
+    def sourceViewProvider(source: VirtualFile): FileViewProvider = {
+      val language = com.intellij.psi.LanguageSubstitutors.getInstance.substituteLanguage(
+        source.getFileType.asInstanceOf[com.intellij.openapi.fileTypes.LanguageFileType].getLanguage, source, project)
+      Option(LanguageFileViewProviders.INSTANCE.forLanguage(language))
+        .map(_.createFileViewProvider(source, language, psiManagerRef, true))
+        .getOrElse(new com.intellij.psi.SingleRootFileViewProvider(psiManagerRef, source, true))
+    }
     val fileManager = tableProxy(classOf[com.intellij.psi.impl.file.impl.FileManagerEx], "FileManager") {
       case ("findCachedViewProvider", Array(f: VirtualFile)) => viewProviders.get(f)
       // One view provider per file (no code-insight contexts).
@@ -720,31 +766,42 @@ object ScalaPsiHost {
         if (!f.isDirectory) null
         else directories.computeIfAbsent(f, d => new com.intellij.psi.impl.file.PsiDirectoryImpl(psiManagerRef.asInstanceOf[com.intellij.psi.impl.PsiManagerEx], d))
     }
-    // Library class files live in the host's library file system; every other file is a source the host was given.
-    def isLibraryClass(f: VirtualFile) = f.getFileSystem.isInstanceOf[LibraryFileSystem]
+    // Library files (classes and attached sources) live in the host's library file system; every other file is a
+    // project source the host was given.
+    def isLibrary(f: VirtualFile) = f.getFileSystem.isInstanceOf[LibraryFileSystem]
+    def isLibrarySource(f: VirtualFile) = f match {
+      case lib: LibraryFile => lib.isLibrarySource
+      case _ => false
+    }
+    def isLibraryClass(f: VirtualFile) = isLibrary(f) && !isLibrarySource(f)
     val fileIndex = tableProxy(classOf[com.intellij.openapi.roots.ProjectFileIndex], "ProjectFileIndex") {
-      case ("isInLibrary" | "isInLibraryClasses", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibraryClass(f))
-      // No library sources are attached yet, so no workspace library or SDK entity has any to offer.
-      case ("isInLibrarySource", _) => java.lang.Boolean.FALSE
+      case ("isInLibrary", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibrary(f))
+      case ("isInLibraryClasses", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibraryClass(f))
+      case ("isInLibrarySource", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibrarySource(f))
+      // The host has no workspace model: no library or SDK entity contains a file.
       case ("findContainingLibraries" | "findContainingSdks", _) => java.util.List.of()
       // Files opened in a module; other files (light files, libraries) have none.
       case ("getModuleForFile", Array(f: VirtualFile, _*)) => moduleModel.ofFile(f).map(_.module).orNull
-      case ("isInSourceContent" | "isInContent" | "isInSource", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(!isLibraryClass(f))
+      case ("isInSourceContent" | "isInContent", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(!isLibrary(f))
+      // Sources: the project's and the libraries' attached ones.
+      case ("isInSource", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(!isLibraryClass(f))
       case ("isInTestSourceContent", _) => java.lang.Boolean.FALSE
       // Every source file the host was given is a production source; the plugin's filter scopes ask by root type.
       case ("isUnderSourceRootOfType", Array(f: VirtualFile, types: java.util.Set[?])) =>
-        java.lang.Boolean.valueOf(!isLibraryClass(f) && types.contains(org.jetbrains.jps.model.java.JavaSourceRootType.SOURCE))
+        java.lang.Boolean.valueOf(!isLibrary(f) && types.contains(org.jetbrains.jps.model.java.JavaSourceRootType.SOURCE))
     }
     projectServices.register(classOf[com.intellij.openapi.roots.ProjectFileIndex])(fileIndex)
     // The same answers through the platform's facade (ClassFileViewProvider asks it before building Java PSI).
     projectServices.register(classOf[com.intellij.openapi.roots.FileIndexFacade])(new Host_FileIndexFacade(project, dispatch {
-      case ("FileIndexFacade.isInLibraryClasses" | "FileIndexFacade.isInLibrary", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibraryClass(f))
-      case ("FileIndexFacade.isInLibrarySource", _) => java.lang.Boolean.FALSE
+      case ("FileIndexFacade.isInLibraryClasses", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibraryClass(f))
+      case ("FileIndexFacade.isInLibrary", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibrary(f))
+      case ("FileIndexFacade.isInLibrarySource", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibrarySource(f))
       // Roots change only when a library or the JDK is mounted, which also counts as a PSI change.
       case ("FileIndexFacade.getRootModificationTracker", _) => psiModTracker
       case ("FileIndexFacade.getModuleForFile", Array(f: VirtualFile)) => moduleModel.ofFile(f).map(_.module).orNull
-      case ("FileIndexFacade.isInSource" | "FileIndexFacade.isInSourceContent" | "FileIndexFacade.isInContent", Array(f: VirtualFile)) =>
-        java.lang.Boolean.valueOf(!isLibraryClass(f))
+      case ("FileIndexFacade.isInSourceContent" | "FileIndexFacade.isInContent", Array(f: VirtualFile)) =>
+        java.lang.Boolean.valueOf(!isLibrary(f))
+      case ("FileIndexFacade.isInSource", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(!isLibraryClass(f))
     }))
     // Tree changes reach the plugin's listener, which decides which of its caches an edit invalidates.
     val psiManager = new HostPsiManager(project, psiModTracker, fileManager, psiModTracker,
@@ -822,10 +879,20 @@ object ScalaPsiHost {
       case ("NullableNotNullManager.getNullityDefault", _) => com.intellij.codeInsight.ContextNullabilityInfo.EMPTY
       case ("NullableNotNullManager.findEffectiveNullabilityInfo", _) => null
     }))
-    // Java class files navigate to their sources through this helper; the host attaches none, so a class file is its
-    // own navigation element, as in the IDE for a library without sources.
+    // Java class files navigate to their sources through this helper, as the IDE's: the source file of the same
+    // package and name in the sources attached to the class's library, or the class file itself (a library without
+    // sources).
     projectServices.register(classOf[com.intellij.psi.impl.JavaPsiImplementationHelper])(new Host_JavaPsiImplementationHelper(dispatch {
-      case ("JavaPsiImplementationHelper.getClsFileNavigationElement", Array(f: com.intellij.psi.PsiJavaFile)) => f
+      case ("JavaPsiImplementationHelper.getClsFileNavigationElement", Array(f: com.intellij.psi.PsiJavaFile)) =>
+        val source = for {
+          classFile <- Option(f.getVirtualFile).collect { case lib: LibraryFile => lib }
+          sourceRoot <- Option(librarySources.get(classFile.root))
+          sourceName <- f.getClasses.headOption.collect { case c: com.intellij.psi.impl.compiled.ClsClassImpl => c.getSourceFileName }
+          directory = classFile.entry.lastIndexOf('/') match { case -1 => "" case i => classFile.entry.substring(0, i + 1) }
+          sourceFile <- Option(sourceRoot.findFileByRelativePath(directory + sourceName))
+          psi <- Option(psiManagerRef.findFile(sourceFile))
+        } yield psi
+        source.getOrElse(f)
       // Java sources parse at the highest language level: it accepts the syntax of every Java release the build may
       // target (the build's own release is not read yet).
       case ("JavaPsiImplementationHelper.getEffectiveLanguageLevel", _) => com.intellij.pom.java.LanguageLevel.HIGHEST
@@ -953,7 +1020,7 @@ object ScalaPsiHost {
       org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager.instance(project).clearOnNonScalaChange()
     }
 
-    new ScalaPsiHost(project, symbolIndex, libraryFiles, moduleModel, () => psiChanged())
+    new ScalaPsiHost(config.stateDir, project, symbolIndex, libraryFiles, librarySources, moduleModel, () => psiChanged())
   }
 
   private def newPrivate[T](cls: Class[T], args: AnyRef*): T = {

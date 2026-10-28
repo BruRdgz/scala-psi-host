@@ -35,6 +35,11 @@ What the host provides instead of the IDE:
 - **Files**: library jars and the JDK as read-only virtual files (`LibraryFileSystem`); project sources as physical
   files (`SourceFile`) whose text is the editor's. Library PSI is stub-based, as in the IDE (Scala 3 libraries from
   TASTy); source syntax trees can be dropped and rebuilt under memory pressure.
+- **Library sources**: the build's source jars (BSP `dependencySources`; sbt downloads them on import) and the JDK's
+  `src.zip`, attached to their libraries as in the IDE; source files are parsed when navigated to, never indexed. Go
+  to definition into a library opens its source, found as the IDE finds it (the plugin's navigation elements), or its
+  decompiled class file when it has no sources: either is written, read-only, under
+  `$SCALA_PSI_HOST_STATE/library-files`, since editors open files, not jar entries.
 - **Index**: the plugin's and the Java stub indexers over library and source stubs, in memory (`SymbolIndex`).
 - **Editing**: document changes are committed synchronously in the host's write action; the platform reparses the
   changed range and the plugin's own PSI listener invalidates its caches.
@@ -132,8 +137,6 @@ Run them with `sbt "Test/runMain scalapsihost.oracle.<Name> ..."`.
 
 ## Known limitations
 
-- Go to definition and type definition reach declarations in project sources only; library declarations have no
-  file to open yet.
 - Scala 2 has no document compilation (its compiler has no stable interface to call); Scala 2 errors come from the
   plugin, or from the build's compile when compiler errors are enabled for Scala 2.
 - Java sources are parsed at the highest language level, not the build's.

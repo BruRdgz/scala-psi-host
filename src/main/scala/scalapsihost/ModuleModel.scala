@@ -47,6 +47,9 @@ final class ModuleModel(project: Project) {
 
   private[scalapsihost] def setJdkRoots(roots: Seq[VirtualFile]): Unit = jdkRoots = roots.toSet
 
+  /** The mounted JDK's module roots. */
+  private[scalapsihost] def jdkModuleRoots: Set[VirtualFile] = jdkRoots
+
   private[scalapsihost] def add(hostModule: HostModule): Unit = {
     val missing = hostModule.spec.dependsOn.filterNot(modules.containsKey)
     if (missing.nonEmpty) throw new IllegalArgumentException(s"module ${hostModule.spec.name} depends on unknown modules: ${missing.mkString(", ")}")

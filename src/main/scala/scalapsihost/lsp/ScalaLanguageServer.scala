@@ -89,23 +89,34 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
   private def onDocuments[T](request: ProjectSession => T): CompletableFuture[T] =
     CompletableFuture.supplyAsync(() => request(session.join()), documents)
 
+  // A project source file's path; none for other documents (a library file the editor opened, an unsaved buffer).
+  private def sourcePath(s: ProjectSession, uri: String): Option[Path] =
+    Option.when(uri.startsWith("file:"))(pathOf(uri)).filter(s.isSource)
+
+  /** A request about a document: answered for project sources, `outside` for other documents. */
+  private def onSource[T](document: TextDocumentIdentifier, outside: => T)(request: (ProjectSession, Path) => T): CompletableFuture[T] =
+    onDocuments(s => sourcePath(s, document.getUri).fold(outside)(request(s, _)))
+
   private object TextDocuments extends LspServices.TextDocuments {
+    // Documents that are not project sources are not tracked.
     override def didOpen(params: DidOpenTextDocumentParams): Unit = onDocuments { s =>
-      val path = pathOf(params.getTextDocument.getUri)
-      versions.put(path, params.getTextDocument.getVersion)
-      // The editor's buffer may differ from the file on disk (unsaved changes).
-      if (s.text(path) != params.getTextDocument.getText) s.change(path, None, params.getTextDocument.getText)
-      scheduleDiagnostics(path)
+      sourcePath(s, params.getTextDocument.getUri).foreach { path =>
+        versions.put(path, params.getTextDocument.getVersion)
+        // The editor's buffer may differ from the file on disk (unsaved changes).
+        if (s.text(path) != params.getTextDocument.getText) s.change(path, None, params.getTextDocument.getText)
+        scheduleDiagnostics(path)
+      }
     }
 
     override def didChange(params: DidChangeTextDocumentParams): Unit = onDocuments { s =>
-      val path = pathOf(params.getTextDocument.getUri)
-      versions.put(path, params.getTextDocument.getVersion)
-      for (change <- params.getContentChanges.asScala) {
-        val range = Option(change.getRange).map(r => (lineColumn(r.getStart), lineColumn(r.getEnd)))
-        s.change(path, range, change.getText)
+      sourcePath(s, params.getTextDocument.getUri).foreach { path =>
+        versions.put(path, params.getTextDocument.getVersion)
+        for (change <- params.getContentChanges.asScala) {
+          val range = Option(change.getRange).map(r => (lineColumn(r.getStart), lineColumn(r.getEnd)))
+          s.change(path, range, change.getText)
+        }
+        scheduleDiagnostics(path)
       }
-      scheduleDiagnostics(path)
     }
 
     override def didClose(params: DidCloseTextDocumentParams): Unit = ()
@@ -115,63 +126,64 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
       s.compileBuild().foreach(scheduleDiagnostics)
     }
 
-    override def hover(params: HoverParams): CompletableFuture[Hover] = onDocuments { s =>
-      s.hover(pathOf(params.getTextDocument.getUri), lineColumn(params.getPosition)).map { signature =>
+    override def hover(params: HoverParams): CompletableFuture[Hover] = onSource(params.getTextDocument, null) { (s, path) =>
+      s.hover(path, lineColumn(params.getPosition)).map { signature =>
         new Hover(new MarkupContent(MarkupKind.MARKDOWN, s"```scala\n$signature\n```"))
       }.orNull
     }
 
     override def definition(params: DefinitionParams)
-        : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] = onDocuments { s =>
-      val locations = s.definition(pathOf(params.getTextDocument.getUri), lineColumn(params.getPosition)).toList.map {
-        case (path, at) => new Location(path.toUri.toString, new Range(position(at), position(at)))
+        : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
+      onSource(params.getTextDocument, locations(Seq.empty)) { (s, path) =>
+        locations(s.definition(path, lineColumn(params.getPosition)).toSeq)
       }
-      LspEither.forLeft[java.util.List[? <: Location], java.util.List[? <: LocationLink]](locations.asJava)
-    }
 
     override def typeDefinition(params: TypeDefinitionParams)
-        : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] = onDocuments { s =>
-      val locations = s.typeDefinition(pathOf(params.getTextDocument.getUri), lineColumn(params.getPosition)).toList.map {
-        case (path, at) => new Location(path.toUri.toString, new Range(position(at), position(at)))
+        : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
+      onSource(params.getTextDocument, locations(Seq.empty)) { (s, path) =>
+        locations(s.typeDefinition(path, lineColumn(params.getPosition)))
       }
-      LspEither.forLeft[java.util.List[? <: Location], java.util.List[? <: LocationLink]](locations.asJava)
-    }
+
+    private def locations(found: Seq[(Path, LineColumn)]): LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]] =
+      LspEither.forLeft(found.map { case (path, at) => new Location(path.toUri.toString, new Range(position(at), position(at))) }.asJava)
 
     override def documentHighlight(params: DocumentHighlightParams): CompletableFuture[java.util.List[? <: DocumentHighlight]] =
-      onDocuments { s =>
-        s.highlights(pathOf(params.getTextDocument.getUri), lineColumn(params.getPosition)).map { o =>
+      onSource(params.getTextDocument, java.util.List.of[DocumentHighlight]()) { (s, path) =>
+        s.highlights(path, lineColumn(params.getPosition)).map { o =>
           new DocumentHighlight(range(o.range), if (o.write) DocumentHighlightKind.Write else DocumentHighlightKind.Read)
         }.asJava
       }
 
     override def documentSymbol(params: DocumentSymbolParams)
-        : CompletableFuture[java.util.List[LspEither[SymbolInformation, DocumentSymbol]]] = onDocuments { s =>
-      def symbol(o: OutlineSymbol): DocumentSymbol = {
-        val d = new DocumentSymbol(o.name, o.kind, range(o.range), range(o.nameRange), o.detail)
-        d.setChildren(o.children.map(symbol).asJava)
-        d
+        : CompletableFuture[java.util.List[LspEither[SymbolInformation, DocumentSymbol]]] =
+      onSource(params.getTextDocument, java.util.List.of[LspEither[SymbolInformation, DocumentSymbol]]()) { (s, path) =>
+        def symbol(o: OutlineSymbol): DocumentSymbol = {
+          val d = new DocumentSymbol(o.name, o.kind, range(o.range), range(o.nameRange), o.detail)
+          d.setChildren(o.children.map(symbol).asJava)
+          d
+        }
+        s.outline(path).map(o => LspEither.forRight[SymbolInformation, DocumentSymbol](symbol(o))).asJava
       }
-      s.outline(pathOf(params.getTextDocument.getUri)).map(o => LspEither.forRight[SymbolInformation, DocumentSymbol](symbol(o))).asJava
-    }
 
     override def semanticTokensFull(params: SemanticTokensParams): CompletableFuture[SemanticTokens] =
-      onDocuments { s =>
-        val data = SemanticColoring.encode(s.semanticTokens(pathOf(params.getTextDocument.getUri)))
+      onSource(params.getTextDocument, new SemanticTokens(java.util.List.of[Integer]())) { (s, path) =>
+        val data = SemanticColoring.encode(s.semanticTokens(path))
         new SemanticTokens(data.map(Integer.valueOf).asJava)
       }
 
-    override def foldingRange(params: FoldingRangeRequestParams): CompletableFuture[java.util.List[FoldingRange]] = onDocuments { s =>
-      s.foldingRanges(pathOf(params.getTextDocument.getUri)).map { fold =>
-        val r = new FoldingRange(fold.startLine, fold.endLine)
-        fold.kind match {
-          case Fold.Comment => r.setKind(FoldingRangeKind.Comment)
-          case Fold.Imports => r.setKind(FoldingRangeKind.Imports)
-          case Fold.Region => r.setKind(FoldingRangeKind.Region)
-          case Fold.Code => ()
-        }
-        r
-      }.asJava
-    }
+    override def foldingRange(params: FoldingRangeRequestParams): CompletableFuture[java.util.List[FoldingRange]] =
+      onSource(params.getTextDocument, java.util.List.of[FoldingRange]()) { (s, path) =>
+        s.foldingRanges(path).map { fold =>
+          val r = new FoldingRange(fold.startLine, fold.endLine)
+          fold.kind match {
+            case Fold.Comment => r.setKind(FoldingRangeKind.Comment)
+            case Fold.Imports => r.setKind(FoldingRangeKind.Imports)
+            case Fold.Region => r.setKind(FoldingRangeKind.Region)
+            case Fold.Code => ()
+          }
+          r
+        }.asJava
+      }
   }
 
   // ---- Diagnostics -----------------------------------------------------------------------------------------------
