@@ -22,7 +22,8 @@ object Main {
       stateDir = Path.of(property("scalapsihost.stateDir")),
       scalaPluginJars = property("scalapsihost.scalaPluginJars").split(File.pathSeparator).toSeq.map(Path.of(_)),
     ))
-    val server = new ScalaLanguageServer(host)
+    // The platform keeps threads of its own running: the process ends when the client says so.
+    val server = new ScalaLanguageServer(host, code => sys.exit(code))
     val launcher = LSPLauncher.createServerLauncher(server, System.in, protocolOut)
     server.connect(launcher.getRemoteProxy)
     launcher.startListening().get()

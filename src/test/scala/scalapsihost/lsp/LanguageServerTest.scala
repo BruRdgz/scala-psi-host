@@ -84,7 +84,8 @@ class LanguageServerTest extends munit.FunSuite {
     assertEquals(errors(diagnosticsOf(main, 2)), Seq("Type mismatch. Required: Int, found: String"))
   }
 
-  // `.text` on line 6 (column 50) is Greeting.text, declared on line 3 of Greeting.scala.
+  // After the change above (`String` became `Int`), `.text` is at line 6, column 50: Greeting.text, declared on line 3
+  // of Greeting.scala.
   test("shows the signature of the symbol under the cursor") {
     val hover = server.getTextDocumentService.hover(new HoverParams(document(main), new Position(6, 50))).get(1, TimeUnit.MINUTES)
     assert(hover.getContents.getRight.getValue.contains("def text: String"), hover.getContents.getRight.getValue)

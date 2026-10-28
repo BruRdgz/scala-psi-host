@@ -20,11 +20,16 @@ import scala.jdk.CollectionConverters.*
  * another thread, a short while after a document's last change: a change cancels a computation in progress (the
  * host's write lock cancels running queries), and a result is published only for the document's current version.
  */
-final class ScalaLanguageServer(host: ScalaPsiHost) extends LspServices.Server {
+/**
+ * @param exitProcess ends the server's process with the given code on the `exit` notification (0 after a `shutdown`
+ *                    request, 1 otherwise, as LSP defines); nothing for a server embedded in another process
+ */
+final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _ => ()) extends LspServices.Server {
   // Fast typing produces a change per keystroke; diagnostics wait for this pause before they are computed.
   private val DiagnosticsDelayMs = 200L
 
   @volatile private var client: LanguageClient = scala.compiletime.uninitialized
+  @volatile private var shutdownRequested = false
   private val documents = Executors.newSingleThreadExecutor(daemon("scala-psi-host-documents"))
   private val diagnostics = Executors.newSingleThreadScheduledExecutor(daemon("scala-psi-host-diagnostics"))
   private val session = new CompletableFuture[ProjectSession]
@@ -55,12 +60,15 @@ final class ScalaLanguageServer(host: ScalaPsiHost) extends LspServices.Server {
 
   override def initialized(params: InitializedParams): Unit = ()
 
-  override def shutdown(): CompletableFuture[AnyRef] =
+  override def shutdown(): CompletableFuture[AnyRef] = {
+    shutdownRequested = true
     CompletableFuture.supplyAsync(() => { if (session.isDone && !session.isCompletedExceptionally) session.join().close(); null }, documents)
+  }
 
   override def exit(): Unit = {
     documents.shutdownNow()
     diagnostics.shutdownNow()
+    exitProcess(if (shutdownRequested) 0 else 1)
   }
 
   override def getTextDocumentService: TextDocumentService = TextDocuments

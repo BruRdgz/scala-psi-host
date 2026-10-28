@@ -1,17 +1,43 @@
 # scala-psi-host
 
-Runs the IntelliJ Scala plugin's PSI and type checker **without an IntelliJ application container** — the
-semantic core of a future standalone Scala language server. The plugin source is not modified.
+A Scala language server built on the IntelliJ Scala plugin's PSI and type checker, running **without an IntelliJ
+application container**. The plugin source is not modified: the host builds the plugin from intellij-scala and
+answers, through fixed tables, what the plugin and the IntelliJ platform's PSI libraries ask of their environment.
+
+It serves LSP diagnostics, hover and go-to-definition for sbt (or any BSP) builds, Scala 2 and 3, with Java
+sources in mixed projects.
+
+## How it works
 
 The host installs three fixed tables before any PSI exists, then only consumes the plugin's PSI:
 
-- an `Application` object (`java.lang.reflect.Proxy`) with a fixed service table — no EDT, no write actions;
-- a root extension area with extension-point *declarations* read from descriptor XML, plus a few explicit
-  language extensions (parser definitions, view providers, AST factory, stub schema);
+- an `Application` object (`java.lang.reflect.Proxy`, `ApplicationEx`) with a fixed service table;
+- a root extension area with extension-point *declarations* read from descriptor XML, plus explicit language
+  extensions (parser definitions, view providers, AST factories, stub schema) and the plugin's semantic extensions;
 - a `Project` object with a fixed service table.
 
 Anything the plugin or platform asks for outside those tables throws, and every adapter call is recorded in
-`CallLog`. Plugin XML is read as data only: extension-point declarations and registry-key defaults.
+`CallLog`; a platform or plugin upgrade that changes the surface fails `AdapterSurfaceTest`. Plugin XML is read as
+data only. Logged errors (`LOG.error`) are reported and recorded instead of thrown, as in the IDE.
+
+What the host provides instead of the IDE:
+
+- **Project model** from the build, over BSP: one module per Scala build target, with its Scala version (a Scala SDK
+  library), compiler options (a compiler-settings profile), classpath jars and module dependencies, and a resolve
+  scope per module.
+- **Files**: library jars and the JDK as read-only virtual files (`LibraryFileSystem`); project sources as physical
+  files (`SourceFile`) whose text is the editor's. Library PSI is stub-based, as in the IDE (Scala 3 libraries from
+  TASTy); source syntax trees can be dropped and rebuilt under memory pressure.
+- **Index**: the plugin's and the Java stub indexers over library and source stubs, in memory (`SymbolIndex`).
+- **Editing**: document changes are committed synchronously in the host's write action; the platform reparses the
+  changed range and the plugin's own PSI listener invalidates its caches.
+- **Threads**: a fair read/write lock as the IDE's read and write actions (`HostLock`): queries read concurrently,
+  an edit cancels them and writes alone. Work the platform schedules for the UI thread runs on a dispatch thread
+  without UI, declared to the platform as its EDT.
+- **Errors**: the plugin's highlighting (`ScalaAnnotator`), and for files whose errors come from the compiler
+  (Scala 3 by default, as in the IDE) the compiler's: the module's own Scala 3 compiler on the document's current
+  text (`DocumentCompiler`), or the build's compile on save.
+- Usage statistics are turned off: building an event would write a device id into the user's Java preferences.
 
 ## Build
 
@@ -21,65 +47,85 @@ Needs JDK 25 for sbt itself (the plugin and platform 263.x are class file 69):
 # 1. The Scala plugin, from an intellij-scala checkout next to this repo (~10 min, ~6 GB RSS)
 (cd ../intellij-scala && sbt --java-home <jdk25> packageArtifactZip)
 
-# 2. The host and its tests
-sbt --java-home <jdk25> test
+# 2. The host, its tests and the distribution
+sbt --java-home <jdk25> test dist
 ```
 
 `SCALA_PLUGIN_LIB` points the build at another plugin build (default `../intellij-scala/target/plugin/Scala/lib`).
 Platform jars come from the IntelliJ snapshots repository at the version pinned in `build.sbt`.
 
+The BSP tests use `fixtures/bsp-project`, an sbt build; create its connection file once with `sbt bspConfig` in that
+directory. sbt keeps a build server running per build directory after its clients leave (`sbt shutdown` there
+stops it).
+
+## Use
+
+`sbt dist` writes the distribution to `target/dist`: `bin/scala-psi-host` and `lib/`. The script speaks LSP on stdin
+and stdout; an editor starts it in a project that has a BSP connection file (`.bsp/`, e.g. from `sbt bspConfig`).
+
+- JDK 25: `JAVA_HOME`, or `java` on the `PATH`.
+- `SCALA_PSI_HOST_STATE`: the platform's state directory (default `$XDG_CACHE_HOME/scala-psi-host`).
+- `SCALA_PSI_HOST_HEAP`: maximum heap (default `2g`; a 500-file Scala 3 project fits in 1.5 GB).
+
+`dist/smoke-test.py <bin/scala-psi-host> <project> <file> <line> <column>` talks to a built distribution as an
+editor would (initialize, open, diagnostics, hover, definition, shutdown).
+
 ## Layout
 
-- `ScalaPsiHost` — bootstrap: the three tables, service registrations, startup of synthetic classes.
-- `LibraryFileSystem` — library class roots (jars via zipfs, JDK modules via `jrt:`) as read-only VirtualFiles.
-- `SymbolIndex` — the stub index: library class files (through the plugin's decompiler) and project source files
-  → the plugin's stub builder and indexers → an in-memory map answering `StubIndex`, kept per file.
-- `LibraryClassFinder` — classes and packages of the library roots for the platform's `JavaPsiFacadeImpl`,
-  next to the plugin's own element finders.
-- `Descriptors` — extension-point declarations and registry keys read from descriptor XML.
-- `Adapters` — `CallLog`, proxy and dispatch tables, `ServiceTable`.
+- `ScalaPsiHost` — bootstrap (the tables, service registrations, startup of synthetic classes) and the host's API:
+  modules, libraries, source files, edits, reads, diagnostics.
+- `ModuleModel` — modules, which module each source belongs to, and their resolve scopes.
+- `LibraryFileSystem`, `SourceFile` — virtual files of libraries and of project sources.
+- `SymbolIndex` — the stub index; `LibraryClassFinder` — classes and packages of the library roots.
+- `BspImport` — the build connection: modules, sources, compile specs, compile with diagnostics.
+- `DocumentCompiler` — a Scala 3 module's compiler on one document.
+- `HostDocumentCommitProcessor` — the IDE's synchronous document commit.
+- `Adapters` — `CallLog`, proxy and dispatch tables, `ServiceTable`, `HostLock`, the dispatch thread, the logger.
+- `lsp/` — `ProjectSession` (an open workspace), `ScalaLanguageServer` (LSP), `Main` (stdio).
 - `src/main/java` — host subclasses of abstract platform classes. `Host_*` files are generated:
   `java -cp <compile classpath> tools/Gen.java src/main/java/scalapsihost <fqcn>...`. `Host_StubIndex` also has
   two hand-written overrides (concrete `StubIndex` overloads that delegate to each other); keep them when
-  regenerating it.
+  regenerating it. The LSP services extend Java bases (`LspServices`): implemented in Scala directly, their
+  interfaces' default methods would be registered twice by lsp4j.
 
 ## Tests
 
-- `HostSemanticsTest` — parse, local resolve and types for a small scenario. Expectations are the correct
-  Scala answers; the ones the host cannot give yet are marked `.fail` and name the phase that fixes them.
-- `LibraryIndexTest` — scala-library binaries indexed through the plugin's own indexers, found by its lookups.
-- `AdapterSurfaceTest` — no call leaves the tables, and the set of adapter entries equals the reviewed list in
-  `src/test/resources/adapter-surface.txt`. A platform or plugin upgrade that changes the surface fails here; on
-  failure the actual list is written to `target/host-state/adapter-surface.actual.txt` for review.
+- `HostSemanticsTest`, `LibraryIndexTest`, `DiagnosticsTest` — parse, resolve, types, library index, highlighting.
+- `ModuleTest` — per-module classpath, compiler options and dependencies.
+- `EditingTest` — edits reparsed in place and seen by other files; Scala 3 language by module; queries cancelled by
+  an edit.
+- `BspImportTest` — the fixture build imported over BSP, compiled (with diagnostics), highlighted, and a Scala 3
+  document compiled.
+- `lsp.LanguageServerTest` — the server end to end through JSON-RPC (runs in a JVM of its own).
+- `AdapterSurfaceTest` — no call leaves the tables, and the adapter entries equal the reviewed list in
+  `src/test/resources/adapter-surface.txt` (on failure the actual list is in `target/host-state/`).
 
-## Type-inference oracle
+## Oracles
 
-`sbt --java-home <jdk25> "Test/runMain scalapsihost.oracle.TypeInferenceOracle <intellij-scala> <report.md>"` runs
-the plugin's own type-inference test data (the generated test classes that use the fixture's default setup: Scala
-2.12, scala-library only) through the host and compares with the expected types in those files. It runs the host
-in unit-test mode, as the fixture does, unless given `--production-mode`; `--only=SCL1234,...` runs single tests.
+Tools in the test scope, each comparing the host with the plugin's own expectations:
 
-At commit time: **395 of 400 agree** (about 2 minutes). The 5 that do not:
+- `oracle.TypeInferenceOracle <intellij-scala> <report.md>` — the plugin's type-inference test data (Scala 2.12, in
+  unit-test mode as the fixture runs it). **395 of 400 agree.** The rest: `SCL11568` (SAM is enabled from module
+  settings; the oracle's files have no module), `SCL6601` and `SCL7805` (the same type, rendered `X.::[A, B]`
+  instead of `A :: B`), `SCL5475` and `SCL8178` (open).
+- `oracle.LibraryHighlightingOracle <intellij-scala> <report.md>` — highlights the scala-library 2.13 sources and
+  compares with `ScalaLibraryHighlightingTest_2_13`'s known errors. 469 of 546 files agree; most of the rest are
+  references to private members of a source's own companion object, which resolve to the compiled companion.
+- `oracle.ProjectHighlighting <project> <report.md> [--plugin-errors]` — highlights a whole BSP project and reports
+  errors, timings, heap and a class histogram. On a 522-file Scala 3 project: no errors with compiler errors (the
+  default), 81 with the plugin's type-aware checks (the same the IDE shows in its built-in mode).
 
-- `SCL11568` — SAM conversion is enabled from the module's compiler settings; the host has no module model (F2).
-- `SCL6601`, `SCL7805` — same type, rendered `SCL6601.::[A, B]` instead of infix `A :: B`.
-- `SCL5475`, `SCL8178` — open; not order- or mode-dependent, and resolution in isolation is right.
-
-## Plugin extensions
-
-The host loads the plugin's extensions only for the extension points listed in
-`ScalaPsiHost.SemanticExtensionPoints`, reading the implementation classes from the plugin's descriptors. Today
-that is `syntheticMemberInjector`: case-class and companion members, context bounds, enums, `derives` and the
-members library macros generate. Every other plugin extension point is declared with no extensions.
+Run them with `sbt "Test/runMain scalapsihost.oracle.<Name> ..."`.
 
 ## Known limitations
 
-- No library sources are attached: navigation into libraries lands on decompiled code.
-- One scope for everything, no module model, single-threaded use. Phases F2 and F3. Settings the plugin reads from
-  the module (compiler options such as SAM) take their defaults.
-- Indexed library PSI is AST-backed (the IDE's is stub-backed), so the whole scala-library takes more than 768 MB
-  of heap; the tests run with 2 GB.
-- Java class files are read by path on demand, not indexed: Java short-name lookups (completion, auto-import)
-  do not see them yet.
-- Depends on platform `@Internal` APIs (`Extensions.setRootArea`, `ExtensionsAreaImpl`) and constructs a few
-  platform and plugin classes with non-public constructors, as the IDE container does.
+- Go-to-definition reaches declarations in project sources only; library declarations have no file to open yet.
+- Scala 2 has no document compilation (its compiler has no stable interface to call); Scala 2 errors come from the
+  plugin, or from the build's compile when compiler errors are enabled for Scala 2.
+- Java sources are parsed at the highest language level, not the build's.
+- Java class files are read by path on demand, not indexed: Java short-name lookups (completion, auto-import) do
+  not see them.
+- The JDK is the one the server runs on.
+- Depends on platform `@Internal` APIs (`Extensions.setRootArea`, `ExtensionsAreaImpl`), constructs a few platform
+  and plugin classes with non-public constructors, as the IDE container does, and sets one private field of the
+  platform's statistics holder (no event providers).

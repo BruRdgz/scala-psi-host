@@ -13,6 +13,8 @@ val Fixtures212 = config("fixtures212").hide
 
 val scalaPluginJars = taskKey[Seq[File]]("The Scala plugin's jars that go on the classpath")
 
+val dist = taskKey[File]("Builds the language server's distribution: bin/scala-psi-host and lib/ in target/dist")
+
 ThisBuild / scalaVersion := "3.9.0"
 
 lazy val root = (project in file("."))
@@ -84,6 +86,27 @@ lazy val root = (project in file("."))
     Compile / unmanagedJars ++= scalaPluginJars.value.classpath,
     // One JVM per test run: the host installs process-wide platform singletons (Application, root area).
     Test / fork := true,
+    dist := {
+      val out = target.value / "dist"
+      IO.delete(out)
+      val pluginJars = scalaPluginJars.value.toSet
+      // Jar names repeat across organizations (e.g. kernel-<version>.jar): managed jars are named with theirs.
+      val dependencies = (Compile / dependencyClasspath).value.filter(_.data.getName.endsWith(".jar")).map { jar =>
+        jar.data -> jar.get(moduleID.key).fold(jar.data.getName)(m => s"${m.organization}.${jar.data.getName}")
+      }
+      val jars = ((Compile / packageBin).value -> "scala-psi-host.jar") +: dependencies
+      // The classpath in order (the host first), as paths relative to the distribution; the plugin's jars apart.
+      val entries = jars.map { case (jar, name) =>
+        val entry = (if (pluginJars(jar)) "lib/plugin/" else "lib/") + name
+        if ((out / entry).exists) sys.error(s"two jars named ${jar.getName} on the classpath")
+        IO.copyFile(jar, out / entry)
+        entry
+      }
+      IO.writeLines(out / "lib" / "classpath", entries)
+      IO.copyFile(baseDirectory.value / "dist" / "scala-psi-host", out / "bin" / "scala-psi-host")
+      (out / "bin" / "scala-psi-host").setExecutable(true)
+      out
+    },
     // The language server test opens the BSP fixture's modules in the JVM's one host, which another suite also
     // does: it runs in a JVM of its own.
     Test / testGrouping := {
