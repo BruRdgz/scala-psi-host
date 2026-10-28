@@ -71,15 +71,17 @@ final class DocumentCompiler {
       case "report" =>
         val diagnostic = args(0)
         val position = call(diagnostic, diagnosticInterface, "position").asInstanceOf[java.util.Optional[AnyRef]]
-        // A problem without a position (e.g. a bad option) is reported at the start of the file.
+        val level = severity(call(diagnostic, diagnosticInterface, "level").asInstanceOf[Int])
+        val message = call(diagnostic, diagnosticInterface, "message").asInstanceOf[String]
+        // A problem without a position is about the run, not the document. An error (e.g. a bad option) explains why
+        // the document has no other problems, so it is reported at the start of the file; anything else (the
+        // compiler's "N errors found" summary is a warning) is only logged.
         def at(line: String, column: String) =
           if (position.isEmpty) LineColumn(0, 0)
           else LineColumn(call(position.get, positionInterface, line).asInstanceOf[Int], call(position.get, positionInterface, column).asInstanceOf[Int])
-        reported += CompilerDiagnostic(
-          severity(call(diagnostic, diagnosticInterface, "level").asInstanceOf[Int]),
-          at("startLine", "startColumn"),
-          at("endLine", "endColumn"),
-          call(diagnostic, diagnosticInterface, "message").asInstanceOf[String])
+        if (position.isPresent || level == HighlightSeverity.ERROR)
+          reported += CompilerDiagnostic(level, at("startLine", "startColumn"), at("endLine", "endColumn"), message)
+        else System.err.println(s"scala-psi-host: compiler: $message")
         null
       case "hashCode" => Integer.valueOf(System.identityHashCode(proxy))
       case "equals" => java.lang.Boolean.valueOf(proxy eq args(0))

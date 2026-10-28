@@ -98,6 +98,12 @@ class LanguageServerTest extends munit.FunSuite {
     assert(hover.getContents.getRight.getValue.contains("case class Greeting"), hover.getContents.getRight.getValue)
   }
 
+  // Inside the literal "Hello, $name": text, not a symbol.
+  test("shows nothing on text that is not a symbol") {
+    val hover = server.getTextDocumentService.hover(new HoverParams(document(greeting), new Position(3, 24))).get(1, TimeUnit.MINUTES)
+    assertEquals(hover, null)
+  }
+
   test("goes to the declaration of the symbol under the cursor") {
     val locations = server.getTextDocumentService.definition(new DefinitionParams(document(main), new Position(6, 50)))
       .get(1, TimeUnit.MINUTES).getLeft.asScala.toSeq

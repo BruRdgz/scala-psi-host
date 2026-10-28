@@ -52,8 +52,9 @@ class BspImportTest extends munit.FunSuite {
     def errors(text: String) = compiler.compile(core3.compile, "Use.scala", text).filter(_.severity == HighlightSeverity.ERROR)
 
     assertEquals(errors("package core3\n\nobject Use:\n  val s: String = Greet3.hello(\"x\")\n"), Seq.empty)
-    val mismatch = errors("package core3\n\nobject Use:\n  val n: Int = Greet3.hello(\"x\")\n")
-    assertEquals(mismatch.map(_.start.line), Seq(3))
+    // The error alone: not the compiler's summary of the run ("1 error found").
+    val mismatch = compiler.compile(core3.compile, "Use.scala", "package core3\n\nobject Use:\n  val n: Int = Greet3.hello(\"x\")\n")
+    assertEquals(mismatch.map(d => (d.severity, d.start.line)), Seq((HighlightSeverity.ERROR, 3)))
     assert(mismatch.head.message.contains("Required: Int"), mismatch)
   }
 

@@ -499,6 +499,12 @@ object ScalaPsiHost {
     appServices.register(classOf[com.intellij.openapi.application.TransactionGuard])(new com.intellij.openapi.application.TransactionGuardImpl)
     // Annotations carry their quick fixes, which the platform wraps as intentions when the annotation is created.
     appServices.register(classOf[com.intellij.modcommand.ModCommandService])(new com.intellij.lang.impl.modcommand.ModCommandServiceImpl)
+    // References that string literals and doc comments get from contributors (in the IDE, file paths and URLs in
+    // text). The plugin's contributors are not loaded: those references serve navigation from text, not the
+    // language server's features, and file paths would need the IDE's file-reference layer.
+    appServices.register(classOf[com.intellij.psi.PsiReferenceService])(new com.intellij.psi.PsiReferenceServiceImpl)
+    appServices.register(classOf[com.intellij.psi.impl.source.resolve.reference.ReferenceProvidersRegistry])(
+      new com.intellij.psi.impl.source.resolve.reference.ReferenceProvidersRegistryImpl)
     // Java module (JPMS) accessibility: the host has no module-info graph (its modules come from the build), so the
     // platform's graph-less implementation, which treats every class as accessible.
     appServices.register(classOf[com.intellij.psi.JavaModuleGraphHelper])(new com.intellij.psi.DumbJavaModuleGraphHelper)
