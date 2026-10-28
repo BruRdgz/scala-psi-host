@@ -1,23 +1,55 @@
 # Roadmap
 
-A placeholder: the phases below are the current direction, to be detailed into milestones.
+Parity with the Scala plugin in IntelliJ IDEA is the goal. Nearly every editor feature of the plugin rests on one of
+a few pieces of platform infrastructure, so the milestones are ordered by those pieces: each one, once the host
+provides it, unlocks a group of features.
 
-## Alphas — harden what exists
+A feature is done when an oracle over the plugin's own test data (`scala/scala-impl/testdata` in intellij-scala)
+agrees with the host, and the cases that do not agree are explained in the README, as for type inference today.
 
-- Go to definition into libraries.
-- Document symbols (outline).
+## Infrastructure
+
+- **A. Read-only, one file.** Nothing new: walk the PSI, or capture what the plugin already produces.
+- **B. Project-wide search.** A word index (`IdIndex`) over the sources and a host `PsiSearchHelper`, behind the
+  plugin's `referencesSearch` and `definitionsScopedSearch` extensions.
+- **C. Change engine.** A change runs on a non-physical copy of the file, as the platform's intention preview does;
+  the difference with the original becomes a `WorkspaceEdit`. Needs `CodeStyleManager` and the formatter, which
+  almost every modification of the plugin calls.
+- **D. Caret-bound features.** An `Editor` object in the fixed tables (document, caret, selection, nothing more;
+  `AdapterSurfaceTest` shows what the plugin uses of it), a completion context (`CompletionParameters`, the copy with
+  a dummy identifier), and a parameter-info UI context that records what `updateUI` renders.
+- **E. Inspections.** The plugin's `LocalInspectionTool`s run without UI against a fixed profile, the IDE's default.
+
+## Alpha 2 — read-only features, and the gaps of alpha 1
+
+- Go to definition into libraries: source jars from BSP `dependencySources`, or decompiled text under a virtual URI.
+- Document symbols, folding ranges (`ScalaFoldingBuilder`), selection ranges (the plugin's word-selection handlers),
+  document highlights within a file, type definition.
+- Semantic tokens from the text attributes the lexer and the annotators already assign.
 - Measurements: hover and definition latency, memory over long sessions.
 - A real Scala 2 project as an acceptance test.
 - Reacting to build changes (reimport).
 
-## Beta — usable every day
+## Alpha 3 — project-wide search
 
-- Completion.
-- Find references, document highlights.
-- Signature help.
-- The plugin's quick fixes as code actions.
-- Rename.
-- Formatting.
+- Word index over the sources, `PsiSearchHelper`.
+- Find references, implementations, workspace symbols. Oracle: `findUsages`.
+- Java class files in the short-name index (auto-import and completion need them).
+
+## Beta 1 — changes
+
+- `CodeStyleManager` and the formatter; formatting, range formatting. Oracle: `formatter`. Decide how scalafmt
+  configurations are honoured (the plugin can delegate to scalafmt).
+- The change engine.
+- Code actions from the plugin's intentions and the annotators' quick fixes. Oracles: `actions`, `surroundWith`.
+- Organize imports (oracle: `optimize`), auto-import (oracle: `autoImport`), rename (with B; oracle: `refactoring`).
+
+## Beta 2 — completion and inspections
+
+- The `Editor` object.
+- Completion (oracles: `completion`, `completion3`, `keywordCompletion`) and signature help (oracle:
+  `parameterInfo`), with a latency budget (p95 under 150 ms on the acceptance projects).
+- Inspections as diagnostics, with their quick fixes as code actions. Oracle: `inspections`.
 
 ## 0.1 — release
 
@@ -29,3 +61,9 @@ A placeholder: the phases below are the current direction, to be detailed into m
 ## Later
 
 - A persistent index, for fast startup.
+- Inlay hints: inferred types, implicit arguments and conversions.
+- `.sbt` files (sbt's meta-build is a build target over BSP).
+- Call and type hierarchy.
+- Test discovery and code lenses over BSP.
+- Refactorings with dialogs in the IDE: extract, inline, change signature.
+- Worksheets; debugging (DAP).
