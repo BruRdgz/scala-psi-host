@@ -383,6 +383,14 @@ object ScalaPsiHost {
           !org.jetbrains.plugins.scala.settings.ScalaHighlightingMode.isShowErrorsFromCompilerEnabled(element.getContainingFile)
       }, root)
     }
+    // Custom folding regions in comments (`//region` ... `//endregion`, `// <editor-fold>`): the IDE's two providers.
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.lang.folding.CustomFoldingProvider.EP_NAME,
+      classOf[com.intellij.lang.folding.CustomFoldingProvider])
+    locally {
+      val providers = area.getExtensionPoint[com.intellij.lang.folding.CustomFoldingProvider](com.intellij.lang.folding.CustomFoldingProvider.EP_NAME.getName)
+      providers.registerExtension(new com.intellij.lang.customFolding.NetBeansCustomFoldingProvider, root)
+      providers.registerExtension(new com.intellij.lang.customFolding.VisualStudioCustomFoldingProvider, root)
+    }
     // Languages that stand for groups of languages in language extensions; none in the host.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.lang.MetaLanguage.EP_NAME, classOf[com.intellij.lang.MetaLanguage])
     // Smart pointers' anchors and element icons: no providers in the host.
@@ -454,6 +462,9 @@ object ScalaPsiHost {
     // Plugin application services: plain classes.
     appServices.register(classOf[org.jetbrains.plugins.scala.settings.ScalaApplicationSettings])(
       new org.jetbrains.plugins.scala.settings.ScalaApplicationSettings)
+    // Which regions the folding builder marks as collapsed by default: the IDE's defaults.
+    appServices.register(classOf[org.jetbrains.plugins.scala.settings.ScalaCodeFoldingSettings])(
+      new org.jetbrains.plugins.scala.settings.ScalaCodeFoldingSettingsImpl)
     appServices.register(classOf[org.jetbrains.plugins.scala.lang.psi.api.expr.ExpectedTypes])(
       new org.jetbrains.plugins.scala.lang.psi.impl.expr.ExpectedTypesImpl)
     appServices.register(classOf[org.jetbrains.plugins.scala.scalaMeta.ScalaMetaApi])(new scala.meta.intellij.ScalaMetaApiImpl)

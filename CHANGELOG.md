@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Go to type definition, as the IDE's "go to type declaration" (project sources).
+- Document highlights: a symbol's occurrences in the file, as reads or writes.
+- Document symbols, from the plugin's structure view.
+- Folding ranges, from the plugin's folding builder (with `//region` and `<editor-fold>` regions).
+
 ## 0.1.0-a1 — 2026-10-28
 
 First public alpha: a language server for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed

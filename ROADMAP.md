@@ -23,8 +23,7 @@ agrees with the host, and the cases that do not agree are explained in the READM
 ## Alpha 2 — read-only features, and the gaps of alpha 1
 
 - Go to definition into libraries: source jars from BSP `dependencySources`, or decompiled text under a virtual URI.
-- Document symbols, folding ranges (`ScalaFoldingBuilder`), selection ranges (the plugin's word-selection handlers),
-  document highlights within a file, type definition.
+- Document symbols, folding ranges (`ScalaFoldingBuilder`), document highlights within a file, type definition.
 - Semantic tokens from the text attributes the lexer and the annotators already assign.
 - Measurements: hover and definition latency, memory over long sessions.
 - A real Scala 2 project as an acceptance test.
@@ -47,6 +46,7 @@ agrees with the host, and the cases that do not agree are explained in the READM
 ## Beta 2 — completion and inspections
 
 - The `Editor` object.
+- Selection ranges: the plugin's word-selection handlers, which read the editor's settings and lexer.
 - Completion (oracles: `completion`, `completion3`, `keywordCompletion`) and signature help (oracle:
   `parameterInfo`), with a latency budget (p95 under 150 ms on the acceptance projects).
 - Inspections as diagnostics, with their quick fixes as code actions. Oracle: `inspections`.

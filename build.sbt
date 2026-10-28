@@ -19,6 +19,9 @@ val scalaPluginJars = taskKey[Seq[File]]("The Scala plugin's jars that go on the
 val dist = taskKey[File]("Builds the language server's distribution: bin/scala-psi-host and lib/ in target/dist")
 
 ThisBuild / scalaVersion := "3.9.0"
+// The compiler's import suggestions (on a "not found" error) load every class of the classpath's packages; some
+// platform class files refer to IDE classes that are not on it, and the compiler crashes instead of reporting the error.
+ThisBuild / scalacOptions += "-Ximport-suggestion-timeout:0"
 
 lazy val root = (project in file("."))
   .configs(Fixtures, Fixtures212)
@@ -45,7 +48,11 @@ lazy val root = (project in file("."))
       val lib = scalaPluginLib.value
       if (!lib.isDirectory) sys.error(s"Scala plugin jars not found at $lib (set SCALA_PLUGIN_LIB)")
       // The plugin bundles its own Scala runtime; this build provides one.
-      (lib * "*.jar").get.filterNot(f => Set("scala-library.jar", "scala3-library_3.jar")(f.getName))
+      val main = (lib * "*.jar").get.filterNot(f => Set("scala-library.jar", "scala3-library_3.jar")(f.getName))
+      // Content modules the host uses: the structure view (document symbols).
+      val modules = Seq("scalaCommunity.structure-view.jar").map(lib / "modules" / _)
+      modules.filterNot(_.isFile).foreach(m => sys.error(s"Scala plugin module jar not found: $m"))
+      main ++ modules
     },
     resolvers ++= Seq(
       "intellij-snapshots" at "https://www.jetbrains.com/intellij-repository/snapshots",
@@ -77,6 +84,8 @@ lazy val root = (project in file("."))
       // External-system data model (model.Key, model.project.*): the plugin's sbt constants, read when it checks for sbt build
       // modules. Only this jar; no external system runs.
       "com.jetbrains.intellij.platform" % "external-system" % platformVersion intransitive(),
+      // AccessLevelProvider, which the plugin's structure-view elements implement (document symbols). Only this jar.
+      "com.jetbrains.intellij.java" % "java-structure-view" % platformVersion intransitive(),
       "com.jetbrains.intellij.platform" % "external-system-rt" % platformVersion intransitive(),
       // XML PSI: ScalaDoc and XML literals parse through it.
       "com.jetbrains.intellij.xml" % "xml-psi" % platformVersion intransitive(),

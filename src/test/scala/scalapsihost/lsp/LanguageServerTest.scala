@@ -22,6 +22,7 @@ class LanguageServerTest extends munit.FunSuite {
   private val fixture = Path.of("fixtures/bsp-project").toAbsolutePath
   private val main = fixture.resolve("app/src/main/scala/app/Main.scala")
   private val greeting = fixture.resolve("core/src/main/scala/core/Greeting.scala")
+  private val counter = fixture.resolve("core/src/main/scala/core/Counter.scala")
 
   /** Records what the server publishes. */
   private object Client extends ClientBase {
@@ -69,6 +70,10 @@ class LanguageServerTest extends munit.FunSuite {
     assertEquals(capabilities.getTextDocumentSync.getLeft, TextDocumentSyncKind.Incremental)
     assert(capabilities.getHoverProvider.getLeft)
     assert(capabilities.getDefinitionProvider.getLeft)
+    assert(capabilities.getTypeDefinitionProvider.getLeft)
+    assert(capabilities.getDocumentHighlightProvider.getLeft)
+    assert(capabilities.getDocumentSymbolProvider.getLeft)
+    assert(capabilities.getFoldingRangeProvider.getLeft)
     server.initialized(new InitializedParams)
   }
 
@@ -108,5 +113,52 @@ class LanguageServerTest extends munit.FunSuite {
     val locations = server.getTextDocumentService.definition(new DefinitionParams(document(main), new Position(6, 50)))
       .get(1, TimeUnit.MINUTES).getLeft.asScala.toSeq
     assertEquals(locations.map(l => (l.getUri, l.getRange.getStart)), Seq((greeting.toUri.toString, new Position(3, 6))))
+  }
+
+  // `zero` (line 20) returns a Counter, declared on line 8.
+  test("goes to the declaration of a symbol's type") {
+    val locations = server.getTextDocumentService.typeDefinition(new TypeDefinitionParams(document(counter), new Position(20, 6)))
+      .get(1, TimeUnit.MINUTES).getLeft.asScala.toSeq
+    assertEquals(locations.map(l => (l.getUri, l.getRange.getStart)), Seq((counter.toUri.toString, new Position(8, 6))))
+  }
+
+  // `count`, declared on line 9: assigned on lines 12 and 13, read on lines 13 and 16.
+  test("highlights a symbol's occurrences in the file, reads and writes") {
+    val highlights = server.getTextDocumentService.documentHighlight(new DocumentHighlightParams(document(counter), new Position(9, 14)))
+      .get(1, TimeUnit.MINUTES).asScala.toSeq
+    val found = highlights.map(h => (h.getRange.getStart.getLine, h.getRange.getStart.getCharacter, h.getKind)).sortBy(h => (h._1, h._2))
+    assertEquals(found, Seq(
+      (9, 14, DocumentHighlightKind.Write),
+      (12, 4, DocumentHighlightKind.Write),
+      (13, 4, DocumentHighlightKind.Write),
+      (13, 12, DocumentHighlightKind.Read),
+      (16, 21, DocumentHighlightKind.Read),
+    ))
+  }
+
+  test("outlines a file as the structure view shows it") {
+    val symbols = server.getTextDocumentService.documentSymbol(new DocumentSymbolParams(document(counter)))
+      .get(1, TimeUnit.MINUTES).asScala.toSeq.map(_.getRight)
+    assertEquals(symbols.map(s => (s.getName, s.getKind)), Seq(("Counter", SymbolKind.Class), ("Counter", SymbolKind.Module)))
+    val members = symbols.head.getChildren.asScala.map(s => s.getName -> s.getDetail).toMap
+    // As the IDE shows it: parameter types only.
+    assertEquals(members.get("increment"), Some("(Int): Unit"))
+    assert(members.contains("count") && members.contains("current"), members)
+    // The class's range is its whole definition, doc comment included (line 5), as LSP asks; its name's range, the name.
+    assertEquals(symbols.head.getRange.getStart, new Position(5, 0))
+    assertEquals(symbols.head.getSelectionRange, new Range(new Position(8, 6), new Position(8, 13)))
+  }
+
+  test("folds imports, doc comments and bodies, leaving closing braces visible") {
+    val folds = server.getTextDocumentService.foldingRange(new FoldingRangeRequestParams(document(counter)))
+      .get(1, TimeUnit.MINUTES).asScala.toSeq
+    val found = folds.map(f => (f.getStartLine.toInt, f.getEndLine.toInt, Option(f.getKind))).sortBy(_._1)
+    assertEquals(found, Seq(
+      (2, 3, Some(FoldingRangeKind.Imports)),
+      (5, 7, Some(FoldingRangeKind.Comment)),
+      (8, 16, None),
+      (11, 13, None),
+      (19, 20, None),
+    ))
   }
 }

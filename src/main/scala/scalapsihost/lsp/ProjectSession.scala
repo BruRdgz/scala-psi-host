@@ -1,19 +1,73 @@
 package scalapsihost.lsp
 
+import com.intellij.codeInsight.highlighting.ReadWriteAccessDetector
+import com.intellij.ide.util.treeView.smartTree.TreeElement
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.editor.Document
+import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.util.text.StringUtil
-import com.intellij.psi.{PsiDocumentManager, PsiFile, PsiNameIdentifierOwner}
+import com.intellij.psi.{PsiDocumentManager, PsiElement, PsiFile, PsiNameIdentifierOwner, PsiNamedElement, SyntaxTraverser}
+import org.eclipse.lsp4j.SymbolKind
 import org.jetbrains.plugins.scala.editor.documentationProvider.ScalaDocQuickInfoGenerator
+import org.jetbrains.plugins.scala.lang.folding.ScalaFoldingBuilder
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
+import org.jetbrains.plugins.scala.lang.psi.api.expr.ScBlock
+import org.jetbrains.plugins.scala.lang.psi.api.statements.{ScEnumCase, ScExtension, ScFunction, ScTypeAlias, ScVariable}
+import org.jetbrains.plugins.scala.lang.psi.api.statements.params.ScClassParameter
+import org.jetbrains.plugins.scala.lang.psi.api.toplevel.ScNamedElement
+import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.{ScEnum, ScObject, ScTrait, ScTypeDefinition}
+import org.jetbrains.plugins.scala.lang.refactoring.util.ScalaNamesUtil
+import org.jetbrains.plugins.scala.structureView.element.Element
 import scalapsihost.*
 
 import java.nio.file.{Files, Path}
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
+import scala.jdk.CollectionConverters.*
 
 /** A problem in a file, from the plugin (`scala-plugin`) or the compiler (`scalac`). */
 final case class FileProblem(severity: HighlightSeverity, start: LineColumn, end: LineColumn, message: String, source: String)
+
+/** An occurrence of a symbol in a file: its range, and whether it writes the symbol (a declaration with a value, an assignment). */
+final case class Occurrence(range: (LineColumn, LineColumn), write: Boolean)
+
+/**
+ * A declaration in a file's outline: its name, the rest of what the structure view shows (parameters, type), its
+ * whole range and its name's.
+ */
+final case class OutlineSymbol(
+  name: String, detail: String, kind: SymbolKind, range: (LineColumn, LineColumn), nameRange: (LineColumn, LineColumn),
+  children: Seq[OutlineSymbol],
+)
+
+object OutlineSymbol {
+  def kind(declaration: PsiElement): SymbolKind = declaration match {
+    case _: ScEnumCase => SymbolKind.EnumMember
+    case _: ScEnum => SymbolKind.Enum
+    case _: ScTrait => SymbolKind.Interface
+    case _: ScObject => SymbolKind.Module
+    case _: ScTypeDefinition => SymbolKind.Class
+    case f: ScFunction if f.isConstructor => SymbolKind.Constructor
+    case f: ScFunction => if (f.containingClass == null) SymbolKind.Function else SymbolKind.Method
+    case _: ScClassParameter => SymbolKind.Property
+    // LSP has no kind for type aliases; editors show a class for them.
+    case _: ScTypeAlias => SymbolKind.Class
+    case _: ScExtension => SymbolKind.Namespace
+    case named: ScNamedElement => named.nameContext match {
+      case _: ScVariable => SymbolKind.Variable
+      case _ => SymbolKind.Constant
+    }
+    case _ => SymbolKind.Object
+  }
+}
+
+/** A folding region: the lines it hides after its first one, up to `endLine`. */
+final case class Fold(startLine: Int, endLine: Int, kind: Fold.Kind)
+
+object Fold {
+  enum Kind { case Code, Comment, Imports, Region }
+  export Kind.*
+}
 
 /**
  * An open project: its build (kept connected, to compile on save), its modules in the host and every source file
@@ -122,7 +176,24 @@ final class ProjectSession private (
     val f = file(path)
     for {
       reference <- Option(f.findReferenceAt(offset(document(f), at)))
-      target <- Option(reference.resolve()).map(_.getNavigationElement)
+      target <- Option(reference.resolve())
+      location <- sourceLocation(target)
+    } yield location
+  }
+
+  /** Where the type of the symbol at `at` is declared, as the IDE's "go to type declaration" (project sources only). */
+  def typeDefinition(path: Path, at: LineColumn): Seq[(Path, LineColumn)] = host.read {
+    val f = file(path)
+    val atOffset = offset(document(f), at)
+    val symbol = Option(f.findReferenceAt(atOffset)).flatMap(r => Option(r.resolve())).orElse(declarationNamedAt(f, atOffset))
+    val types = symbol.flatMap(s => Option(new org.jetbrains.plugins.scala.annotator.gutter.ScalaGotoTypeDeclarationProvider().getSymbolTypeDeclarations(s)))
+    types.toSeq.flatten.flatMap(sourceLocation)
+  }
+
+  // A declaration's file and the position of its name, when it is in the project's sources.
+  private def sourceLocation(declaration: PsiElement): Option[(Path, LineColumn)] = {
+    val target = declaration.getNavigationElement
+    for {
       targetFile <- Option(target.getContainingFile)
       source <- Option(targetFile.getViewProvider.getVirtualFile).collect { case s: SourceFile => s }
     } yield {
@@ -131,6 +202,104 @@ final class ProjectSession private (
         case other => other.getTextOffset
       }
       source.path -> position(document(targetFile), nameOffset)
+    }
+  }
+
+  /**
+   * The occurrences in this file of the symbol at `at` (referenced or declared there), as the IDE highlights them
+   * under the caret: its declaration and the references to it, read or written as the plugin's access detector says.
+   */
+  def highlights(path: Path, at: LineColumn): Seq[Occurrence] = host.read {
+    val f = file(path)
+    val d = document(f)
+    val atOffset = offset(d, at)
+    val target = Option(f.findReferenceAt(atOffset)) match {
+      case Some(reference) => Option(reference.resolve())
+      case None => declarationNamedAt(f, atOffset)
+    }
+    target.collect { case named: PsiNamedElement if named.getName != null => named }.toSeq.flatMap { named =>
+      val access = new org.jetbrains.plugins.scala.highlighter.readWriteAccess.ScalaReadWriteAccessDetector
+      def span(range: TextRange) = position(d, range.getStartOffset) -> position(d, range.getEndOffset)
+      val declaration = named.getNavigationElement match {
+        case owner: PsiNameIdentifierOwner if owner.getContainingFile == f && owner.getNameIdentifier != null =>
+          Seq(Occurrence(span(owner.getNameIdentifier.getTextRange), write = access.isDeclarationWriteAccess(owner)))
+        case _ => Seq.empty
+      }
+      // Only references whose text names the symbol can refer to it (the IDE's search also looks for the name's
+      // occurrences first); resolving every reference of the file would be the whole highlighting pass.
+      val references = SyntaxTraverser.psiTraverser(f).asScala.toSeq.flatMap(_.getReferences.toSeq).filter { reference =>
+        val text = reference.getRangeInElement.substring(reference.getElement.getText)
+        ScalaNamesUtil.equivalent(text, named.getName) && reference.isReferenceTo(named)
+      }
+      declaration ++ references.map { reference =>
+        val write = access.getReferenceAccess(named, reference) == ReadWriteAccessDetector.Access.Write
+        Occurrence(span(reference.getRangeInElement.shiftRight(reference.getElement.getTextRange.getStartOffset)), write)
+      }
+    }.distinct
+  }
+
+  /** The file's outline, as the IDE's structure view shows it (Scala files; Java sources have none). */
+  def outline(path: Path): Seq[OutlineSymbol] = host.read {
+    file(path) match {
+      case scalaFile: ScalaFile =>
+        val d = document(scalaFile)
+        def span(range: TextRange) = position(d, range.getStartOffset) -> position(d, range.getEndOffset)
+        def symbols(node: TreeElement): Seq[OutlineSymbol] = node match {
+          case element: Element =>
+            val children = element.getChildren.toSeq.flatMap(symbols)
+            element.element match {
+              // An initializer block has no name: its declarations are shown under the enclosing one.
+              case _: ScBlock => children
+              case psi =>
+                val text = element.getPresentation.getPresentableText
+                val (name, detail) = psi match {
+                  case named: ScNamedElement if text.startsWith(named.name) => named.name -> text.drop(named.name.length)
+                  case _ => text -> ""
+                }
+                // A val's or var's binding is the element; its definition is the whole statement.
+                val whole = psi match {
+                  case named: ScNamedElement => named.nameContext
+                  case other => other
+                }
+                val nameRange = psi match {
+                  case named: ScNamedElement => named.nameId.getTextRange
+                  case other => TextRange.from(other.getTextOffset, 0)
+                }
+                Seq(OutlineSymbol(name, detail, OutlineSymbol.kind(psi), span(whole.getTextRange), span(nameRange), children))
+            }
+          case _ => Seq.empty
+        }
+        Element(() => scalaFile).getChildren.toSeq.flatMap(symbols)
+      case _ => Seq.empty
+    }
+  }
+
+  /**
+   * The file's folding regions, as the plugin's folding builder computes them for the IDE's editor. A region that
+   * ends on a closing bracket leaves that bracket's line unfolded.
+   */
+  def foldingRanges(path: Path): Seq[Fold] = host.read {
+    file(path) match {
+      case scalaFile: ScalaFile =>
+        val d = document(scalaFile)
+        val text = d.getCharsSequence
+        new ScalaFoldingBuilder().buildFoldRegions(scalaFile, d, /* quick = */ false).toSeq.flatMap { descriptor =>
+          val range = descriptor.getRange
+          val startLine = d.getLineNumber(range.getStartOffset)
+          val lastLine = d.getLineNumber(range.getEndOffset)
+          val closes = range.getLength > 0 && "})]".contains(text.charAt(range.getEndOffset - 1))
+          val endLine = if (closes && lastLine > startLine) lastLine - 1 else lastLine
+          val node = descriptor.getElement
+          val kind = node.getElementType match {
+            case t if org.jetbrains.plugins.scala.lang.lexer.ScalaTokenTypes.COMMENTS_TOKEN_SET.contains(t) =>
+              if (com.intellij.lang.folding.CustomFoldingBuilder.isCustomRegionElement(node.getPsi)) Fold.Region else Fold.Comment
+            case t if t == org.jetbrains.plugins.scala.lang.scaladoc.parser.ScalaDocElementTypes.SCALA_DOC_COMMENT => Fold.Comment
+            case t if t == org.jetbrains.plugins.scala.lang.parser.ScalaElementType.ImportStatement => Fold.Imports
+            case _ => Fold.Code
+          }
+          Option.when(endLine > startLine)(Fold(startLine, endLine, kind))
+        }.distinct
+      case _ => Seq.empty
     }
   }
 

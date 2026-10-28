@@ -8,8 +8,10 @@ A Scala language server built on the IntelliJ Scala plugin's PSI and type checke
 application container**. The plugin source is not modified: the host builds the plugin from intellij-scala and
 answers, through fixed tables, what the plugin and the IntelliJ platform's PSI libraries ask of their environment.
 
-It serves LSP diagnostics, hover and go-to-definition for sbt (or any BSP) builds, Scala 2 and 3, with Java
-sources in mixed projects.
+It serves LSP diagnostics, hover, go to definition and type definition, document highlights, document symbols and
+folding ranges for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects. Symbols and folding
+are the plugin's structure view and folding builder; highlights and type definition, its access detector and
+type-declaration provider.
 
 ## How it works
 
@@ -129,7 +131,8 @@ Run them with `sbt "Test/runMain scalapsihost.oracle.<Name> ..."`.
 
 ## Known limitations
 
-- Go-to-definition reaches declarations in project sources only; library declarations have no file to open yet.
+- Go to definition and type definition reach declarations in project sources only; library declarations have no
+  file to open yet.
 - Scala 2 has no document compilation (its compiler has no stable interface to call); Scala 2 errors come from the
   plugin, or from the build's compile when compiler errors are enabled for Scala 2.
 - Java sources are parsed at the highest language level, not the build's.

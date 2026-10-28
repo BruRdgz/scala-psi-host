@@ -15,7 +15,7 @@ import scala.jdk.CollectionConverters.*
 /**
  * The language server: LSP over a [[ProjectSession]] of the workspace's build.
  *
- * Document notifications, hover and definition run in order on one thread, so a request sees every change sent
+ * Document notifications and requests run in order on one thread, so a request sees every change sent
  * before it; the project is opened there first, so `initialize` answers at once. Diagnostics are computed on
  * another thread, a short while after a document's last change: a change cancels a computation in progress (the
  * host's write lock cancels running queries), and a result is published only for the document's current version.
@@ -55,6 +55,10 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
     capabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental)
     capabilities.setHoverProvider(true)
     capabilities.setDefinitionProvider(true)
+    capabilities.setTypeDefinitionProvider(true)
+    capabilities.setDocumentHighlightProvider(true)
+    capabilities.setDocumentSymbolProvider(true)
+    capabilities.setFoldingRangeProvider(true)
     CompletableFuture.completedFuture(new InitializeResult(capabilities, new ServerInfo("scala-psi-host", "0.1")))
   }
 
@@ -123,6 +127,44 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
       }
       LspEither.forLeft[java.util.List[? <: Location], java.util.List[? <: LocationLink]](locations.asJava)
     }
+
+    override def typeDefinition(params: TypeDefinitionParams)
+        : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] = onDocuments { s =>
+      val locations = s.typeDefinition(pathOf(params.getTextDocument.getUri), lineColumn(params.getPosition)).toList.map {
+        case (path, at) => new Location(path.toUri.toString, new Range(position(at), position(at)))
+      }
+      LspEither.forLeft[java.util.List[? <: Location], java.util.List[? <: LocationLink]](locations.asJava)
+    }
+
+    override def documentHighlight(params: DocumentHighlightParams): CompletableFuture[java.util.List[? <: DocumentHighlight]] =
+      onDocuments { s =>
+        s.highlights(pathOf(params.getTextDocument.getUri), lineColumn(params.getPosition)).map { o =>
+          new DocumentHighlight(range(o.range), if (o.write) DocumentHighlightKind.Write else DocumentHighlightKind.Read)
+        }.asJava
+      }
+
+    override def documentSymbol(params: DocumentSymbolParams)
+        : CompletableFuture[java.util.List[LspEither[SymbolInformation, DocumentSymbol]]] = onDocuments { s =>
+      def symbol(o: OutlineSymbol): DocumentSymbol = {
+        val d = new DocumentSymbol(o.name, o.kind, range(o.range), range(o.nameRange), o.detail)
+        d.setChildren(o.children.map(symbol).asJava)
+        d
+      }
+      s.outline(pathOf(params.getTextDocument.getUri)).map(o => LspEither.forRight[SymbolInformation, DocumentSymbol](symbol(o))).asJava
+    }
+
+    override def foldingRange(params: FoldingRangeRequestParams): CompletableFuture[java.util.List[FoldingRange]] = onDocuments { s =>
+      s.foldingRanges(pathOf(params.getTextDocument.getUri)).map { fold =>
+        val r = new FoldingRange(fold.startLine, fold.endLine)
+        fold.kind match {
+          case Fold.Comment => r.setKind(FoldingRangeKind.Comment)
+          case Fold.Imports => r.setKind(FoldingRangeKind.Imports)
+          case Fold.Region => r.setKind(FoldingRangeKind.Region)
+          case Fold.Code => ()
+        }
+        r
+      }.asJava
+    }
   }
 
   // ---- Diagnostics -----------------------------------------------------------------------------------------------
@@ -159,6 +201,7 @@ final class ScalaLanguageServer(host: ScalaPsiHost, exitProcess: Int => Unit = _
 
   private def lineColumn(p: Position): LineColumn = LineColumn(p.getLine, p.getCharacter)
   private def position(at: LineColumn): Position = new Position(at.line, at.column)
+  private def range(span: (LineColumn, LineColumn)): Range = new Range(position(span._1), position(span._2))
 
   // ---- Workspace -------------------------------------------------------------------------------------------------
 
