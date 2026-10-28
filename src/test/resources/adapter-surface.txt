@@ -92,6 +92,7 @@ Project.service org.jetbrains.plugins.scala.settings.ScalaProjectSettings
 Project.service org.jetbrains.plugins.scala.util.UnloadAwareDisposable$UnloadAwareDisposableService
 ProjectFileIndex.findContainingLibraries
 ProjectFileIndex.findContainingSdks
+ProjectFileIndex.getModuleForFile
 ProjectFileIndex.isInLibrary
 ProjectFileIndex.isInLibraryClasses
 ProjectFileIndex.isInSourceContent
@@ -104,6 +105,7 @@ PsiManager.findFile
 PsiManager.getFileManager
 PsiManager.getModificationTracker
 PsiManager.getProject
+PsiManager.isBatchFilesProcessingMode
 PsiManager.isDisposed
 PsiModificationTracker.getModificationCount
 ResolveScopeManager.getResolveScope

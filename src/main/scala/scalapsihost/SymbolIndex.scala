@@ -21,7 +21,7 @@ import scala.jdk.CollectionConverters.*
  * @param scalaIndexed top-level Scala class files and TASTy files whose decompiled PSI went into the index
  * @param javaClasses  Java class files: not indexed, the host's class finder reads them by path on demand
  * @param notTopLevel  class files without a PSI file of their own (inner and companion classes, classes of TASTy files)
- * @param refused      Scala class files whose stubs could not be paired with their PSI; left out of the index
+ * @param refused      Scala class files with no stub tree to index (their syntax tree was already loaded)
  */
 final case class LibraryIndexReport(
   classFiles: Int,
@@ -90,7 +90,7 @@ final class SymbolIndex {
         else if ((file.getName.endsWith(".class") || file.getName.endsWith(".tasty")) && includeEntry(relative)) {
           classFiles += 1
           psiManager.findFile(file) match {
-            case scalaFile: ScalaFile => if (indexSourceFile(scalaFile)) scalaIndexed += 1 else refused += relative
+            case scalaFile: ScalaFile => if (indexLibraryFile(scalaFile)) scalaIndexed += 1 else refused += relative
             case _: PsiJavaFile => javaClasses += 1
             case _ => notTopLevel += 1
           }
@@ -102,9 +102,26 @@ final class SymbolIndex {
   }
 
   /**
-   * Indexes one source file (Scala or Java) or decompiled Scala library file; returns false, indexing nothing, when
-   * its stubs cannot be paired with its PSI.
-   * The indexed elements are the file's own PSI, so lookups land on the same tree callers hold.
+   * Indexes a decompiled library file from its stub tree, as the IDE keeps library PSI: the indexed elements are
+   * stub-based, and the file's syntax tree is built only if something navigates into it. Returns false, indexing
+   * nothing, when the file has no stub tree to read (its syntax tree is already loaded).
+   */
+  private def indexLibraryFile(file: ScalaFile): Boolean =
+    file match {
+      case stubbed: com.intellij.psi.impl.source.PsiFileImpl =>
+        Option(stubbed.getStubTree) match {
+          case Some(tree) =>
+            // The first stub is the file's own.
+            record(file, tree.getPlainList.asScala.toSeq.drop(1).map(stub => stub -> stub.getPsi))
+            true
+          case None => false
+        }
+      case _ => false
+    }
+
+  /**
+   * Indexes one source file (Scala or Java); returns false, indexing nothing, when its stubs cannot be paired with
+   * its PSI. The indexed elements are the file's own PSI, so lookups land on the same tree callers hold.
    */
   def indexSourceFile(file: PsiFile): Boolean = {
     val registry = StubElementRegistryService.Companion.getInstance()
@@ -124,24 +141,28 @@ final class SymbolIndex {
     walk(file.getNode)
     val paired = stubs.size == psis.size && stubs.zip(psis).forall((s, p) => s.getElementType == p.getNode.getElementType)
     // No mapping is better than a wrong one: an unpaired file stays out of the index.
-    if (paired) {
-      val entries = Vector.newBuilder[(String, AnyRef, PsiElement)]
-      for ((stub, psi) <- stubs.zip(psis); serializer <- Option(registry.getStubSerializer(stub.getElementType))) {
-        val sink = new IndexSink {
-          override def occurrence[Psi <: PsiElement, K](key: StubIndexKey[K, Psi], value: K): Unit =
-            entries += ((key.getName, normKey(value.asInstanceOf[AnyRef]), psi))
-        }
-        serializer.asInstanceOf[ObjectStubSerializer[StubElement[?], ?]].indexStub(stub, sink)
-      }
-      val fileEntries = entries.result()
-      for ((index, key, psi) <- fileEntries) {
-        elements.computeIfAbsent((index, key), _ => new CopyOnWriteArrayList[PsiElement]()).add(psi)
-        keys.computeIfAbsent(index, _ => ConcurrentHashMap.newKeySet[AnyRef]()).add(key)
-      }
-      entriesByFile.put(file, fileEntries)
-      tracker.incModificationCount()
-    }
+    if (paired) record(file, stubs.zip(psis))
     paired
+  }
+
+  /** Runs the stub indexers over each stub and records the occurrences for its element, as `file`'s entries. */
+  private def record(file: PsiFile, stubsWithElements: Seq[(StubElement[?], PsiElement)]): Unit = {
+    val registry = StubElementRegistryService.Companion.getInstance()
+    val entries = Vector.newBuilder[(String, AnyRef, PsiElement)]
+    for ((stub, psi) <- stubsWithElements; serializer <- Option(registry.getStubSerializer(stub.getElementType))) {
+      val sink = new IndexSink {
+        override def occurrence[Psi <: PsiElement, K](key: StubIndexKey[K, Psi], value: K): Unit =
+          entries += ((key.getName, normKey(value.asInstanceOf[AnyRef]), psi))
+      }
+      serializer.asInstanceOf[ObjectStubSerializer[StubElement[?], ?]].indexStub(stub, sink)
+    }
+    val fileEntries = entries.result()
+    for ((index, key, psi) <- fileEntries) {
+      elements.computeIfAbsent((index, key), _ => new CopyOnWriteArrayList[PsiElement]()).add(psi)
+      keys.computeIfAbsent(index, _ => ConcurrentHashMap.newKeySet[AnyRef]()).add(key)
+    }
+    entriesByFile.put(file, fileEntries)
+    tracker.incModificationCount()
   }
 
   /** Removes everything `file` contributed. */

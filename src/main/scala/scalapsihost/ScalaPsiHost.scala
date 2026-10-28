@@ -558,8 +558,10 @@ object ScalaPsiHost {
     val directories = new ConcurrentHashMap[VirtualFile, com.intellij.psi.PsiDirectory]()
     var psiManagerRef: PsiManager = null
     def viewProvider(f: VirtualFile): FileViewProvider = viewProviders.computeIfAbsent(f, {
+      // Physical (event system enabled), as the IDE's library files: a non-physical file loads its syntax tree up
+      // front, while a physical one stays stub-based until something navigates into it.
       case lib: LibraryFile if com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType) != null =>
-        com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType).createFileViewProvider(lib, null, psiManagerRef, false)
+        com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType).createFileViewProvider(lib, null, psiManagerRef, true)
       case other => CallLog.unsupported(s"FileManager.findViewProvider for a file the host does not own: $other")
     })
     val fileManager = tableProxy(classOf[com.intellij.psi.impl.file.impl.FileManager], "FileManager") {
@@ -595,6 +597,7 @@ object ScalaPsiHost {
       case ("FileIndexFacade.isInLibrarySource", _) => java.lang.Boolean.FALSE
       // Roots change only when a library or the JDK is mounted, which also counts as a PSI change.
       case ("FileIndexFacade.getRootModificationTracker", _) => psiModificationCount
+      case ("FileIndexFacade.getModuleForFile", Array(f: VirtualFile)) => moduleModel.ofFile(f).map(_.module).orNull
       case ("FileIndexFacade.isInSource" | "FileIndexFacade.isInSourceContent" | "FileIndexFacade.isInContent", Array(f: VirtualFile)) =>
         java.lang.Boolean.valueOf(!isLibraryClass(f))
     }))
