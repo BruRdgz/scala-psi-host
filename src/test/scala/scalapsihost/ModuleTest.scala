@@ -22,8 +22,11 @@ class ModuleTest extends munit.FunSuite {
     )
   }
 
+  private val sourceCount = new java.util.concurrent.atomic.AtomicInteger()
+
   private def errorsIn(module: HostModule, source: String): Seq[String] = {
-    val file = host.openSource(source, module)
+    val file = host.openFile(Path.of(s"/${module.spec.name}/Source${sourceCount.incrementAndGet()}.scala"), source, module)
+      .asInstanceOf[org.jetbrains.plugins.scala.lang.psi.api.ScalaFile]
     try host.diagnostics(file).filter(_.severity == HighlightSeverity.ERROR).map(_.message)
     finally host.closeSource(file)
   }
@@ -44,7 +47,7 @@ class ModuleTest extends munit.FunSuite {
   test("a module sees the sources of the modules it depends on, and no others") {
     val lib = host.addModule(ModuleSpec("lib", "2.13.18", Seq.empty, Seq(library213)))
     val client = host.addModule(ModuleSpec("client", "2.13.18", Seq.empty, Seq(library213), dependsOn = Seq("lib")))
-    val libFile = host.openSource("package lib\nobject Lib { val answer: Int = 42 }", lib)
+    val libFile = host.openFile(Path.of("/lib/lib/Lib.scala"), "package lib\nobject Lib { val answer: Int = 42 }", lib)
     try {
       val clientSource = "object Client { val n: Int = lib.Lib.answer }"
       assertEquals(errorsIn(client, clientSource), Seq.empty)

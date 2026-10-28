@@ -50,11 +50,7 @@ class BspImportTest extends munit.FunSuite {
     TestHost.libraryReport // the JDK
     val hostModules = imported.map(m => m -> TestHost.host.addModule(m.spec))
     val files = for ((m, hostModule) <- hostModules; source <- m.sources) yield {
-      val text = Files.readString(source)
-      val file =
-        if (source.toString.endsWith(".java")) TestHost.host.openJavaSource(source.getFileName.toString, text, hostModule)
-        else TestHost.host.openSource(text, hostModule)
-      fixture.relativize(source).toString -> file
+      fixture.relativize(source).toString -> TestHost.host.openFile(source, Files.readString(source), hostModule)
     }
     try {
       val errors = files.collect { case (path, file: org.jetbrains.plugins.scala.lang.psi.api.ScalaFile) => path -> file }.flatMap { (path, file) =>

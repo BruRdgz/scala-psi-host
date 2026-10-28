@@ -4,7 +4,7 @@ import com.intellij.codeInsight.daemon.impl.{AnnotationHolderImpl, AnnotationSes
 import com.intellij.core.{CoreApplicationEnvironment, CoreFileTypeRegistry}
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
-import com.intellij.psi.{PsiErrorElement, PsiFile, PsiJavaFile, SyntaxTraverser}
+import com.intellij.psi.{PsiErrorElement, PsiFile, SyntaxTraverser}
 import com.intellij.psi.codeStyle.FileIndentOptionsProvider
 import com.intellij.psi.impl.source.tree.TreeCopyHandler
 import com.intellij.lang.{DefaultASTFactory, DefaultASTFactoryImpl, LanguageASTFactory, LanguageExtensionPoint, LanguageParserDefinitions, ParserDefinition, PsiBuilderFactory}
@@ -84,33 +84,6 @@ final class ScalaPsiHost private (
    */
   def openSource(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile =
     HostLock.write(index(parse(text, features)))
-
-  /**
-   * A source file of `module`: parsed with the module's language features (Scala version, compiler options) and
-   * resolved in the module's scope.
-   */
-  def openSource(text: String, module: HostModule): ScalaFile = HostLock.write {
-    openInModule(parse(text, org.jetbrains.plugins.scala.project.ModuleExt(module.module).features), module)
-  }
-
-  /**
-   * A Java source file of `module` (mixed Scala/Java modules): its classes are indexed, so the module's Scala code
-   * resolves them. `fileName` is the file's name (`Foo.java`), which Java ties to its public class.
-   */
-  def openJavaSource(fileName: String, text: String, module: HostModule): PsiJavaFile = HostLock.write {
-    val file = com.intellij.psi.PsiFileFactory.getInstance(project)
-      .createFileFromText(fileName, com.intellij.lang.java.JavaLanguage.INSTANCE, text)
-      .asInstanceOf[PsiJavaFile]
-    openInModule(file, module)
-  }
-
-  private def openInModule[F <: PsiFile](file: F, module: HostModule): F = {
-    // The file is non-physical (no PsiFile.getVirtualFile): the platform finds its module through this key, as for
-    // code fragments.
-    file.putUserData(com.intellij.openapi.module.ModuleUtilCore.KEY_MODULE, module.module)
-    modules.addSource(file.getViewProvider.getVirtualFile, module)
-    index(file)
-  }
 
   private def index[F <: PsiFile](file: F): F = {
     if (!symbolIndex.indexSourceFile(file)) {
