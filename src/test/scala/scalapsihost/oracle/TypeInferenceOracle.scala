@@ -8,7 +8,7 @@ import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.api.base.ScLiteral
 import org.jetbrains.plugins.scala.lang.psi.api.expr.{ScExpression, ScInfixExpr, ScReferenceExpression}
 import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunctionDefinition
-import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.{ScClass, ScTypeDefinition}
+import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScClass
 import org.jetbrains.plugins.scala.lang.psi.types.api.presentation.TypePresentation
 import org.jetbrains.plugins.scala.lang.psi.types.result.*
 import org.jetbrains.plugins.scala.lang.psi.types.{Context, ScType, ScTypeExt, TypePresentationContext}
@@ -31,10 +31,12 @@ import scala.util.control.NonFatal
  * fixture's default setup: Scala 2.12 (`ScalaSdkOwner.defaultSdkVersion`), scala-library only, expected to pass.
  * Everything else is reported as skipped, with the reason.
  *
- * Usage: `Test/runMain scalapsihost.oracle.TypeInferenceOracle <intellij-scala checkout> <report.md> [--unit-test-mode]`
+ * Usage: `Test/runMain scalapsihost.oracle.TypeInferenceOracle <intellij-scala checkout> <report.md> [--production-mode]
+ * [--only=<test name>,...]`. `--only` runs just those tests (e.g. `SCL5475`), in a fresh host.
  *
- * `--unit-test-mode` runs the host as the plugin's fixture does (`isUnitTestMode`), to check which disagreements
- * come only from behaviour the plugin enables in tests.
+ * By default the host runs as the plugin's fixture does (`isUnitTestMode`), because the plugin changes behaviour in
+ * that mode and the expectations were recorded with it — e.g. top-level declarations of Scala 2 files resolve only
+ * in tests (FileDeclarationsHolder, SCL-20481). `--production-mode` runs it as an IDE outside tests.
  */
 object TypeInferenceOracle {
   /** The version the plugin's light fixture selects for tests without a `supportedIn` restriction. */
@@ -42,7 +44,7 @@ object TypeInferenceOracle {
 
   def main(args: Array[String]): Unit = {
     val (Seq(repo, reportPath), flags) = args.toSeq.partition(!_.startsWith("--"))
-    val unitTestMode = flags.contains("--unit-test-mode")
+    val unitTestMode = !flags.contains("--production-mode")
     val pluginRoot = Path.of(repo, "scala/scala-impl")
     val host = ScalaPsiHost.start(HostConfig(
       stateDir = Path.of(sys.props("scalapsihost.stateDir")),
@@ -52,7 +54,9 @@ object TypeInferenceOracle {
     host.addJdk(Path.of(System.getProperty("java.home")))
     host.addLibrary(Path.of(sys.props("scalapsihost.fixture.scalaLibrary212")))
 
-    val (cases, skippedClasses) = TestClasses.collect(host, pluginRoot)
+    val only = flags.collectFirst { case f if f.startsWith("--only=") => f.stripPrefix("--only=").split(',').toSet }
+    val (allCases, skippedClasses) = TestClasses.collect(host, pluginRoot)
+    val cases = only.fold(allCases)(names => allCases.filter(c => names.contains(c.testName)))
     val features = ScalaFeatures.onlyByVersion(TestVersion)
     val t0 = System.nanoTime()
     val outcomes = cases.map(c => c -> runCase(host, features, c))
@@ -74,13 +78,7 @@ object TypeInferenceOracle {
         else Expected.lastComment(file) match {
           case None => Outcome.Unusable("the file does not end with a comment")
           case Some(comment) =>
-            val outcome = compare(selectedExpression(file), Expected.forVersion(comment, TestVersion))
-            // FileDeclarationsHolder processes top-level declarations of a Scala 2 file only in unit-test mode
-            // (SCL-20481, "a hack not to patch hundreds of tests"). The host, like the IDE outside tests, does not.
-            val hasTopLevelDeclarations = file.members.exists(!_.isInstanceOf[ScTypeDefinition])
-            if (outcome != Outcome.Agree && hasTopLevelDeclarations && !ApplicationManager.getApplication.isUnitTestMode)
-              Outcome.UnitTestModeOnly(outcome.toString.take(200))
-            else outcome
+            compare(selectedExpression(file), Expected.forVersion(comment, TestVersion))
         }
       }
       finally host.closeSource(file)
@@ -150,8 +148,6 @@ enum Outcome {
   case ParseError(message: String)
   case Crash(message: String, origin: String)
   case Unusable(reason: String)
-  /** Disagrees, but the test relies on behaviour the plugin enables only in unit-test mode. */
-  case UnitTestModeOnly(outcome: String)
 }
 
 /** Expected results as TestUtils.extractExpectedResultFromLastComment and TypeInferenceTestFixture read them. */
@@ -279,17 +275,17 @@ object Report {
       case _: Outcome.ParseError => "parse error"
       case _: Outcome.Crash => "crash"
       case _: Outcome.Unusable => "unusable"
-      case _: Outcome.UnitTestModeOnly => "unit-test mode only"
     }
     val counts = outcomes.groupBy(o => kind(o._2)).view.mapValues(_.size).toMap
     val lines = Vector.newBuilder[String]
     lines += "# Type-inference oracle"
     lines += ""
-    lines += s"${outcomes.size} cases in ${elapsedMs} ms (Scala 2.12 test data, scala-library 2.12.21, JDK ${System.getProperty("java.version")})."
+    val mode = if (ApplicationManager.getApplication.isUnitTestMode) "unit-test mode, as the fixture" else "production mode"
+    lines += s"${outcomes.size} cases in ${elapsedMs} ms (Scala 2.12 test data, scala-library 2.12.21, JDK ${System.getProperty("java.version")}, $mode)."
     lines += ""
     lines += "| Outcome | Cases |"
     lines += "|---|---|"
-    for (k <- Seq("agree", "differ", "type failure", "parse error", "crash", "unusable", "unit-test mode only"))
+    for (k <- Seq("agree", "differ", "type failure", "parse error", "crash", "unusable"))
       lines += s"| $k | ${counts.getOrElse(k, 0)} |"
     lines += ""
     lines += "## Disagreements"
@@ -304,7 +300,6 @@ object Report {
         case Outcome.ParseError(m) => ("", m)
         case Outcome.Crash(m, origin) => ("", s"$m (at $origin)")
         case Outcome.Unusable(r) => ("", r)
-        case Outcome.UnitTestModeOnly(o) => ("", o)
         case Outcome.Agree => ("", "")
       }
       lines += s"| ${c.testClass}.${c.testName} | ${kind(o)} | ${cell(expected)} | ${cell(actual)} |"

@@ -62,6 +62,28 @@ object Descriptors {
     }.toMap
   }
 
+  /**
+   * Implementation classes the Scala plugin's descriptors register for extension point `epName` (fully qualified),
+   * in declaration order. Read as data; the caller decides which extension points it loads.
+   */
+  def scalaExtensions(scalaPluginJars: Seq[Path], epName: String): Seq[String] = {
+    val factory = DocumentBuilderFactory.newInstance()
+    for {
+      jar <- scalaPluginJars
+      (_, bytes) <- xmlEntries(jar) if new String(bytes, StandardCharsets.UTF_8).contains("<extensions")
+      doc <- scala.util.Try(factory.newDocumentBuilder().parse(new java.io.ByteArrayInputStream(bytes))).toOption.toSeq
+      blocks = doc.getElementsByTagName("extensions")
+      b <- 0 until blocks.getLength
+      block = blocks.item(b).asInstanceOf[org.w3c.dom.Element]
+      namespace = block.getAttribute("defaultExtensionNs")
+      children = block.getChildNodes
+      i <- 0 until children.getLength
+      e <- Option(children.item(i)).collect { case el: org.w3c.dom.Element => el }
+      if s"$namespace.${e.getTagName}" == epName
+      implementation = e.getAttribute("implementation") if implementation.nonEmpty
+    } yield implementation
+  }
+
   private def xmlEntries(jar: Path): Seq[(String, Array[Byte])] =
     Using.resource(new ZipFile(jar.toFile)) { zip =>
       zip.entries().asScala.filter(_.getName.endsWith(".xml")).map(e => e.getName -> zip.getInputStream(e).readAllBytes()).toVector

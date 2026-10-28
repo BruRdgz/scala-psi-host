@@ -84,6 +84,9 @@ final class ScalaPsiHost private (
 object ScalaPsiHost {
   @volatile private var started: Option[ScalaPsiHost] = None
 
+  /** Plugin extension points that carry language semantics; every other plugin extension point stays empty. */
+  val SemanticExtensionPoints: Seq[String] = Seq("org.intellij.scala.syntheticMemberInjector")
+
   /**
    * Starts the host. The platform keeps the Application and the root extension area in process-wide statics,
    * so there is one host per JVM and it lives until the JVM exits.
@@ -157,6 +160,15 @@ object ScalaPsiHost {
     if (pluginEps.isEmpty)
       throw new IllegalStateException(s"no extension points declared by the Scala plugin jars ${config.scalaPluginJars.mkString(", ")}; are they on the classpath?")
     pluginEps.foreach(d => declare(d.name))
+    // The plugin's extension points whose extensions are language semantics, loaded as its descriptors register
+    // them. syntheticMemberInjector: case-class and companion members, context bounds, enums, `derives`, and the
+    // members library macros generate (Monocle, Circe, Simulacrum, ...), as the IDE always runs them.
+    for (epName <- ScalaPsiHost.SemanticExtensionPoints) {
+      val implementations = Descriptors.scalaExtensions(config.scalaPluginJars, epName)
+      if (implementations.isEmpty) throw new IllegalStateException(s"no extensions registered for $epName in the Scala plugin's descriptors")
+      val ep = area.getExtensionPoint[AnyRef](epName).asInstanceOf[ExtensionPointImpl[AnyRef]]
+      implementations.foreach(name => ep.registerExtension(newPrivate(Class.forName(name).asInstanceOf[Class[AnyRef]]), root))
+    }
     // Platform extension points the plugin's PSI queries, with no extensions. Their declarations live in IDE
     // descriptors that are not on this classpath; the platform's own core environment declares them in code too.
     CoreApplicationEnvironment.registerExtensionPoint(area, FileIndentOptionsProvider.EP_NAME, classOf[FileIndentOptionsProvider])
