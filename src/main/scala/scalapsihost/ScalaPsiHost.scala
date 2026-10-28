@@ -65,6 +65,8 @@ final class ScalaPsiHost private (
 ) {
   // Library jars by real path: a jar on the classpath of several modules is mounted and indexed once.
   private val libraryRoots = new ConcurrentHashMap[Path, VirtualFile]()
+  // The mounted JDK's home (written in the write lock).
+  @volatile private var jdkHome: Option[Path] = None
 
   /**
    * Runs `query` as the IDE's read actions run: concurrently with other queries, never during an edit. An edit that
@@ -145,10 +147,17 @@ final class ScalaPsiHost private (
     report
   }
 
-  /** Mounts the JDK's modules. Java classes are read on demand, not indexed. Every module sees the JDK. */
+  /**
+   * Mounts the JDK's modules. Java classes are read on demand, not indexed. Every module sees the JDK. Mounting the
+   * JDK that is already mounted does nothing.
+   */
   def addJdk(javaHome: Path): Unit = HostLock.write {
-    modules.setJdkRoots(libraryFiles.mountJdk(javaHome))
-    psiChanged()
+    if (!jdkHome.contains(javaHome.toRealPath())) {
+      if (jdkHome.nonEmpty) throw new IllegalStateException(s"a JDK is already mounted (${jdkHome.get}); the host has one JDK")
+      modules.setJdkRoots(libraryFiles.mountJdk(javaHome))
+      jdkHome = Some(javaHome.toRealPath())
+      psiChanged()
+    }
   }
 
   /**

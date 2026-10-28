@@ -54,6 +54,11 @@ lazy val root = (project in file("."))
       "com.jetbrains.intellij.java" % "java-impl" % platformVersion intransitive(),
       "com.jetbrains.intellij.platform" % "lang-impl" % platformVersion intransitive(),
       "com.jetbrains.intellij.platform" % "lang" % platformVersion intransitive(),
+      // Java's highlighting keys (JavaHighlightInfoTypes), which the plugin's Scala highlighting keys derive from; quick
+      // documentation (hover) renders signatures with them. Only these jars (and their message bundle); the host has
+      // no colors.
+      "com.jetbrains.intellij.java" % "java-analysis-impl" % platformVersion intransitive(),
+      "com.jetbrains.intellij.java" % "java-analysis" % platformVersion intransitive(),
       // External-system data model (model.Key, model.project.*): the plugin's sbt constants, read when it checks for sbt build
       // modules. Only this jar; no external system runs.
       "com.jetbrains.intellij.platform" % "external-system" % platformVersion intransitive(),
@@ -68,6 +73,8 @@ lazy val root = (project in file("."))
       // The version the IDE bundles (lib/intellij.libraries.markdown.jar): same MarkdownParser API as 0.7.17.
       "org.jetbrains" % "markdown-jvm" % "0.7.17" intransitive(),
       "org.apache.commons" % "commons-text" % "1.12.0" intransitive(),
+      // LSP protocol types; the JSON-RPC layer (lsp4j.jsonrpc) comes with the plugin's jars, at this version.
+      "org.eclipse.lsp4j" % "org.eclipse.lsp4j" % "0.20.1" intransitive(),
       "org.scalameta" %% "munit" % "1.3.4" % Test,
       // 2.13.18 is the plugin's latest 2.13 (ScalaVersion.Latest): its library-highlighting test data is for these sources.
       ("org.scala-lang" % "scala-library" % "2.13.18" % Fixtures intransitive()).withSources(),
@@ -77,6 +84,13 @@ lazy val root = (project in file("."))
     Compile / unmanagedJars ++= scalaPluginJars.value.classpath,
     // One JVM per test run: the host installs process-wide platform singletons (Application, root area).
     Test / fork := true,
+    // The language server test opens the BSP fixture's modules in the JVM's one host, which another suite also
+    // does: it runs in a JVM of its own.
+    Test / testGrouping := {
+      val (own, shared) = (Test / definedTests).value.partition(_.name == "scalapsihost.lsp.LanguageServerTest")
+      val fork = Tests.SubProcess((Test / forkOptions).value)
+      Seq(Tests.Group("shared", shared, fork)) ++ own.map(test => Tests.Group(test.name, Seq(test), fork))
+    },
     // Tools in the test scope (the type-inference oracle) get their own JVM with the same options.
     Test / run / fork := true,
     Test / run / javaOptions := (Test / javaOptions).value,
