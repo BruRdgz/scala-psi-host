@@ -747,12 +747,18 @@ object ScalaPsiHost {
       case ("putUserData", Array(k: Key[?], v)) =>
         projectData.putUserData(k.asInstanceOf[Key[AnyRef]], v); null
     }
-    // The host's file store: view providers of light files (snapshots) and of library class files, keyed by
-    // virtual file; light files register themselves, library class files are created on first request.
+    // The host's file store: view providers of project sources and of library files, keyed by virtual file; sources
+    // register themselves, library files are created on first request. Other light files are the platform's
+    // temporary copies (a reparse makes one per edit): such a file holds its own provider, as in the platform's
+    // LightFileViewProviderCache, so the copy is collected once no one holds it.
     val viewProviders = new ConcurrentHashMap[VirtualFile, FileViewProvider]()
+    val temporaryViewProvider = Key.create[FileViewProvider]("scala-psi-host.temporaryViewProvider")
+    def isTemporary(f: VirtualFile) = f.isInstanceOf[com.intellij.testFramework.LightVirtualFile] && !f.isInstanceOf[SourceFile]
+    def cachedViewProvider(f: VirtualFile): FileViewProvider =
+      if (isTemporary(f)) f.getUserData(temporaryViewProvider) else viewProviders.get(f)
     val directories = new ConcurrentHashMap[VirtualFile, com.intellij.psi.PsiDirectory]()
     var psiManagerRef: PsiManager = null
-    def viewProvider(f: VirtualFile): FileViewProvider = viewProviders.computeIfAbsent(f, {
+    def viewProvider(f: VirtualFile): FileViewProvider = Option(cachedViewProvider(f)).getOrElse(viewProviders.computeIfAbsent(f, {
       // Physical (event system enabled), as the IDE's library files: a non-physical file loads its syntax tree up
       // front, while a physical one stays stub-based until something navigates into it.
       case lib: LibraryFile if com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType) != null =>
@@ -763,7 +769,7 @@ object ScalaPsiHost {
       // when no one holds it. The language's view provider when it has one (Scala), the platform's default otherwise.
       case source: SourceFile => sourceViewProvider(source)
       case other => CallLog.unsupported(s"FileManager.findViewProvider for a file the host does not own: $other")
-    })
+    }))
     // As the IDE's FileManagerImpl: the file type's language, as substituted for this file (Scala 3 modules).
     def sourceViewProvider(source: VirtualFile): FileViewProvider = {
       val language = com.intellij.psi.LanguageSubstitutors.getInstance.substituteLanguage(
@@ -773,13 +779,16 @@ object ScalaPsiHost {
         .getOrElse(new com.intellij.psi.SingleRootFileViewProvider(psiManagerRef, source, true))
     }
     val fileManager = tableProxy(classOf[com.intellij.psi.impl.file.impl.FileManagerEx], "FileManager") {
-      case ("findCachedViewProvider", Array(f: VirtualFile)) => viewProviders.get(f)
+      case ("findCachedViewProvider", Array(f: VirtualFile)) => cachedViewProvider(f)
       // One view provider per file (no code-insight contexts).
-      case ("findCachedViewProviders", Array(f: VirtualFile)) => Option(viewProviders.get(f)).toList.asJava
+      case ("findCachedViewProviders", Array(f: VirtualFile)) => Option(cachedViewProvider(f)).toList.asJava
       case ("getCachedPsiFile", Array(f: VirtualFile, _*)) =>
-        Option(viewProviders.get(f)).map(vp => vp.getPsi(vp.getBaseLanguage)).orNull
+        Option(cachedViewProvider(f)).map(vp => vp.getPsi(vp.getBaseLanguage)).orNull
       case ("setViewProvider", Array(f: VirtualFile, vp)) =>
-        if (vp == null) viewProviders.remove(f) else viewProviders.put(f, vp.asInstanceOf[FileViewProvider]); null
+        if (isTemporary(f)) f.putUserData(temporaryViewProvider, vp.asInstanceOf[FileViewProvider])
+        else if (vp == null) viewProviders.remove(f)
+        else viewProviders.put(f, vp.asInstanceOf[FileViewProvider])
+        null
       case ("findViewProvider", Array(f: VirtualFile)) => viewProvider(f)
       case ("findFile", Array(f: VirtualFile)) =>
         if (f.isDirectory) null else { val vp = viewProvider(f); vp.getPsi(vp.getBaseLanguage) }
