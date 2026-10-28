@@ -7,9 +7,9 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.Executor;
 
 /**
- * The host owns threading: a non-blocking read action runs synchronously on the caller's thread,
- * which already holds the host's snapshot. Builder calls are accepted and ignored; any other
- * terminal operation (submit to an executor, UI continuations) is unsupported.
+ * The host owns threading: a non-blocking read action runs synchronously on the caller's thread, inside the
+ * host's read lock. Builder calls are accepted and ignored; any other terminal operation (submit to an
+ * executor, UI continuations) is unsupported.
  */
 public final class HostAsyncExecutionService extends AsyncExecutionService {
   @Override protected ExpirableExecutor createExecutor(Executor executor) { return CallLog.unsupported("AsyncExecutionService.createExecutor"); }
@@ -27,7 +27,7 @@ public final class HostAsyncExecutionService extends AsyncExecutionService {
         String name = method.getName();
         if (name.equals("executeSynchronously")) {
           CallLog.hit("NonBlockingReadAction.executeSynchronously");
-          return callable.call();
+          return HostLock.readLocked(callable);
         }
         if (method.getReturnType() == NonBlockingReadAction.class) {
           CallLog.hit("NonBlockingReadAction." + name + " (builder, ignored)");

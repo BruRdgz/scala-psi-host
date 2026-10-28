@@ -55,7 +55,7 @@ object TypeInferenceOracle {
     host.addLibrary(Path.of(sys.props("scalapsihost.fixture.scalaLibrary212")))
 
     val only = flags.collectFirst { case f if f.startsWith("--only=") => f.stripPrefix("--only=").split(',').toSet }
-    val (allCases, skippedClasses) = TestClasses.collect(host, pluginRoot)
+    val (allCases, skippedClasses) = host.read(TestClasses.collect(host, pluginRoot))
     val cases = only.fold(allCases)(names => allCases.filter(c => names.contains(c.testName)))
     val features = ScalaFeatures.onlyByVersion(TestVersion)
     val t0 = System.nanoTime()
@@ -72,7 +72,7 @@ object TypeInferenceOracle {
       val text = Files.readString(c.file, StandardCharsets.UTF_8).trim.replace("\r\n", "\n")
       // As in the fixture, the test file is the project's only source file while the test runs.
       val file = host.openSource(text, features)
-      try {
+      try host.read {
         val parseErrors = PsiTreeUtil.findChildrenOfType(file, classOf[PsiErrorElement]).asScala
         if (parseErrors.nonEmpty) Outcome.ParseError(parseErrors.head.getErrorDescription)
         else Expected.lastComment(file) match {

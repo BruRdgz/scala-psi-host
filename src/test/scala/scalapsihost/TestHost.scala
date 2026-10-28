@@ -55,7 +55,9 @@ object TestHost {
   /** Runs every query the semantic tests make; the adapter surface test measures this. */
   def runScenario(): Unit = {
     val file = scenarioFile()
-    references(file).foreach(_.resolve())
-    patternDefinitions(file).flatMap(_.expr).foreach(_.`type`())
+    host.read {
+      references(file).foreach(_.resolve())
+      patternDefinitions(file).flatMap(_.expr).foreach(_.`type`())
+    }
   }
 }

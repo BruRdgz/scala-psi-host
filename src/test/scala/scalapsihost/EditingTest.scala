@@ -24,8 +24,30 @@ class EditingTest extends munit.FunSuite {
     val scala3 = host.addModule(ModuleSpec("editing3", "3.3.4", Seq.empty, Seq(Path.of(sys.props("scalapsihost.fixture.scalaLibrary")))))
     val file = host.openFile(Path.of("/editing3/C.scala"), "object C:\n  def f(b: Boolean): Int = if b then 1 else 2\n", scala3)
     try {
-      assertEquals(file.getLanguage, org.jetbrains.plugins.scala.Scala3Language.INSTANCE)
+      assertEquals(host.read(file.getLanguage), org.jetbrains.plugins.scala.Scala3Language.INSTANCE)
       assertEquals(errors(file.asInstanceOf[ScalaFile]), Seq.empty)
+    } finally host.closeSource(file)
+  }
+
+  // As the IDE's background reads: a query checks for cancellation as it works, and an edit cancels it rather than
+  // waiting for it to finish.
+  test("an edit cancels the queries running meanwhile") {
+    val file = host.openFile(Path.of("/editing/D.scala"), "object D\n", module)
+    try {
+      val started = new java.util.concurrent.CountDownLatch(1)
+      val query = scala.concurrent.Future {
+        host.read {
+          started.countDown()
+          while (true) com.intellij.openapi.progress.ProgressManager.checkCanceled()
+        }
+      }(using scala.concurrent.ExecutionContext.global)
+      assert(started.await(30, java.util.concurrent.TimeUnit.SECONDS), "the query did not start")
+
+      host.edit(file, 0, 0, "// edited\n")
+
+      intercept[com.intellij.openapi.progress.ProcessCanceledException](
+        scala.concurrent.Await.result(query, scala.concurrent.duration.Duration(30, "s")))
+      assertEquals(host.read(file.getText), "// edited\nobject D\n")
     } finally host.closeSource(file)
   }
 
@@ -39,8 +61,8 @@ class EditingTest extends munit.FunSuite {
       val start = aText.indexOf("Int = 1")
       host.edit(a, start, start + "Int = 1".length, "String = \"s\"")
 
-      assertEquals(a.getText, "object A { def f: String = \"s\" }\n")
-      assert(a.isValid, "the edited file is the same PSI file, reparsed in place")
+      assertEquals(host.read(a.getText), "object A { def f: String = \"s\" }\n")
+      assert(host.read(a.isValid), "the edited file is the same PSI file, reparsed in place")
       assertEquals(errors(b), Seq("Type mismatch. Required: Int, found: String"))
       // Nothing left the host's tables or was logged as an error on the way (both would hide problems).
       val swallowed = CallLog.snapshot.map(_._1).filter(e => e.startsWith("UNSUPPORTED ") || e.startsWith("LOGGED ERROR "))

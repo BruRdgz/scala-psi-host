@@ -66,29 +66,38 @@ final class ScalaPsiHost private (
   // Library jars by real path: a jar on the classpath of several modules is mounted and indexed once.
   private val libraryRoots = new ConcurrentHashMap[Path, VirtualFile]()
 
+  /**
+   * Runs `query` as the IDE's read actions run: concurrently with other queries, never during an edit. An edit that
+   * starts meanwhile cancels it: it throws `ProcessCanceledException`. For callers that read PSI directly; the host's
+   * own queries ([[diagnostics]]) do this themselves. Nested reads are part of the outer one.
+   */
+  def read[T](query: => T): T = HostLock.query(query)
+
   /** A file outside the project: parsed, but invisible to symbol lookups (as the IDE's non-physical files). */
-  def parse(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile =
+  def parse(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile = HostLock.readLocked {
     ScalaPsiElementFactory.createScalaFileFromText(text, features)(using new ProjectContext(project))
+  }
 
   /**
    * A project source file: its declarations are indexed, so other files and the file itself find them by name,
    * as for a file under an IDE source root. Fails when its stubs cannot be paired with its PSI.
    */
   def openSource(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile =
-    index(parse(text, features))
+    HostLock.write(index(parse(text, features)))
 
   /**
    * A source file of `module`: parsed with the module's language features (Scala version, compiler options) and
    * resolved in the module's scope.
    */
-  def openSource(text: String, module: HostModule): ScalaFile =
+  def openSource(text: String, module: HostModule): ScalaFile = HostLock.write {
     openInModule(parse(text, org.jetbrains.plugins.scala.project.ModuleExt(module.module).features), module)
+  }
 
   /**
    * A Java source file of `module` (mixed Scala/Java modules): its classes are indexed, so the module's Scala code
    * resolves them. `fileName` is the file's name (`Foo.java`), which Java ties to its public class.
    */
-  def openJavaSource(fileName: String, text: String, module: HostModule): PsiJavaFile = {
+  def openJavaSource(fileName: String, text: String, module: HostModule): PsiJavaFile = HostLock.write {
     val file = com.intellij.psi.PsiFileFactory.getInstance(project)
       .createFileFromText(fileName, com.intellij.lang.java.JavaLanguage.INSTANCE, text)
       .asInstanceOf[PsiJavaFile]
@@ -116,7 +125,7 @@ final class ScalaPsiHost private (
    * Opens a project source file of `module` (Scala or Java, by extension) with the given text: a physical file whose
    * PSI follows edits made with [[edit]], as a file open in an IDE editor.
    */
-  def openFile(path: Path, text: String, module: HostModule): PsiFile = {
+  def openFile(path: Path, text: String, module: HostModule): PsiFile = HostLock.write {
     val fileType = FileTypeRegistry.getInstance.getFileTypeByFileName(path.getFileName.toString)
     val source = new SourceFile(path, fileType, text)
     modules.addSource(source, module)
@@ -131,31 +140,31 @@ final class ScalaPsiHost private (
   /**
    * Replaces `file`'s text between `start` and `end` (offsets) with `replacement`, as an editor change: the document
    * changes and is committed, the platform reparses the changed range, and the resulting tree changes reach the
-   * plugin's caches. The file's index entries are then rebuilt.
+   * plugin's caches. The file's index entries are then rebuilt. Queries running meanwhile are cancelled.
    */
   def edit(file: PsiFile, start: Int, end: Int, replacement: String): Unit = {
-    val documents = com.intellij.psi.PsiDocumentManager.getInstance(project)
-    val document = documents.getDocument(file)
-    if (document == null) throw new IllegalArgumentException(s"$file has no document: only files opened with openFile can be edited")
-    ApplicationManager.getApplication.runWriteAction((() => {
+    HostLock.write {
+      val documents = com.intellij.psi.PsiDocumentManager.getInstance(project)
+      val document = documents.getDocument(file)
+      if (document == null) throw new IllegalArgumentException(s"$file has no document: only files opened with openFile can be edited")
       document.replaceString(start, end, replacement)
       documents.commitDocument(document)
-    }): Runnable)
+      symbolIndex.removeFile(file)
+      if (!symbolIndex.indexSourceFile(file)) throw new IllegalStateException(s"stubs of the edited $file could not be paired with its PSI")
+    }
     // Work the commit scheduled for the UI thread (after-commit actions) runs before the edit returns.
     HostDispatchThread.drain()
-    symbolIndex.removeFile(file)
-    if (!symbolIndex.indexSourceFile(file)) throw new IllegalStateException(s"stubs of the edited $file could not be paired with its PSI")
   }
 
   /** Removes a source file opened with [[openSource]] or [[openFile]] from the project. */
-  def closeSource(file: PsiFile): Unit = {
+  def closeSource(file: PsiFile): Unit = HostLock.write {
     symbolIndex.removeFile(file)
     modules.removeSource(file.getViewProvider.getVirtualFile)
     psiChanged()
   }
 
   /** Mounts a library jar and indexes its Scala class files accepted by `includeEntry` (e.g. `scala/Option.class`). */
-  def addLibrary(jar: Path, includeEntry: String => Boolean = _ => true): LibraryIndexReport = {
+  def addLibrary(jar: Path, includeEntry: String => Boolean = _ => true): LibraryIndexReport = HostLock.write {
     val root = libraryFiles.mountJar(jar)
     libraryRoots.put(jar.toRealPath(), root)
     val report = symbolIndex.indexLibrary(project, root, includeEntry)
@@ -164,7 +173,7 @@ final class ScalaPsiHost private (
   }
 
   /** Mounts the JDK's modules. Java classes are read on demand, not indexed. Every module sees the JDK. */
-  def addJdk(javaHome: Path): Unit = {
+  def addJdk(javaHome: Path): Unit = HostLock.write {
     modules.setJdkRoots(libraryFiles.mountJdk(javaHome))
     psiChanged()
   }
@@ -175,7 +184,7 @@ final class ScalaPsiHost private (
    * a compiler-settings profile, from which the plugin derives the module's language features.
    * Classpath entries must be jars; the class directories of other modules are given by `dependsOn`.
    */
-  def addModule(spec: ModuleSpec): HostModule = {
+  def addModule(spec: ModuleSpec): HostModule = HostLock.write {
     val notJars = spec.classpath.filterNot(_.getFileName.toString.endsWith(".jar"))
     if (notJars.nonEmpty) throw new IllegalArgumentException(s"module ${spec.name}: classpath entries are not jars: ${notJars.mkString(", ")}")
     val roots = spec.classpath.map { jar =>
@@ -238,15 +247,16 @@ final class ScalaPsiHost private (
    * Whether `file`'s errors come from the build's compiler (see [[HostConfig.compilerErrorsScala3]]). For such a file
    * [[diagnostics]] has only the plugin's checks that do not need types, and the caller adds the compiler's problems.
    */
-  def isCompilerHighlighted(file: ScalaFile): Boolean =
+  def isCompilerHighlighted(file: ScalaFile): Boolean = HostLock.query {
     org.jetbrains.plugins.scala.settings.ScalaHighlightingMode.isShowErrorsFromCompilerEnabled(file)
+  }
 
   /**
    * The problems the IDE's highlighting pass reports for `file`: syntax errors, and the plugin's `ScalaAnnotator`
    * run over every element through the platform's annotation session. Presentation-only annotations (no message)
    * are left out.
    */
-  def diagnostics(file: ScalaFile): Seq[Diagnostic] = {
+  def diagnostics(file: ScalaFile): Seq[Diagnostic] = HostLock.query {
     // As the IDE's highlighting visitor: error elements the filters reject (e.g. inside ScalaDoc) are not reported.
     val errorFilters = com.intellij.codeInsight.highlighting.HighlightErrorFilter.EP_NAME.getExtensions(project).asScala
     val syntaxErrors = SyntaxTraverser.psiTraverser(file).filter(classOf[PsiErrorElement]).asScala.toSeq
@@ -314,19 +324,22 @@ object ScalaPsiHost {
       // The host has no UI thread and no write actions: every caller may read.
       case ("isDispatchThread", _) => java.lang.Boolean.valueOf(HostDispatchThread.isCurrent)
       case ("isWriteIntentLockAcquired", _) => java.lang.Boolean.FALSE
-      case ("isReadAccessAllowed", _) => java.lang.Boolean.TRUE
-      case ("isWriteAccessAllowed", _) => java.lang.Boolean.valueOf(HostWriteAction.isRunning)
+      // Reads and writes are the host's lock (HostLock): access is allowed where the thread holds it.
+      case ("isReadAccessAllowed", _) => java.lang.Boolean.valueOf(HostLock.isReading || HostLock.isWriting)
+      case ("assertReadAccessAllowed", _) =>
+        if (!HostLock.isReading && !HostLock.isWriting) throw new IllegalStateException("read access is allowed inside read or write actions only")
+        null
+      case ("isWriteAccessAllowed", _) => java.lang.Boolean.valueOf(HostLock.isWriting)
       // Work for the UI thread runs on the host's dispatch thread.
       case ("invokeLater", Array(r: Runnable, _*)) => HostDispatchThread.invokeLater(r); null
       // No modal dialogs exist in the host.
       case ("getDefaultModalityState", _) => ModalityState.nonModal()
       case ("assertWriteAccessAllowed", _) =>
-        if (!HostWriteAction.isRunning) throw new IllegalStateException("write access is allowed inside write actions only")
+        if (!HostLock.isWriting) throw new IllegalStateException("write access is allowed inside write actions only")
         null
-      // Edits run in write actions on the caller's thread, one at a time (see HostWriteAction).
-      case ("runWriteAction", Array(r: Runnable)) => HostWriteAction.run(r.run()); null
-      case ("runWriteAction", Array(c: com.intellij.openapi.util.Computable[?])) => HostWriteAction.run(c.compute()).asInstanceOf[AnyRef]
-      case ("assertReadAccessAllowed" | "assertIsNonDispatchThread" | "assertReadAccessNotAllowed", _) => null
+      case ("runWriteAction", Array(r: Runnable)) => HostLock.write(r.run()); null
+      case ("runWriteAction", Array(c: com.intellij.openapi.util.Computable[?])) => HostLock.write(c.compute()).asInstanceOf[AnyRef]
+      case ("assertIsNonDispatchThread" | "assertReadAccessNotAllowed", _) => null
       case ("isUnitTestMode", _) => java.lang.Boolean.valueOf(config.unitTestMode)
       case ("isInternal" | "isEAP" | "isDisposed", _) => java.lang.Boolean.FALSE
       case ("isHeadlessEnvironment" | "isCommandLine", _) => java.lang.Boolean.TRUE
@@ -335,12 +348,12 @@ object ScalaPsiHost {
       case ("loadClass", Array(name: String, _)) => Class.forName(name)
       // Wraps an extension's failure for logging; the IDE adds plugin attribution, which the host does not track.
       case ("createError", Array(t: Throwable, _*)) => new RuntimeException(t)
-      case ("runReadAction", Array(r: Runnable)) => r.run(); null
-      case ("tryRunReadAction", Array(r: Runnable)) => r.run(); java.lang.Boolean.TRUE
+      case ("runReadAction", Array(r: Runnable)) => HostLock.readLocked(r.run()); null
+      case ("tryRunReadAction", Array(r: Runnable)) => HostLock.readLocked(r.run()); java.lang.Boolean.TRUE
       // In unit-test mode the plugin runs some startup work on the UI thread: the host's dispatch thread.
       case ("invokeAndWait", Array(r: Runnable, _*)) if config.unitTestMode => HostDispatchThread.invokeAndWait(r); null
-      case ("runReadAction", Array(c: com.intellij.openapi.util.Computable[?])) => c.compute().asInstanceOf[AnyRef]
-      case ("runReadAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) => c.compute().asInstanceOf[AnyRef]
+      case ("runReadAction", Array(c: com.intellij.openapi.util.Computable[?])) => HostLock.readLocked(c.compute()).asInstanceOf[AnyRef]
+      case ("runReadAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) => HostLock.readLocked(c.compute()).asInstanceOf[AnyRef]
     }
     ApplicationManager.setApplication(app, root)
     Extensions.setRootArea(area)
@@ -464,7 +477,7 @@ object ScalaPsiHost {
     appServices.register(classOf[org.jetbrains.plugins.scala.scalaMeta.ScalaMetaApi])(new scala.meta.intellij.ScalaMetaApiImpl)
     // The editor's read/write-action facade, reached from CodeStyle.getSettings: the host's callers may always read.
     appServices.register(classOf[com.intellij.openapi.editor.elf.Elf])(tableProxy(classOf[com.intellij.openapi.editor.elf.Elf], "Elf") {
-      case ("runReadAction", Array(f: kotlin.jvm.functions.Function0[?])) => f.invoke().asInstanceOf[AnyRef]
+      case ("runReadAction", Array(f: kotlin.jvm.functions.Function0[?])) => HostLock.readLocked(f.invoke()).asInstanceOf[AnyRef]
       // Documents are plain platform documents, outside the editor's Elf scope.
       case ("isInElfScope", _) => java.lang.Boolean.FALSE
     })
@@ -910,7 +923,7 @@ object ScalaPsiHost {
 
     // A source file was added or removed, or a library mounted: what the IDE's PsiModificationTrackerImpl and the
     // plugin's ScalaPsiChangeListener do for a change under a directory (not a Scala element).
-    def psiChanged(): Unit = HostWriteAction.run {
+    def psiChanged(): Unit = HostLock.write {
       psiModTracker.incCounter()
       org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager.instance(project).clearOnNonScalaChange()
     }

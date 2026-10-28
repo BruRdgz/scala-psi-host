@@ -11,6 +11,10 @@ import org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.ScSyntheticF
 class HostSemanticsTest extends munit.FunSuite {
   private lazy val file = TestHost.scenarioFile()
 
+  // Every test reads PSI: each runs as a read of the host.
+  override def munitTestTransforms: List[TestTransform] = super.munitTestTransforms :+
+    new TestTransform("host read", test => test.withBody(() => TestHost.host.read(test.body())))
+
   test("parses into Scala PSI without syntax errors") {
     assertEquals(PsiTreeUtil.findChildrenOfType(file, classOf[PsiErrorElement]).size(), 0)
   }

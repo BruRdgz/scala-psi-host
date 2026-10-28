@@ -63,7 +63,8 @@ object ProjectHighlighting {
           val fromCompiler =
             if (!host.isCompilerHighlighted(file)) Seq.empty
             else compiled.toSeq.flatMap(_.diagnostics.getOrElse(projectDir.resolve(path), Seq.empty)).map { c =>
-              ("compiler", Diagnostic(c.severity, new TextRange(offset(file.getText, c.start), offset(file.getText, c.end)), c.message))
+              val text = host.read(file.getText)
+              ("compiler", Diagnostic(c.severity, new TextRange(offset(text, c.start), offset(text, c.end)), c.message))
             }
           Right((fromPlugin ++ fromCompiler).filter(_._2.severity == HighlightSeverity.ERROR))
         }

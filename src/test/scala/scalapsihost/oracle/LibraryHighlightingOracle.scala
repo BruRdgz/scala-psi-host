@@ -38,8 +38,8 @@ object LibraryHighlightingOracle {
     val indexMs = (System.nanoTime() - t0) / 1_000_000
     val heapAfterIndexMb = usedHeapMb()
 
-    val expected = expectedProblems(host, Path.of(repo,
-      "sbt/sbt-project-highlighting-tests/test/org/jetbrains/plugins/scala/projectHighlighting/scalaLibrary/ScalaLibraryHighlightingTest_2_13.scala"))
+    val expected = host.read(expectedProblems(host, Path.of(repo,
+      "sbt/sbt-project-highlighting-tests/test/org/jetbrains/plugins/scala/projectHighlighting/scalaLibrary/ScalaLibraryHighlightingTest_2_13.scala")))
     val features = ScalaFeatures.onlyByVersion(LatestScalaVersions.Scala_2_13)
     val sourcesJar = FileSystems.newFileSystem(Path.of(sys.props("scalapsihost.fixture.scalaLibrarySources")))
     val root = sourcesJar.getPath("/")

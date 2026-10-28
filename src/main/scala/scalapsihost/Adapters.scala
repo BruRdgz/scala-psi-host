@@ -34,24 +34,52 @@ final class HostLogger(category: String) extends com.intellij.openapi.diagnostic
 }
 
 /**
- * The host's write action: one writer at a time, and `Application.isWriteAccessAllowed` is true on the writing
- * thread, as PSI and documents require for changes.
+ * The host's read/write lock, the IDE's read and write actions: queries read concurrently, an edit writes alone.
+ * An edit first cancels the running queries (their progress indicators), as the IDE cancels background reads for a
+ * pending write: the platform's and the plugin's code checks for cancellation as it works, so a query stops with
+ * `ProcessCanceledException` and releases the lock. The lock is fair: queries started after a waiting edit wait
+ * for it.
  */
-private[scalapsihost] object HostWriteAction {
-  private val lock = new java.util.concurrent.locks.ReentrantLock
-  private val writing = ThreadLocal.withInitial[java.lang.Boolean](() => java.lang.Boolean.FALSE)
+private[scalapsihost] object HostLock {
+  private val lock = new java.util.concurrent.locks.ReentrantReadWriteLock(/* fair = */ true)
+  private val queries = java.util.concurrent.ConcurrentHashMap.newKeySet[com.intellij.openapi.progress.ProgressIndicator]()
 
-  def isRunning: Boolean = writing.get
+  def isReading: Boolean = lock.getReadHoldCount > 0
+  def isWriting: Boolean = lock.isWriteLockedByCurrentThread
 
-  def run[T](body: => T): T = {
-    lock.lock()
-    val outer = writing.get
-    writing.set(java.lang.Boolean.TRUE)
-    try body
-    finally {
-      writing.set(outer)
-      lock.unlock()
+  /** A read without its own cancellation (the platform's `runReadAction`): the lock only. */
+  def readLocked[T](body: => T): T =
+    if (isReading || isWriting) body
+    else {
+      lock.readLock.lock()
+      try body
+      finally lock.readLock.unlock()
     }
+
+  /** [[readLocked]] for Java callers. */
+  def readLocked[T](body: java.util.concurrent.Callable[T]): T = readLocked(body.call())
+
+  /** A query: a read that an edit cancels. Nested in another read, it is part of that one. */
+  def query[T](body: => T): T =
+    if (isReading || isWriting) body
+    else {
+      val indicator = new com.intellij.openapi.progress.EmptyProgressIndicator
+      lock.readLock.lock()
+      queries.add(indicator)
+      try com.intellij.openapi.progress.ProgressManager.getInstance.runProcess((() => body): com.intellij.openapi.util.Computable[T], indicator)
+      finally {
+        queries.remove(indicator)
+        lock.readLock.unlock()
+      }
+    }
+
+  def write[T](body: => T): T = {
+    // A read lock cannot become a write lock: waiting for it here would wait for this thread's own read forever.
+    if (isReading && !isWriting) throw new IllegalStateException("an edit cannot start inside a read")
+    if (!isWriting) queries.forEach(_.cancel())
+    lock.writeLock.lock()
+    try body
+    finally lock.writeLock.unlock()
   }
 }
 
