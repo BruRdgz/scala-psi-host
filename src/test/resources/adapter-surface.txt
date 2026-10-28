@@ -18,6 +18,7 @@ Application.service com.intellij.openapi.application.AsyncExecutionService
 Application.service com.intellij.openapi.application.TransactionGuard
 Application.service com.intellij.openapi.command.CommandProcessor
 Application.service com.intellij.openapi.fileEditor.FileDocumentManager
+Application.service com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers
 Application.service com.intellij.openapi.progress.ProgressManager
 Application.service com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 Application.service com.intellij.openapi.vfs.newvfs.ManagingFS

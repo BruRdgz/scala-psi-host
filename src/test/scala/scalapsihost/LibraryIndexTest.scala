@@ -23,4 +23,17 @@ class LibraryIndexTest extends munit.FunSuite {
       case other => fail(s"expected the decompiled ScClass scala.Option, got $other")
     }
   }
+
+  // The test host attaches no JDK sources: a JDK class is its own navigation element, and its text is decompiled.
+  test("a Java library class without sources has decompiled text, with its declarations in it") {
+    TestHost.libraryReport
+    val host = TestHost.host
+    host.read {
+      val list = com.intellij.psi.JavaPsiFacade.getInstance(host.project)
+        .findClass("java.util.ArrayList", new EverythingGlobalScope(host.project))
+      val target = list.getNavigationElement
+      val text = target.getContainingFile.getText
+      assert(text.startsWith("ArrayList", target.getTextOffset), text.substring(target.getTextOffset, target.getTextOffset + 40))
+    }
+  }
 }

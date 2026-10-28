@@ -690,6 +690,15 @@ object ScalaPsiHost {
     com.intellij.psi.stubs.BinaryFileStubBuilders.INSTANCE.addExplicitExtension(
       com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, new com.intellij.psi.impl.compiled.ClassFileStubBuilder)
     appServices.register(classOf[com.intellij.psi.stubs.StubTreeLoader])(new com.intellij.psi.stubs.CoreStubTreeLoader)
+    // A binary library file's text (its document, which Java class files' PSI mirrors): decompiled as the IDE
+    // registers it, Java class files by the platform's decompiler, TASTy files by the plugin's.
+    declare("com.intellij.filetype.decompiler")
+    appServices.register(classOf[com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers])(
+      newPrivate(classOf[com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers]))
+    com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers.getInstance.addExplicitExtension(
+      com.intellij.ide.highlighter.JavaClassFileType.INSTANCE, new com.intellij.psi.impl.compiled.ClassFileDecompiler)
+    com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers.getInstance.addExplicitExtension(
+      org.jetbrains.plugins.scala.tasty.TastyFileType, new org.jetbrains.plugins.scala.tasty.TastyDecompiler)
     // File properties the IDE pushes to files (language levels), which stub builders read to version their stubs; the
     // host pushes none.
     appServices.register(classOf[com.intellij.openapi.roots.impl.PushedFilePropertiesRetriever])(
@@ -935,6 +944,16 @@ object ScalaPsiHost {
           com.intellij.codeInsight.multiverse.CodeInsightContexts.defaultContext()
         case ("getCodeInsightContexts", _) => java.util.List.of(com.intellij.codeInsight.multiverse.CodeInsightContexts.defaultContext())
       })
+    // Java code style of decompiled class files (indents): the platform's core defaults, as headless compilers use.
+    appServices.register(classOf[com.intellij.psi.codeStyle.JavaFileCodeStyleFacadeFactory])(
+      tableProxy(classOf[com.intellij.psi.codeStyle.JavaFileCodeStyleFacadeFactory], "JavaFileCodeStyleFacadeFactory") {
+        case ("createFacade", _) => new com.intellij.core.CoreJavaFileCodeStyleFacade
+      })
+    // The IDE decompiles a Java class file (its text, for the class's PSI mirror) in its default project, as a
+    // throwaway class-file PSI; the host's one project takes that role.
+    appServices.register(classOf[com.intellij.openapi.project.DefaultProjectFactory])(new Host_DefaultProjectFactory(dispatch {
+      case ("DefaultProjectFactory.getDefaultProject", _) => project
+    }))
     // Code style: the host never formats, so actions "with the formatter disabled" (reparse results applied to the
     // tree) just run.
     projectServices.register(classOf[com.intellij.psi.codeStyle.CodeStyleManager])(new Host_CodeStyleManager(dispatch {
