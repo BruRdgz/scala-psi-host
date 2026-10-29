@@ -19,7 +19,8 @@
   platform's warnings and errors; progress while the project opens; an error message when it cannot; the server's
   state (`scalaPsiHost/state`) and a status report (`scalaPsiHost/status`). The VS Code extension shows the state in
   the status bar and has *Show Status* and *Show Log File* commands.
-- Memory: the platform's reparse copies of edited files are no longer kept.
+- Memory: the platform's reparse copies of edited files are no longer kept, and lookups share one project-wide
+  scope instead of piling up a new one each in the plugin's caches: the heap no longer grows with edits.
 - Resolution as the IDE's scopes: a module sees its own resolved classpath (not the replaced library versions of the
   modules it depends on), a library's classes resolve in the modules that have the library, synthetic files keep
   their declaration's scope, and packages that sources declare do not leak other modules' subpackages. On korolev the

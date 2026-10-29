@@ -209,13 +209,12 @@ Run them with `sbt "Test/runMain scalapsihost.oracle.<Name> ..."`.
 | semantic tokens after an edit | 29 | 64 | 71 |
 
 Opening the project takes 18–24 s (BSP import, library sources, modules, parsing and indexing the sources); the heap
-holds 650 MB after opening and 1.4 GB once every file was highlighted. Editing one file over and over, the heap
-after a full GC grows by about 0.3 MB per edit (see [Known limitations](#known-limitations)).
+holds 650 MB after opening and 1.4 GB once every file was highlighted. Editing one file over and over (120 edits,
+2026-10-29), what stays strongly reachable after a full GC does not grow: 778 MB after the first edit, 766 MB after
+the last (measured with `-XX:SoftRefLRUPolicyMSPerMB=0`, so the plugin's soft-referenced caches do not hide growth).
 
 ## Known limitations
 
-- Memory held per edit: about 0.3 MB stays reachable after each edit and the requests that follow it (a long day of
-  typing adds a few hundred MB). Not yet located.
 - Requests are answered one at a time, in order: while a file's problems or semantic tokens are computed (seconds
   for the slowest files) or the build reloads, other requests wait.
 

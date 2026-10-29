@@ -31,6 +31,7 @@ The change engine and the formatter (beta 1), completion, signature help and the
 ## Alpha 2 — read-only features, and the gaps of alpha 1
 
 - The memory held per edit (`SessionBenchmark --edit-file`, about 0.3 MB per edit): locate it and let it go.
+  **Done:** one `EverythingGlobalScope` per project instead of one per lookup; flat over 120 edits.
 - A real Scala 2 project as an acceptance test. **Done:** korolev v1.5.0 agrees with the plugin's own project test.
 
 ## Alpha 3 — project-wide search
@@ -38,6 +39,8 @@ The change engine and the formatter (beta 1), completion, signature help and the
 - Word index over the sources, `PsiSearchHelper`.
 - Find references, implementations, workspace symbols. Oracle: `findUsages`.
 - Java class files in the short-name index (auto-import and completion need them).
+- `PackageIndex`: the plugin's use scope of a `private[pkg]` member is a `PackageScope`, which needs it (the
+  inheritor searchers behind completion hit it today and log an error).
 
 ## Beta 1 — changes
 
