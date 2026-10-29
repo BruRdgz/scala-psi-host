@@ -213,6 +213,7 @@ PsiManager.isDisposed
 PsiShortNamesCache.getAllClassNames
 PsiShortNamesCache.getClassesByName
 ResolveScopeManager.getResolveScope
+ResolveScopeManager.getUseScope
 ScalaCodeStyleProvider.getDefaultCommonSettings
 ScalaCodeStyleProvider.getDocCommentSettings
 ScalaCodeStyleProvider.getLanguage

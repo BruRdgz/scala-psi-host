@@ -26,7 +26,10 @@ class AdapterSurfaceTest extends munit.FunSuite {
     TestHost.host.read {
       val contributors = com.intellij.codeInsight.completion.CompletionContributor.forLanguage(
         org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE, null).asScala.map(_.getClass.getName).toSet
-      assertEquals(contributors, ScalaPsiHost.CompletionContributors)
+      val declared = ScalaPsiHost.scalaCompletionContributors(
+        sys.props("scalapsihost.scalaPluginJars").split(java.io.File.pathSeparator).toSeq.map(java.nio.file.Path.of(_))).map(_.implementation).toSet
+      assertEquals(contributors, declared)
+      assert(declared.exists(_.endsWith("ScalaClassNameCompletionContributor")), declared)
       val weighers = com.intellij.psi.WeighingService.getWeighers(com.intellij.codeInsight.completion.CompletionService.RELEVANCE_KEY)
         .asScala.map(_.toString).toSeq
       assertEquals(weighers.toSet, Set("scalaContainingClassWeigher", "scalaMethodCompletionWeigher", "scalaByNameWeigher",

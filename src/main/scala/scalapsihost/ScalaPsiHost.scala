@@ -341,13 +341,28 @@ object ScalaPsiHost {
   @volatile private var started: Option[ScalaPsiHost] = None
 
   /** Plugin extension points that carry language semantics; every other plugin extension point stays empty. */
-  val SemanticExtensionPoints: Seq[String] = Seq("org.intellij.scala.syntheticMemberInjector")
+  val SemanticExtensionPoints: Seq[String] = Seq(
+    "org.intellij.scala.syntheticMemberInjector",
+    // The inheritors of a class, from the stub index: case clauses and exhaustive matches list a sealed type's.
+    "com.intellij.directClassInheritorsSearch", "com.intellij.classInheritorsSearch",
+  )
 
-  /** Initialization, visible symbols, syntax and literal values; imports and generated edits need insert handlers. */
-  val CompletionContributors: Set[String] = Set(
-    "ScalaDumbAwareCompletionContributor", "ScalaBasicCompletionContributor",
-    "ScalaKeywordCompletionContributor", "ScalaLiteralTypeValuesCompletionContributor",
-  ).map("org.jetbrains.plugins.scala.lang.completion." + _)
+  /**
+   * The completion contributors the plugin's descriptors declare for Scala, as the IDE registers them: references and
+   * members, keywords, class names to import, overrides, case clauses, end markers... Their insert handlers run once
+   * a suggestion is chosen (see [[Completion.insert]]), so the ones that generate code work too.
+   */
+  def scalaCompletionContributors(scalaPluginJars: Seq[Path]): Seq[ExtensionBean] =
+    Descriptors.scalaExtensionBeans(scalaPluginJars, "com.intellij.completion.contributor")
+      .filter(bean => bean.attributes.get("language").contains("Scala") && !UnsupportedCompletionContributors(bean.implementation))
+
+  /** Contributors that need what the host does not have yet, and why. */
+  private val UnsupportedCompletionContributors: Set[String] = Set(
+    // The bodies of the members it generates come from the IDE's file templates (FileTemplateManager).
+    "org.jetbrains.plugins.scala.lang.completion.ScalaOverrideContributor",
+    // It suggests names the file uses but does not resolve, from the highlights of the IDE's daemon in the editor.
+    "org.jetbrains.plugins.scala.lang.completion.ScalaUnresolvedNameContributor",
+  )
 
   /** The plugin's completion and proximity weighers, used with their declared keys and ordering. */
   val CompletionWeighers: Set[String] = Set(
@@ -384,6 +399,7 @@ object ScalaPsiHost {
     com.intellij.openapi.diagnostic.Logger.setFactory((category: String) => new HostLogger(category))
     val root: Disposable = Disposer.newDisposable("scala-psi-host")
     val appServices = new ServiceTable("Application")
+    val completionContributors = scalaCompletionContributors(config.scalaPluginJars).map(_.implementation).toSet
     val projectServices = new ServiceTable("Project")
     val appData = new UserDataHolderBase
     val projectData = new UserDataHolderBase
@@ -438,12 +454,12 @@ object ScalaPsiHost {
       case ("isInjectionForExtensionSupported", _) => java.lang.Boolean.FALSE
       // Completion bean extensions use the platform's lazy loader, without container injection.
       case ("instantiateClass", Array(cls: Class[?], _)) if
-          ScalaPsiHost.CompletionContributors.contains(cls.getName) ||
+          completionContributors(cls.getName) ||
           ScalaPsiHost.CompletionWeighers.contains(cls.getName) ||
           Set("com.intellij.codeInsight.completion.CompletionContributorEP", "com.intellij.psi.WeigherExtensionPoint").contains(cls.getName) =>
         newPrivate(cls).asInstanceOf[AnyRef]
       case ("instantiateClass", Array(name: String, _)) if
-          ScalaPsiHost.CompletionContributors(name) || ScalaPsiHost.CompletionWeighers(name) ||
+          completionContributors(name) || ScalaPsiHost.CompletionWeighers(name) ||
           PlatformCompletionWeighers.exists(_.implementation == name) =>
         newPrivate(Class.forName(name))
       // Wraps an extension's failure for logging; the IDE adds plugin attribution, which the host does not track.
@@ -477,7 +493,9 @@ object ScalaPsiHost {
     for (epName <- ScalaPsiHost.SemanticExtensionPoints) {
       val implementations = Descriptors.scalaExtensions(config.scalaPluginJars, epName)
       if (implementations.isEmpty) throw new IllegalStateException(s"no extensions registered for $epName in the Scala plugin's descriptors")
-      val ep = area.getExtensionPoint[AnyRef](epName).asInstanceOf[ExtensionPointImpl[AnyRef]]
+      // A platform extension point (the plugin's own are declared above) is declared on first use.
+      val declared = Option(area.getExtensionPointIfRegistered[AnyRef](epName)).getOrElse(declare(epName))
+      val ep = declared.asInstanceOf[ExtensionPointImpl[AnyRef]]
       implementations.foreach(name => ep.registerExtension(newPrivate(Class.forName(name).asInstanceOf[Class[AnyRef]]), root))
     }
     // Descriptor beans preserve both the implementation attributes and the platform's id/order semantics.
@@ -492,13 +510,12 @@ object ScalaPsiHost {
       }
       ep.registerExtensions(descriptors.asJava, plugin, java.util.List.of())
     }
-    for (epName <- Seq("com.intellij.completion.contributor", "com.intellij.weigher")) {
+    val weighers = Descriptors.scalaExtensionBeans(config.scalaPluginJars, "com.intellij.weigher").filter { bean =>
+      ScalaPsiHost.CompletionWeighers(bean.implementation) && Set("completion", "proximity").contains(bean.attributes.getOrElse("key", ""))
+    }
+    for ((epName, beans) <- Seq("com.intellij.completion.contributor" -> scalaCompletionContributors(config.scalaPluginJars),
+                                "com.intellij.weigher" -> weighers)) {
       declare(epName)
-      val beans = Descriptors.scalaExtensionBeans(config.scalaPluginJars, epName).filter { bean =>
-        if (epName.endsWith("contributor"))
-          bean.attributes.get("language").contains("Scala") && ScalaPsiHost.CompletionContributors(bean.implementation)
-        else ScalaPsiHost.CompletionWeighers(bean.implementation) && Set("completion", "proximity").contains(bean.attributes.getOrElse("key", ""))
-      }
       if (beans.isEmpty) throw new IllegalStateException(s"no completion beans for $epName")
       registerCompletionBeans(epName, beans, completionPlugin)
     }
