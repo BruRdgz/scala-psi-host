@@ -78,8 +78,10 @@ object Completion {
   /** The suggestions at `offset`. A read: nothing is inserted until the user chooses. */
   def complete(file: ScalaFile, offset: Int, limit: Int = MaxSuggestions): Suggestions = HostLock.query {
     completionResults(file, file.getText, offset) { results =>
-      val suggestions = sort(results).flatMap(result => rendered(result, offset))
-      Suggestions(suggestions.take(limit), incomplete = suggestions.size > limit)
+      // The lookup renders visible items lazily. One more successful rendering determines whether the list is incomplete.
+      val suggestions = sort(results).iterator.flatMap(result => rendered(result, offset))
+      val items = suggestions.take(limit).toVector
+      Suggestions(items, incomplete = suggestions.hasNext)
     }
   }
 

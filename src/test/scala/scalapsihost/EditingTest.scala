@@ -118,7 +118,14 @@ class EditingTest extends munit.FunSuite {
       "def message(n: String): Int = 0; Lookup.mes }"
     val file = scalaFile("Lookup", text)
     try {
-      val items = host.completion(file, text.indexOf("Lookup.mes") + "Lookup.mes".length).items.filter(_.lookup == "message")
+      val offset = text.indexOf("Lookup.mes") + "Lookup.mes".length
+      val completed = host.completion(file, offset)
+      val limited = Completion.complete(file, offset, limit = 1)
+      assertEquals(limited.items, completed.items.take(1))
+      assert(limited.incomplete)
+      val unlimited = Completion.complete(file, offset, limit = Int.MaxValue)
+      assertEquals(unlimited, completed)
+      val items = completed.items.filter(_.lookup == "message")
       assertEquals(items.size, 2)
       assertEquals(items.map(_.identity).distinct.size, 2)
       assertEquals(items.count(_.deprecated), 1)

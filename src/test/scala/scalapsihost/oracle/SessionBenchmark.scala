@@ -12,7 +12,9 @@ import scala.jdk.CollectionConverters.*
  * requests at identifiers sampled across its Scala files, then runs a long session of edits and heap samples. The
  * project's files are only read; edits stay in memory.
  *
- * Usage: `Test/runMain scalapsihost.oracle.SessionBenchmark <project dir> <report.md> [--positions=N] [--rounds=N]
+ * Export `Test/fullClasspath` and `Test/javaOptions` with sbt first, then run Java directly with those options and
+ * that classpath: sbt, the benchmark and the project's build server together can exhaust memory.
+ * Usage: `java <options> -cp <classpath> scalapsihost.oracle.SessionBenchmark <project dir> <report.md> [--positions=N] [--rounds=N]
  * [--edit-file=<path in the project>] [--connection=<name>]`. Positions (default 1500) are identifiers spread evenly
  * over the files; each round (default 60) edits a file (a comment appended, then removed), asks for its problems and
  * semantic tokens, and samples the heap after a full GC. Rounds edit the files in turn, or always `--edit-file` (heap
@@ -102,9 +104,9 @@ object SessionBenchmark {
       lines += s"# Session benchmark: ${projectDir.getFileName}"
       lines += ""
       lines += s"JDK ${System.getProperty("java.version")}, max heap ${Runtime.getRuntime.maxMemory / (1024 * 1024)} MB, one thread."
-      lines += "Completion includes contributors, classification, rendering and at most eight handler previews (200-item LSP cap). Import-list samples use ArrayBuffer on the fixture, including its additional import edits; server queueing and JSON transport are excluded."
-      lines += "For a real project with a BSP connection: `sbt --java-home /usr/lib/jvm/java-25 -batch " +
-        "'Test/runMain scalapsihost.oracle.SessionBenchmark /path/to/project target/session-benchmark.md --positions=1500 --rounds=60'`."
+      lines += "Completion includes contributors, classification, rendering up to the 200-item cap plus an incomplete-list lookahead, and document-position conversion. Import-list samples require ArrayBuffer with its import handler; handlers run only after choosing an item. LSP item conversion, server queueing and JSON transport are excluded."
+      lines += "Export `Test/fullClasspath` and `Test/javaOptions` with sbt, let sbt exit, then run " +
+        "`java <Test/javaOptions> -cp <classpath> scalapsihost.oracle.SessionBenchmark /path/to/project target/session-benchmark.md --positions=300 --rounds=120` directly."
       lines += ""
       lines += s"- Scala files: ${scalaFiles.size}; sampled positions: ${positions.size}; edit rounds: $rounds" +
         editFile.fold(" (files in turn)")(f => s" (always ${projectDir.relativize(f)})")

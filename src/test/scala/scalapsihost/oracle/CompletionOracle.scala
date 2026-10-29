@@ -81,8 +81,8 @@ object CompletionOracle {
     lines += ""
     lines += "## Replay limits and disagreements"
     lines += ""
-    lines += "Interactive lists preview at most Completion.MaxPreviews primary-changing handlers. File-set replay disables the list and preview budgets; keyword fixtures collect only keyword results, as upstream. Selected-item replay has no list budget. " +
-      "Completion uses Scala 2.13.18 and the existing four contributors; Java binary short-name enumeration and other contributors remain unavailable. " +
+    lines += "Interactive lists render up to Completion.MaxSuggestions items and look ahead for an incomplete list; handlers run only after choosing an item. File-set replay disables the list budget; keyword fixtures collect only keyword results, as upstream. Selected-item replay has no list budget. " +
+      "Completion uses Scala 2.13.18 and the host's registered contributors; Java binary short-name enumeration and other contributors remain unavailable. " +
       "Auto-import mounts Source*.scala fixture companions from the case directory; additional IDE fixture configuration is not inferred."
     lines += ""
     results.filter(_._2.outcome != "agree").groupMapReduce { (_, result) =>
