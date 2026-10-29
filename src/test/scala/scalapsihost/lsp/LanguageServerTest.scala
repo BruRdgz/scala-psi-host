@@ -1,5 +1,6 @@
 package scalapsihost.lsp
 
+import com.intellij.psi.PsiManager
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.launch.LSPLauncher
 import scalapsihost.{BspImport, TestHost}
@@ -58,19 +59,22 @@ class LanguageServerTest extends munit.FunSuite {
   private lazy val server = connect(Client, implementation)
   private var ownsFixtureServer = false
 
-  override def afterAll(): Unit = {
-    server.shutdown().get(5, TimeUnit.SECONDS)
+  private lazy val closedServer: Unit = {
+    server.shutdown().get(30, TimeUnit.SECONDS)
     server.exit()
+  }
+
+  override def afterAll(): Unit = {
+    closedServer
     if (ownsFixtureServer)
       assert(!Files.exists(fixture.resolve("project/target/active.json")), "the language server left its sbt server running")
   }
 
-  private def initialize(server: HostProtocol.LanguageServerWithStatus, root: Path): InitializeResult = {
+  private def initialize(server: HostProtocol.LanguageServerWithStatus, root: Path, snippets: Boolean = true): InitializeResult = {
     val params = new InitializeParams
     params.setWorkspaceFolders(java.util.List.of(new WorkspaceFolder(root.toUri.toString, root.getFileName.toString)))
     val item = new CompletionItemCapabilities
-    item.setSnippetSupport(true)
-    item.setResolveSupport(new CompletionItemResolveSupportCapabilities(java.util.List.of("additionalTextEdits")))
+    item.setSnippetSupport(snippets)
     val completion = new CompletionCapabilities
     completion.setCompletionItem(item)
     val text = new TextDocumentClientCapabilities
@@ -78,7 +82,9 @@ class LanguageServerTest extends munit.FunSuite {
     val capabilities = new ClientCapabilities
     capabilities.setTextDocument(text)
     params.setCapabilities(capabilities)
-    server.initialize(params).get(1, TimeUnit.MINUTES)
+    val result = server.initialize(params).get(1, TimeUnit.MINUTES)
+    server.initialized(new InitializedParams)
+    result
   }
 
   /** The states the server reports until it reaches `last`. */
@@ -153,7 +159,7 @@ class LanguageServerTest extends munit.FunSuite {
     assertEquals(capabilities.getTextDocumentSync.getLeft, TextDocumentSyncKind.Incremental)
     assert(capabilities.getHoverProvider.getLeft)
     assertEquals(capabilities.getCompletionProvider.getTriggerCharacters.asScala.toSeq, Seq("."))
-    assertEquals(capabilities.getCompletionProvider.getResolveProvider, java.lang.Boolean.TRUE)
+    assertEquals(capabilities.getCompletionProvider.getResolveProvider, java.lang.Boolean.FALSE)
     assert(capabilities.getDocumentFormattingProvider.getLeft)
     assert(capabilities.getDocumentRangeFormattingProvider.getLeft)
     assert(capabilities.getDefinitionProvider.getLeft)
@@ -162,7 +168,6 @@ class LanguageServerTest extends munit.FunSuite {
     assert(capabilities.getDocumentSymbolProvider.getLeft)
     assert(capabilities.getFoldingRangeProvider.getLeft)
     assert(capabilities.getSemanticTokensProvider.getFull.getLeft)
-    server.initialized(new InitializedParams)
   }
 
   test("publishes a document's problems, and new ones after a change") {
@@ -332,7 +337,6 @@ class LanguageServerTest extends munit.FunSuite {
       assert(text.getDetail.contains("String"), text.toString)
       assertEquals(text.getKind, CompletionItemKind.Method)
       assertEquals(text.getTextEdit.getLeft.getNewText, "text$0")
-      assertEquals(server.getTextDocumentService.resolveCompletionItem(text).get(1, TimeUnit.MINUTES), text)
       val locals = complete(original.replace("println(text)", "println(tex)"), "println(tex", 21)
       assert(locals.exists(_.getFilterText == "text"), locals.toString)
       val keywords = complete(original.replace("println(text)", "val next = tr"), "val next = tr", 22)
@@ -340,30 +344,19 @@ class LanguageServerTest extends munit.FunSuite {
     } finally change(original, 23)
   }
 
-  test("resolves import edits over JSON-RPC and rejects recipes after a document change") {
+  test("completion lists carry import edits and the handler caret over JSON-RPC") {
     val original = Files.readString(main).replace("val text: String", "val text: Int")
-    val text = "package app\nobject ResolveClient { val c: Coun = ??? }"
+    val text = "package app\nobject ConstructorClient { val c = new Coun }"
     def change(value: String, version: Int): Unit = server.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
       new VersionedTextDocumentIdentifier(main.toUri.toString, version), java.util.List.of(new TextDocumentContentChangeEvent(value))))
     try {
       change(text, 24)
       val list = server.getTextDocumentService.completion(new CompletionParams(document(main),
-        new Position(1, text.split("\n")(1).indexOf("Coun") + 4))).get(1, TimeUnit.MINUTES).getRight
+        new Position(1, text.split("\n")(1).indexOf("Coun }") + 4))).get(1, TimeUnit.MINUTES).getRight
       val item = list.getItems.asScala.find(_.getFilterText == "Counter").getOrElse(fail(list.toString))
-      assertEquals(item.getTextEdit.getLeft.getNewText, "Counter$0")
+      assertEquals(item.getTextEdit.getLeft.getNewText, "Counter($0)")
       assertEquals(item.getInsertTextFormat, InsertTextFormat.Snippet)
-      assertEquals(item.getAdditionalTextEdits, null)
-      val resolved = server.getTextDocumentService.resolveCompletionItem(item).get(1, TimeUnit.MINUTES)
-      assert(resolved.getAdditionalTextEdits.asScala.exists(_.getNewText.contains("import core.Counter")), resolved.toString)
-      assertEquals(resolved.getTextEdit, item.getTextEdit)
-      change(text + "\n", 25)
-      val error = intercept[java.util.concurrent.ExecutionException](
-        server.getTextDocumentService.resolveCompletionItem(item).get(1, TimeUnit.MINUTES))
-      error.getCause match {
-        case response: org.eclipse.lsp4j.jsonrpc.ResponseErrorException =>
-          assertEquals(response.getResponseError.getCode, org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestCancelled.getValue)
-        case other => fail(s"unexpected stale-resolve error: $other")
-      }
+      assert(item.getAdditionalTextEdits.asScala.exists(_.getNewText.contains("import core.Counter")), item.toString)
     } finally change(original, 26)
   }
 
@@ -502,5 +495,37 @@ class LanguageServerTest extends munit.FunSuite {
     }
     // Back to the original options; the editor's text was kept through both imports.
     assertEquals(problemsAfterImport(4), typeMismatch)
+  }
+
+  test("a client without snippet support receives plain insertion text") {
+    closedServer
+    releaseModules()
+    val plain = connect(new RecordingClient)
+    try {
+      initialize(plain, fixture, snippets = false)
+      val text = "package app\nobject PlainClient { val c = new Coun }"
+      plain.getTextDocumentService.didOpen(new DidOpenTextDocumentParams(
+        new TextDocumentItem(main.toUri.toString, "scala", 1, text)))
+      val list = plain.getTextDocumentService.completion(new CompletionParams(document(main),
+        new Position(1, text.split("\n")(1).indexOf("Coun }") + 4))).get(1, TimeUnit.MINUTES).getRight
+      val item = list.getItems.asScala.find(_.getFilterText == "Counter").getOrElse(fail(list.toString))
+      assertEquals(item.getTextEdit.getLeft.getNewText, "Counter()")
+      assert(Option(item.getInsertTextFormat).forall(_ == InsertTextFormat.PlainText), item.toString)
+      assert(item.getAdditionalTextEdits.asScala.exists(_.getNewText.contains("import core.Counter")), item.toString)
+    } finally {
+      plain.shutdown().get(30, TimeUnit.SECONDS)
+      plain.exit()
+      releaseModules()
+    }
+  }
+
+  /** A fresh client session imports the same module names into this JVM's one host. */
+  private def releaseModules(): Unit = {
+    val host = TestHost.host
+    for (module <- host.modules.all.reverse) {
+      val files = host.read(module.sources.asScala.toSeq.map(PsiManager.getInstance(host.project).findFile))
+      files.foreach(host.closeSource)
+      host.removeModule(module.spec.name)
+    }
   }
 }

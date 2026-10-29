@@ -8,7 +8,7 @@ import scala.util.Using
 /**
  * Bootstrap guard: the set of adapter entries the scenario reaches must equal the reviewed surface in
  * `adapter-surface.txt`. A new platform or plugin version that asks the host for something else fails here,
- * with the difference, instead of changing behaviour unnoticed. Insertion and resolve belong to this scenario too,
+ * with the difference, instead of changing behaviour unnoticed. Insertion and formatting belong to this scenario too,
  * so editing-only adapter growth receives the same review as semantic reads.
  */
 class AdapterSurfaceTest extends munit.FunSuite {

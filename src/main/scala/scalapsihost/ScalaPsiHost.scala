@@ -81,16 +81,12 @@ final class ScalaPsiHost private (
   /** Cancels reads for an editor change already received but still waiting in the server's queue. */
   private[scalapsihost] def cancelReads(): Unit = HostLock.cancelQueries()
 
-  /** Completion may preview insert handlers, so it enters the copy engine outside a semantic read. */
-  def completion(file: ScalaFile, offset: Int, options: Completion.Options = Completion.Options()): org.eclipse.lsp4j.CompletionList =
-    Completion.complete(file, offset, options = options)
+  /** The completion suggestions at `offset`. Not inside a read: inserting a suggestion changes a copy of the file. */
+  def completion(file: ScalaFile, offset: Int): Completion.Suggestions = Completion.complete(file, offset)
 
-  def resolveCompletion(file: ScalaFile, item: org.eclipse.lsp4j.CompletionItem, version: Int): org.eclipse.lsp4j.CompletionItem =
-    Completion.resolve(file, item, version)
-
-  /** Formatting returns edits against the current snapshot while leaving project PSI untouched. */
-  def formatting(file: ScalaFile, range: Option[TextRange], options: org.eclipse.lsp4j.FormattingOptions): Seq[org.eclipse.lsp4j.TextEdit] =
-    ChangeEngine.format(file, range, options).edits
+  /** The edits that format `range` of `file` (all of it without one); the file itself is left as it is. */
+  def formatting(file: ScalaFile, range: Option[TextRange], indentSize: Int, useTabs: Boolean): Seq[ChangeEngine.Edit] =
+    ChangeEngine.format(file, range, indentSize, useTabs).edits
 
   /** A file outside the project: parsed, but invisible to symbol lookups (as the IDE's non-physical files). */
   def parse(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile = HostLock.readLocked {

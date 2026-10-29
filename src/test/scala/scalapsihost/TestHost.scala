@@ -49,6 +49,20 @@ object TestHost {
 
   def scenarioFile(): ScalaFile = scenario
 
+  /** Applies replacements at original-text offsets, checking that no two edits overlap. */
+  def applyEdits(text: String, edits: Seq[ChangeEngine.Edit]): String = {
+    val sorted = edits.sortBy(_.range.getStartOffset)
+    sorted.sliding(2).foreach {
+      case Seq(left, right) =>
+        require(left.range.getStartOffset < right.range.getStartOffset &&
+          left.range.getEndOffset <= right.range.getStartOffset, "edits overlap")
+      case _ => ()
+    }
+    sorted.reverse.foldLeft(text) { (current, edit) =>
+      current.substring(0, edit.range.getStartOffset) + edit.text + current.substring(edit.range.getEndOffset)
+    }
+  }
+
   def references(file: ScalaFile): Seq[ScReferenceExpression] =
     PsiTreeUtil.findChildrenOfType(file, classOf[ScReferenceExpression]).asScala.toSeq
 
@@ -73,9 +87,7 @@ object TestHost {
       case other => throw new IllegalStateException(s"not a Scala scenario: $other")
     }
     try {
-      val options = Completion.Options(snippets = true, resolve = true)
-      val items = host.completion(completionFile, completionSource.indexOf("ArrayBuff") + "ArrayBuff".length, options).getItems.asScala
-      items.find(i => i.getFilterText == "ArrayBuffer" && i.getData != null).foreach(host.resolveCompletion(completionFile, _, 0))
+      host.completion(completionFile, completionSource.indexOf("ArrayBuff") + "ArrayBuff".length)
       host.completion(completionFile, completionSource.indexOf("; inv") + "; inv".length)
       host.edit(completionFile, 0, completionSource.length, completionSource.replace("ArrayBuff", "ArrayBuffer"))
       host.edit(completionFile, 0, host.read(completionFile.getTextLength), completionSource)
@@ -102,7 +114,7 @@ object TestHost {
     try settingsManager.computeWithLocalSettings(settings, _ =>
       host.completion(prefixed, prefixedText.indexOf("ArrayBuff") + "ArrayBuff".length))
     finally host.closeSource(prefixed)
-    host.formatting(file, None, new org.eclipse.lsp4j.FormattingOptions(2, true))
+    host.formatting(file, None, 2, useTabs = false)
     val importFile = host.parse("object ImportUser { val x: scala.collection.mutable.HashSet[Int] = ??? }")
     val target = host.read {
       com.intellij.psi.JavaPsiFacade.getInstance(host.project).findClass("scala.collection.mutable.HashSet",

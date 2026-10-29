@@ -31,6 +31,18 @@ final case class FileProblem(severity: HighlightSeverity, start: LineColumn, end
 /** An occurrence of a symbol in a file: its range, and whether it writes the symbol (a declaration with a value, an assignment). */
 final case class Occurrence(range: (LineColumn, LineColumn), write: Boolean)
 
+/** The text between `start` and `end` becomes `text`. */
+final case class TextChange(start: LineColumn, end: LineColumn, text: String)
+
+/**
+ * A completion suggestion as the editor applies it (see [[Completion.Insertion]]): `change` at the completed prefix,
+ * the caret `caret` characters into its text, and `additional` changes elsewhere (imports).
+ */
+final case class CompletionChoice(suggestion: Completion.Suggestion, change: TextChange, caret: Int, additional: Seq[TextChange])
+
+/** The suggestions, best first; `incomplete` when some were left out, so the editor asks again as the user types. */
+final case class CompletionChoices(items: Seq[CompletionChoice], incomplete: Boolean)
+
 /**
  * A declaration in a file's outline: its name, the rest of what the structure view shows (parameters, type), its
  * whole range and its name's.
@@ -110,28 +122,35 @@ final class ProjectSession private (
 
   def text(path: Path): String = host.read(file(path).getText)
 
-  /** Positions are read before completion acquires its copy-modification scope. */
-  def completion(path: Path, at: LineColumn, options: scalapsihost.Completion.Options = scalapsihost.Completion.Options())
-      : org.eclipse.lsp4j.CompletionList = file(path) match {
-    case f: ScalaFile => host.completion(f, host.read(offset(document(f), at)), options)
-    case _ => new org.eclipse.lsp4j.CompletionList(false, java.util.List.of())
-  }
-
-  def resolveCompletion(path: Path, item: org.eclipse.lsp4j.CompletionItem, version: Int): org.eclipse.lsp4j.CompletionItem = file(path) match {
-    case f: ScalaFile => host.resolveCompletion(f, item, version)
-    case _ => throw new IllegalArgumentException("completion resolve requires a Scala source")
-  }
-
-  /** Copy modifications acquire their own write scope after positions have been read. */
-  def formatting(path: Path, range: Option[(LineColumn, LineColumn)], options: org.eclipse.lsp4j.FormattingOptions)
-      : Seq[org.eclipse.lsp4j.TextEdit] = file(path) match {
+  /** The completion suggestions at `at`, best first. Only Scala files complete. */
+  def completion(path: Path, at: LineColumn): CompletionChoices = file(path) match {
     case f: ScalaFile =>
-      val selected = host.read {
-        range.map((start, end) => new TextRange(offset(document(f), start), offset(document(f), end)))
+      // The position is read before completion takes the write lock of its copies.
+      val suggestions = host.completion(f, host.read(offset(document(f), at)))
+      val choices = host.read {
+        val text = document(f)
+        suggestions.items.map { suggestion =>
+          val insertion = suggestion.insertion
+          CompletionChoice(suggestion, textChange(text, insertion.edit), insertion.caret, insertion.additional.map(textChange(text, _)))
+        }
       }
-      host.formatting(f, selected, options)
-    case _ => Seq.empty
+      CompletionChoices(choices, suggestions.incomplete)
+    case _ => CompletionChoices(Seq.empty, incomplete = false)
   }
+
+  /** The changes that format `range` of the file (all of it without one). Only Scala files are formatted. */
+  def formatting(path: Path, range: Option[(LineColumn, LineColumn)], indentSize: Int, useTabs: Boolean): Seq[TextChange] =
+    file(path) match {
+      case f: ScalaFile =>
+        // Positions are read before formatting takes the write lock of its copy.
+        val selected = host.read(range.map((start, end) => new TextRange(offset(document(f), start), offset(document(f), end))))
+        val edits = host.formatting(f, selected, indentSize, useTabs)
+        host.read(edits.map(textChange(document(f), _)))
+      case _ => Seq.empty
+    }
+
+  private def textChange(document: Document, edit: ChangeEngine.Edit): TextChange =
+    TextChange(position(document, edit.range.getStartOffset), position(document, edit.range.getEndOffset), edit.text)
 
   /**
    * Applies an editor change: the text between `start` and `end` becomes `replacement`; without a range, the whole
@@ -139,10 +158,10 @@ final class ProjectSession private (
    */
   def change(path: Path, range: Option[(LineColumn, LineColumn)], replacement: String): Unit = {
     val f = file(path)
-    val (start, end) = host.read {
-      val d = document(f)
-      range.fold((0, d.getTextLength))((from, to) => (offset(d, from), offset(d, to)))
-    }
+    // Only this thread edits documents, so reading one needs no lock; and an edit must not be cancelled as the
+    // queries a newer edit cancels are.
+    val d = document(f)
+    val (start, end) = range.fold((0, d.getTextLength))((from, to) => (offset(d, from), offset(d, to)))
     host.edit(f, start, end, replacement)
   }
 

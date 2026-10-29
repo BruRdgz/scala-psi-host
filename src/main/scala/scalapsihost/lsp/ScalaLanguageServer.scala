@@ -1,16 +1,18 @@
 package scalapsihost.lsp
 
+import com.intellij.diff.comparison.DiffTooBigException
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.progress.ProcessCanceledException
 import org.eclipse.lsp4j.*
-import org.eclipse.lsp4j.jsonrpc.messages.Either as LspEither
+import org.eclipse.lsp4j.jsonrpc.ResponseErrorException
+import org.eclipse.lsp4j.jsonrpc.messages.{Either as LspEither, ResponseError, ResponseErrorCode}
 import org.eclipse.lsp4j.services.*
-import scalapsihost.{CallLog, HostLog, LineColumn, ScalaPsiHost}
+import scalapsihost.{CallLog, ChangeEngine, HostLog, LineColumn, ScalaPsiHost}
 
 import java.net.URI
 import java.nio.file.Path
 import java.util.concurrent.*
-import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
@@ -46,7 +48,9 @@ final class ScalaLanguageServer(
 
   @volatile private var client: LanguageClient = scala.compiletime.uninitialized
   private var clientLog: Option[AutoCloseable] = None
-  @volatile private var completionOptions = scalapsihost.Completion.Options()
+  @volatile private var completionSnippets = false
+  // The project to open once the client says it is ready (`initialized`).
+  @volatile private var workspace = Option.empty[Path]
   @volatile private var watchesFiles = false
   @volatile private var reportsProgress = false
   @volatile private var state = new HostProtocol.ServerState("starting", "waiting for the client")
@@ -61,12 +65,8 @@ final class ScalaLanguageServer(
   private val session = new CompletableFuture[ProjectSession]
   // Each document's latest version, as the client numbers them; diagnostics of older versions are dropped.
   private val versions = new ConcurrentHashMap[Path, Integer]()
-  // Changes are observed at receipt as well as application, so a queued request cannot publish an old completion.
-  private val completionVersions = new ConcurrentHashMap[String, AtomicInteger]()
-  private val completionGate = new Object
-  private var completing = false
-
-  private def completionVersion(uri: String): AtomicInteger = completionVersions.computeIfAbsent(uri, _ => new AtomicInteger())
+  // Edits counted as they arrive, before their turn on the documents thread (see onCopyRequest).
+  private val editsReceived = new AtomicLong()
 
   private def daemon(name: String): ThreadFactory = runnable => {
     val thread = new Thread(runnable, name)
@@ -130,42 +130,18 @@ final class ScalaLanguageServer(
     watchesFiles = offered.flatMap(c => Option(c.getWorkspace)).flatMap(w => Option(w.getDidChangeWatchedFiles))
       .flatMap(w => Option(w.getDynamicRegistration)).exists(_.booleanValue)
     reportsProgress = offered.flatMap(c => Option(c.getWindow)).flatMap(w => Option(w.getWorkDoneProgress)).exists(_.booleanValue)
-    val completion = offered.flatMap(c => Option(c.getTextDocument)).flatMap(c => Option(c.getCompletion))
-      .flatMap(c => Option(c.getCompletionItem))
-    completionOptions = scalapsihost.Completion.Options(
-      snippets = completion.flatMap(c => Option(c.getSnippetSupport)).exists(_.booleanValue),
-      resolve = completion.flatMap(c => Option(c.getResolveSupport)).flatMap(c => Option(c.getProperties))
-        .exists(_.contains("additionalTextEdits")))
+    completionSnippets = offered.flatMap(c => Option(c.getTextDocument)).flatMap(t => Option(t.getCompletion))
+      .flatMap(c => Option(c.getCompletionItem)).flatMap(i => Option(i.getSnippetSupport)).exists(_.booleanValue)
     val folders = Option(params.getWorkspaceFolders).map(_.asScala.toSeq).getOrElse(Seq.empty)
     val rootUri = folders.headOption.map(_.getUri).orElse(Option(params.getRootUri))
       .getOrElse(throw new IllegalArgumentException("the client sent no workspace folder or root URI"))
     val clientName = Option(params.getClientInfo).map(i => s"${i.getName} ${Option(i.getVersion).getOrElse("")}".trim).getOrElse("an unnamed client")
     HostLog.info(s"initialized by $clientName for $rootUri")
-    projectRequested = true
-    documents.execute { () =>
-      val root = Path.of(URI.create(rootUri))
-      setState("importing", s"opening $root")
-      try {
-        val opened = withProgress("scala-psi-host: opening the project")(progress => ProjectSession.open(host, root, progress = progress))
-        val heap = Runtime.getRuntime
-        HostLog.info(s"ready in ${(System.nanoTime() - startedAt) / 1_000_000} ms since the server started: " +
-          s"${opened.moduleCount} modules, ${opened.sourceFiles.size} source files, " +
-          s"heap ${(heap.totalMemory - heap.freeMemory) / (1024 * 1024)} of ${heap.maxMemory / (1024 * 1024)} MB")
-        setState("ready", s"${opened.moduleCount} modules, ${opened.sourceFiles.size} source files")
-        session.complete(opened)
-      } catch {
-        case e: Throwable =>
-          HostLog.error(s"opening the project at $root failed", e)
-          setState("failed", String.valueOf(e.getMessage))
-          val seeLog = logFile.fold("")(f => s" (log: $f)")
-          client.showMessage(new MessageParams(MessageType.Error, s"scala-psi-host could not open the project: ${e.getMessage}$seeLog"))
-          session.completeExceptionally(e)
-      }
-    }
+    workspace = Some(Path.of(URI.create(rootUri)))
     val capabilities = new ServerCapabilities
     capabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental)
     capabilities.setHoverProvider(true)
-    capabilities.setCompletionProvider(new CompletionOptions(true, java.util.List.of(".")))
+    capabilities.setCompletionProvider(new CompletionOptions(/* resolveProvider = */ false, java.util.List.of(".")))
     capabilities.setDocumentFormattingProvider(true)
     capabilities.setDocumentRangeFormattingProvider(true)
     capabilities.setDefinitionProvider(true)
@@ -188,7 +164,8 @@ final class ScalaLanguageServer(
    * Asks the client to report changes to the build's definition (sbt files, `project/`) and created or deleted source
    * files: either makes the server import the build again (see [[ProjectSession.importBuild]]).
    */
-  override def initialized(params: InitializedParams): Unit =
+  override def initialized(params: InitializedParams): Unit = {
+    workspace.foreach(openProject)
     if (watchesFiles) {
       val changes = WatchKind.Create | WatchKind.Change | WatchKind.Delete
       val watchers = Seq(
@@ -198,6 +175,34 @@ final class ScalaLanguageServer(
       client.registerCapability(new RegistrationParams(java.util.List.of(new Registration(
         "scala-psi-host-build-files", "workspace/didChangeWatchedFiles", new DidChangeWatchedFilesRegistrationOptions(watchers.asJava)))))
     }
+  }
+
+  /**
+   * Opens the project, reporting it as progress. Only after `initialized`: until then the client may not take the
+   * server's requests (VS Code answers the progress request as an unhandled method).
+   */
+  private def openProject(root: Path): Unit = {
+    projectRequested = true
+    documents.execute { () =>
+      setState("importing", s"opening $root")
+      try {
+        val opened = withProgress("scala-psi-host: opening the project")(progress => ProjectSession.open(host, root, progress = progress))
+        val heap = Runtime.getRuntime
+        HostLog.info(s"ready in ${(System.nanoTime() - startedAt) / 1_000_000} ms since the server started: " +
+          s"${opened.moduleCount} modules, ${opened.sourceFiles.size} source files, " +
+          s"heap ${(heap.totalMemory - heap.freeMemory) / (1024 * 1024)} of ${heap.maxMemory / (1024 * 1024)} MB")
+        setState("ready", s"${opened.moduleCount} modules, ${opened.sourceFiles.size} source files")
+        session.complete(opened)
+      } catch {
+        case e: Throwable =>
+          HostLog.error(s"opening the project at $root failed", e)
+          setState("failed", String.valueOf(e.getMessage))
+          val seeLog = logFile.fold("")(f => s" (log: $f)")
+          client.showMessage(new MessageParams(MessageType.Error, s"scala-psi-host could not open the project: ${e.getMessage}$seeLog"))
+          session.completeExceptionally(e)
+      }
+    }
+  }
 
   override def shutdown(): CompletableFuture[AnyRef] = {
     shutdownRequested = true
@@ -279,17 +284,13 @@ final class ScalaLanguageServer(
     CompletableFuture.supplyAsync(() =>
       try timed(kind, submitted)(request(session.join()))
       catch {
-        case e: com.intellij.diff.comparison.DiffTooBigException =>
-          HostLog.warn(s"$kind diff is too large", e)
-          throw new org.eclipse.lsp4j.jsonrpc.ResponseErrorException(new org.eclipse.lsp4j.jsonrpc.messages.ResponseError(
-            org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestFailed, "change diff is too large", null))
-        case e: ProcessCanceledException => throw new org.eclipse.lsp4j.jsonrpc.ResponseErrorException(
-          new org.eclipse.lsp4j.jsonrpc.messages.ResponseError(org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestCancelled,
-            "request cancelled by a newer edit", null))
-        case e: scalapsihost.ChangeEngine.UnsupportedFormatter =>
+        case _: ProcessCanceledException => throw requestError(ResponseErrorCode.RequestCancelled, "cancelled by a newer edit")
+        case e: DiffTooBigException =>
+          HostLog.warn(s"$kind: the change is too large to compare", e)
+          throw requestError(ResponseErrorCode.RequestFailed, "the change is too large to compare")
+        case e: ChangeEngine.UnsupportedFormatter =>
           client.showMessage(new MessageParams(MessageType.Error, e.getMessage))
-          throw new org.eclipse.lsp4j.jsonrpc.ResponseErrorException(new org.eclipse.lsp4j.jsonrpc.messages.ResponseError(
-            org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestFailed, e.getMessage, null))
+          throw requestError(ResponseErrorCode.RequestFailed, e.getMessage)
         case NonFatal(e) =>
           HostLog.error(s"$kind failed", e)
           throw e
@@ -316,19 +317,23 @@ final class ScalaLanguageServer(
   private def onSource[T](kind: String, document: TextDocumentIdentifier, outside: => T)(request: (ProjectSession, Path) => T): CompletableFuture[T] =
     onDocuments(kind)(s => sourcePath(s, document.getUri).fold(outside)(request(s, _)))
 
-  /** Receipt-time versions guard copy requests both before execution and before publishing their edits. */
+  private def requestError(code: ResponseErrorCode, message: String) =
+    new ResponseErrorException(new ResponseError(code, message, null))
+
+  /**
+   * A request answered with edits of the document's text (completion, formatting): an edit received after it makes
+   * them wrong. A running one is cancelled as the edit arrives; one still waiting for its turn, or one the
+   * cancellation came too late for, is answered as cancelled.
+   */
   private def onCopyRequest[T](kind: String, document: TextDocumentIdentifier, outside: => T)
                               (request: (ProjectSession, Path) => T): CompletableFuture[T] = {
-    val version = completionVersion(document.getUri)
-    val submittedVersion = version.get()
+    val received = editsReceived.get()
+    def checkNoNewerEdit(): Unit = if (editsReceived.get() != received) throw new ProcessCanceledException
     onSource(kind, document, outside) { (s, path) =>
-      completionGate.synchronized { completing = true }
-      try {
-        if (version.get() != submittedVersion) throw new ProcessCanceledException
-        val result = request(s, path)
-        if (version.get() != submittedVersion) throw new ProcessCanceledException
-        result
-      } finally completionGate.synchronized { completing = false }
+      checkNoNewerEdit()
+      val result = request(s, path)
+      checkNoNewerEdit()
+      result
     }
   }
 
@@ -351,9 +356,8 @@ final class ScalaLanguageServer(
     }
 
     override def didChange(params: DidChangeTextDocumentParams): Unit = {
-      completionVersion(params.getTextDocument.getUri).incrementAndGet()
-      // Cancel only during a copy request; offset reads used by another edit must finish.
-      completionGate.synchronized { if (completing) host.cancelReads() }
+      editsReceived.incrementAndGet()
+      host.cancelReads()
       onDocuments("didChange") { s =>
         sourcePath(s, params.getTextDocument.getUri).foreach { path =>
           versions.put(path, params.getTextDocument.getVersion)
@@ -379,33 +383,23 @@ final class ScalaLanguageServer(
       }.orNull
     }
 
-    override def completion(params: CompletionParams)
-        : CompletableFuture[LspEither[java.util.List[CompletionItem], CompletionList]] = {
-      onCopyRequest("completion", params.getTextDocument,
-        LspEither.forRight[java.util.List[CompletionItem], CompletionList](new CompletionList(false, java.util.List.of()))) { (s, path) =>
-        LspEither.forRight(s.completion(path, lineColumn(params.getPosition),
-          completionOptions.copy(uri = params.getTextDocument.getUri, version = Option(versions.get(path)).fold(0)(_.intValue))))
-      }
-    }
-
-    override def resolveCompletionItem(item: CompletionItem): CompletableFuture[CompletionItem] =
-      if (item.getData == null) CompletableFuture.completedFuture(item)
-      else {
-        val recipe = scalapsihost.Completion.recipe(item)
-        onCopyRequest("completion resolve", new TextDocumentIdentifier(recipe.uri), throw new ProcessCanceledException) { (s, path) =>
-          s.resolveCompletion(path, item, Option(versions.get(path)).fold(0)(_.intValue))
-        }
+    override def completion(params: CompletionParams): CompletableFuture[LspEither[java.util.List[CompletionItem], CompletionList]] =
+      onCopyRequest("completion", params.getTextDocument, LspEither.forRight(new CompletionList())) { (s, path) =>
+        val choices = s.completion(path, lineColumn(params.getPosition))
+        LspEither.forRight(new CompletionList(choices.incomplete, choices.items.zipWithIndex.map(completionItem).asJava))
       }
 
     override def formatting(params: DocumentFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
       onCopyRequest("formatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
-        s.formatting(path, None, params.getOptions).asJava
+        textEdits(s.formatting(path, None, params.getOptions.getTabSize, !params.getOptions.isInsertSpaces))
       }
 
     override def rangeFormatting(params: DocumentRangeFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
       onCopyRequest("rangeFormatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
         val range = params.getRange
-        s.formatting(path, Some(lineColumn(range.getStart) -> lineColumn(range.getEnd)), params.getOptions).asJava
+        val options = params.getOptions
+        textEdits(s.formatting(path, Some(lineColumn(range.getStart) -> lineColumn(range.getEnd)), options.getTabSize,
+          !options.isInsertSpaces))
       }
 
     override def definition(params: DefinitionParams)
@@ -501,6 +495,39 @@ final class ScalaLanguageServer(
   private def lineColumn(p: Position): LineColumn = LineColumn(p.getLine, p.getCharacter)
   private def position(at: LineColumn): Position = new Position(at.line, at.column)
   private def range(span: (LineColumn, LineColumn)): Range = new Range(position(span._1), position(span._2))
+  private def textEdit(change: TextChange): TextEdit = new TextEdit(range(change.start -> change.end), change.text)
+  private def textEdits(changes: Seq[TextChange]): java.util.List[TextEdit] = changes.map(textEdit).asJava
+
+  private def completionItem(choice: CompletionChoice, rank: Int): CompletionItem = {
+    val suggestion = choice.suggestion
+    val item = new CompletionItem(suggestion.label)
+    val details = new CompletionItemLabelDetails
+    details.setDetail(suggestion.tail.orNull)
+    details.setDescription(suggestion.typeText.orNull)
+    item.setLabelDetails(details)
+    item.setDetail(Seq(suggestion.tail, suggestion.typeText).flatten.mkString(" "))
+    item.setKind(suggestion.kind)
+    if (suggestion.deprecated) item.setTags(java.util.List.of(CompletionItemTag.Deprecated))
+    // The suggestions come ordered: by rank, the editor keeps that order instead of sorting them by label.
+    item.setSortText(f"$rank%06d")
+    item.setFilterText(suggestion.filterText)
+    val change = choice.change
+    if (completionSnippets) {
+      item.setInsertTextFormat(InsertTextFormat.Snippet)
+      item.setTextEdit(LspEither.forLeft(textEdit(change.copy(text = snippet(change.text, choice.caret)))))
+    } else item.setTextEdit(LspEither.forLeft(textEdit(change)))
+    if (choice.additional.nonEmpty) item.setAdditionalTextEdits(textEdits(choice.additional))
+    item
+  }
+
+  /** `text` as a snippet whose final tab stop, where the editor leaves the caret, is `caret` characters in. */
+  private def snippet(text: String, caret: Int): String = {
+    def escape(part: String) = part.flatMap {
+      case c @ ('\\' | '$' | '}') => s"\\$c"
+      case c => c.toString
+    }
+    escape(text.take(caret)) + "$0" + escape(text.drop(caret))
+  }
 
   // ---- Workspace -------------------------------------------------------------------------------------------------
 

@@ -1,8 +1,9 @@
 package scalapsihost.oracle
 
 import com.intellij.psi.util.PsiTreeUtil
-import org.eclipse.lsp4j.{CompletionItem, CompletionItemKind, CompletionItemTag, TextEdit}
+import org.eclipse.lsp4j.CompletionItemKind
 import org.jetbrains.plugins.scala.LatestScalaVersions
+import org.jetbrains.plugins.scala.autoImport.quickFix.ScalaImportTypeFix
 import org.jetbrains.plugins.scala.lang.psi.api.base.{ScInterpolatedStringLiteral, ScLiteral, ScReference}
 import org.jetbrains.plugins.scala.lang.psi.api.expr.*
 import org.jetbrains.plugins.scala.lang.psi.api.statements.ScPatternDefinition
@@ -10,10 +11,11 @@ import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScTypeDefinition
 import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunctionDefinition
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScClass
-import scalapsihost.{CallLog, ChangeEngine, Completion, CompletionEditor, HostConfig, HostDispatchThread, HostLog, HostModule, ModuleSpec, ScalaPsiHost}
+import scalapsihost.{CallLog, ChangeEngine, Completion, CompletionEditor, HostConfig, HostDispatchThread, HostLog, HostModule, ModuleSpec, ScalaPsiHost, TestHost}
 
 import java.io.File
 import java.nio.file.{Files, Path}
+import java.util.concurrent.FutureTask
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal
@@ -78,7 +80,7 @@ object CompletionOracle {
     lines += ""
     lines += "## Replay limits and disagreements"
     lines += ""
-    lines += "Interactive lists preview at most Completion.MaxEagerHandlers primary-changing handlers. File-set replay disables the list and preview budgets; keyword fixtures collect only keyword results, as upstream. Selected-item replay has no list budget. " +
+    lines += "Interactive lists preview at most Completion.MaxPreviews primary-changing handlers. File-set replay disables the list and preview budgets; keyword fixtures collect only keyword results, as upstream. Selected-item replay has no list budget. " +
       "Completion uses Scala 2.13.18 and the existing four contributors; Java binary short-name enumeration and other contributors remain unavailable. " +
       "Auto-import mounts Source*.scala fixture companions from the case directory; additional IDE fixture configuration is not inferred."
     lines += ""
@@ -97,7 +99,7 @@ object CompletionOracle {
     lines += ""
     lines += "## Adapter observations"
     lines += ""
-    for ((entry, count) <- CallLog.snapshot if entry.startsWith("UNSUPPORTED ") || entry.startsWith("LOGGED ERROR ") || entry.startsWith("Completion.filtered."))
+    for ((entry, count) <- CallLog.snapshot if entry.startsWith("UNSUPPORTED ") || entry.startsWith("LOGGED ERROR ") || entry.startsWith("Completion.skipped."))
       lines += s"- $entry: $count"
     val report = Path.of(reportPath)
     Files.createDirectories(report.toAbsolutePath.getParent)
@@ -261,11 +263,13 @@ object CompletionOracle {
       case other => throw new IllegalStateException(s"not a Scala fixture: $other")
     }
     try {
-      val item = Completion.replay(file, offset, contract.lookup, contract.char)
-      val primary = item.getTextEdit.getLeft.getRange
-      require(primary.getStart.getLine == primary.getEnd.getLine, "primary edit spans source lines")
-      val edits = item.getAdditionalTextEdits.asScala.toSeq :+ decodedEdit(item)
-      val inserted = applyEdits(before.replace("<caret>", ""), edits).trim
+      val insertion = Completion.insertion(file, offset, contract.lookup, contract.char)
+      val primary = insertion.edit
+      val original = before.replace("<caret>", "")
+      require(!primary.range.substring(original).contains('\n'), "primary edit spans source lines")
+      val replacement = primary.text.patch(insertion.caret, "<caret>", 0)
+      val edits = insertion.additional :+ primary.copy(text = replacement)
+      val inserted = TestHost.applyEdits(original, edits).trim
       val actual = if (after.contains("<caret>")) inserted else inserted.replace("<caret>", "")
       require(host.read(file.getText) == before.replace("<caret>", ""), "completion changed original")
       if (actual == after) Result("agree", "")
@@ -278,33 +282,6 @@ object CompletionOracle {
         HostLog.warn(s"completion oracle ${c.suite}/${c.name} failed", e)
         Result("disagree", s"${e.getClass.getSimpleName}: ${e.getMessage}")
     } finally host.closeSource(file)
-  }
-
-  private def decodedEdit(item: CompletionItem): TextEdit = {
-    val source = item.getTextEdit.getLeft
-    val text = source.getNewText
-    val decoded = new StringBuilder
-    var index = 0
-    while (index < text.length) {
-      if (text.charAt(index) == '\\' && index + 1 < text.length) { decoded += text.charAt(index + 1); index += 2 }
-      else if (text.startsWith("$0", index)) { decoded ++= "<caret>"; index += 2 }
-      else { decoded += text.charAt(index); index += 1 }
-    }
-    new TextEdit(source.getRange, decoded.toString)
-  }
-
-  private def applyEdits(text: String, edits: Seq[TextEdit]): String = {
-    val document = new com.intellij.openapi.editor.impl.DocumentImpl(text, true)
-    def at(position: org.eclipse.lsp4j.Position): Int = document.getLineStartOffset(position.getLine) + position.getCharacter
-    val sorted = edits.sortBy(e => at(e.getRange.getStart))
-    sorted.sliding(2).foreach {
-      case Seq(left, right) => require(at(left.getRange.getStart) < at(right.getRange.getStart) &&
-        at(left.getRange.getEnd) <= at(right.getRange.getStart), "completion edits overlap")
-      case _ => ()
-    }
-    sorted.reverse.foldLeft(text) { (current, edit) =>
-      current.substring(0, at(edit.getRange.getStart)) + edit.getNewText + current.substring(at(edit.getRange.getEnd))
-    }
   }
 
   private def runImport(host: ScalaPsiHost, module: HostModule, c: TestCase): Result = {
@@ -323,20 +300,8 @@ object CompletionOracle {
       val expectation = host.read(Expected.lastComment(file))
       if (expectation.isEmpty) return Result("skip", "no resulting-text comment")
       val expected = expectation.get
-      var changed = Option.empty[ChangeEngine.Result]
-      HostDispatchThread.invokeAndWait(() => {
-        changed = Some(ChangeEngine.run(file) { copy =>
-          val reference = PsiTreeUtil.getParentOfType(copy.findElementAt(offset), classOf[ScReference], false)
-          require(reference != null, "no reference at marker")
-          val fix = org.jetbrains.plugins.scala.autoImport.quickFix.ScalaImportTypeFix(reference)
-          val candidates = fix.elements
-          require(candidates.nonEmpty, "no import candidate")
-          val editor = new CompletionEditor(copy.getViewProvider.getDocument, copy.getProject, offset)
-          try fix.createAddImportAction(editor.editor).addImportTestOnly(candidates.head)
-          finally editor.close()
-        })
-      })
-      val result = changed.getOrElse(throw new IllegalStateException("auto-import did not run"))
+      val result = importChange(file, offset)
+      require(TestHost.applyEdits(original, result.edits) == result.text, "edits do not reconstruct the import")
       require(host.read(file.getText) == original, "auto-import changed original")
       val parsed = host.parse(result.text.trim)
       val commentStart = host.read(parsed.findElementAt(parsed.getTextLength - 1).getTextRange.getStartOffset)
@@ -350,6 +315,21 @@ object CompletionOracle {
     } finally { host.closeSource(file); companions.foreach(host.closeSource) }
   }
 
+  private def importChange(file: ScalaFile, offset: Int): ChangeEngine.Result = {
+    val change = new FutureTask[ChangeEngine.Result](() => ChangeEngine.run(file) { copy =>
+      val reference = PsiTreeUtil.getParentOfType(copy.findElementAt(offset), classOf[ScReference], false)
+      require(reference != null, "no reference at marker")
+      val fix = ScalaImportTypeFix(reference)
+      val candidates = fix.elements
+      require(candidates.nonEmpty, "no import candidate")
+      Using.resource(new CompletionEditor(copy.getViewProvider.getDocument, copy.getProject, offset)) { editor =>
+        fix.createAddImportAction(editor.editor).addImportTestOnly(candidates.head)
+      }
+    }._1)
+    HostDispatchThread.invokeAndWait(change)
+    change.get()
+  }
+
   private def runCase(host: ScalaPsiHost, module: HostModule, c: TestCase): Result = {
     val marker = if (c.suite == "completion") "/*caret*/" else "<caret>"
     try {
@@ -360,7 +340,7 @@ object CompletionOracle {
       // which changes findReferenceAt and therefore the plugin's operator/backtick dummy selection.
       val configured = if (c.suite == "completion") text else text.replace(marker, "")
       val file = host.openFile(Path.of("/completion-oracle").resolve(c.path.getFileName), configured, module) match {
-        case f: org.jetbrains.plugins.scala.lang.psi.api.ScalaFile => f
+        case f: ScalaFile => f
         case other => throw new IllegalStateException(s"not a Scala fixture: $other")
       }
       try {
@@ -368,11 +348,10 @@ object CompletionOracle {
           case None => Result("skip", "no last-comment expectation")
           case Some(comment) =>
             val expected = Expected.forVersion(comment, LatestScalaVersions.Scala_2_13).trim.linesIterator.filter(_.nonEmpty).toVector.sorted
-            val completed = Completion.complete(file, offset, Int.MaxValue, keywordOnly = c.suite == "keywordCompletion", maxPreviews = Int.MaxValue)
-            val items = completed.getItems.asScala.filter(i => c.suite != "keywordCompletion" || i.getKind == CompletionItemKind.Keyword)
+            val completed = Completion.complete(file, offset, limit = Int.MaxValue, previews = Int.MaxValue)
+            val items = completed.items.filter(i => c.suite != "keywordCompletion" || i.kind == CompletionItemKind.Keyword)
             val actual = items.map { i =>
-              val strikeout = Option(i.getTags).exists(_.contains(CompletionItemTag.Deprecated))
-              i.getFilterText + (if (strikeout && c.suite == "completion") " (strikeout)" else "")
+              i.filterText + (if (i.deprecated && c.suite == "completion") " (strikeout)" else "")
             }.toVector.sorted
             if (expected == actual) Result("agree", "")
             else Result("disagree", s"missing: ${expected.diff(actual).mkString(", ")}; extra: ${actual.diff(expected).mkString(", ")}")

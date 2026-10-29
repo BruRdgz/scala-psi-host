@@ -1,11 +1,10 @@
 package scalapsihost.oracle
 
 import com.intellij.psi.codeStyle.CodeStyleSettingsManager
-import org.eclipse.lsp4j.FormattingOptions
 import org.jetbrains.plugins.scala.ScalaLanguage
 import org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
-import scalapsihost.{CallLog, ChangeEngine, HostConfig, HostLog, ScalaPsiHost}
+import scalapsihost.{CallLog, ChangeEngine, HostConfig, HostLog, ScalaPsiHost, TestHost}
 
 import java.io.File
 import java.nio.file.{Files, Path}
@@ -120,12 +119,8 @@ object FormatterOracle {
       }
       val errorsBefore = HostLog.count(HostLog.Level.Error)
       val changed = manager.computeWithLocalSettings(settings, _ =>
-        ChangeEngine.format(file, None, new FormattingOptions(2, true)))
-      val snapshot = new com.intellij.openapi.editor.impl.DocumentImpl(parts.head, true)
-      def offset(p: org.eclipse.lsp4j.Position) = snapshot.getLineStartOffset(p.getLine) + p.getCharacter
-      val reconstructed = changed.edits.reverse.foldLeft(parts.head) { (text, edit) =>
-        text.substring(0, offset(edit.getRange.getStart)) + edit.getNewText + text.substring(offset(edit.getRange.getEnd))
-      }
+        ChangeEngine.format(file, None, 2, useTabs = false))
+      val reconstructed = TestHost.applyEdits(parts.head, changed.edits)
       if (reconstructed != changed.text) throw new IllegalStateException("edits do not reconstruct the copy")
       val expected = parts.last.trim
       val actual = changed.text.trim

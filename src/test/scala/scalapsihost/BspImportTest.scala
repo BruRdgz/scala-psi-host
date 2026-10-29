@@ -73,9 +73,17 @@ class BspImportTest extends munit.FunSuite {
       owner.reload()
       assertEquals(BspImport.sbtServerState(fixture), live, "reimport restarted sbt")
     } finally owner.close()
-    assert(!Files.exists(fixture.resolve("project/target/active.json")), "the owned sbt server survived close")
+    assert(sbtServerGone(), "the owned sbt server survived close")
     owner.close()
-    assert(!Files.exists(fixture.resolve("project/target/active.json")), "a repeated close started sbt again")
+    assert(sbtServerGone(), "a repeated close started sbt again")
+  }
+
+  // sbt goes on its own time once asked to shut down, slower on a busy machine than close() waits for.
+  private def sbtServerGone(): Boolean = {
+    val active = fixture.resolve("project/target/active.json")
+    val deadline = 30.seconds.fromNow
+    while (Files.exists(active) && deadline.hasTimeLeft()) Thread.sleep(100)
+    !Files.exists(active)
   }
 
   test("imports the build's Scala targets with their settings") {

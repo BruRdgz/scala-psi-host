@@ -1,7 +1,7 @@
 {
   "name": "scala-psi-host",
   "displayName": "Scala (scala-psi-host)",
-  "description": "Scala diagnostics, navigation, symbols and semantic colors from the IntelliJ Scala plugin, through the scala-psi-host language server.",
+  "description": "Scala diagnostics, completion, formatting, navigation, symbols and semantic colors from the IntelliJ Scala plugin, through the scala-psi-host language server.",
   "version": "0.1.0",
   "publisher": "brurdgz",
   "license": "Apache-2.0",
@@ -31,6 +31,9 @@
           "description": "Log every request the server answers, with its time (SCALA_PSI_HOST_LOG=debug). Takes effect when the server restarts."
         }
       }
+    },
+    "configurationDefaults": {
+      "[scala]": { "editor.defaultFormatter": "brurdgz.scala-psi-host" }
     },
     "commands": [
       { "command": "scalaPsiHost.showStatus", "title": "Show Status", "category": "scala-psi-host" },
