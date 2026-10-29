@@ -3,7 +3,7 @@ package scalapsihost.lsp
 import com.intellij.psi.PsiManager
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.launch.LSPLauncher
-import scalapsihost.{BspImport, TestHost}
+import scalapsihost.TestHost
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, PipedInputStream, PipedOutputStream}
 import java.nio.file.{Files, Path}
@@ -67,18 +67,13 @@ class LanguageServerTest extends munit.FunSuite {
   private val Client = new RecordingClient
   private lazy val implementation = new ScalaLanguageServer(TestHost.host)
   private lazy val server = connect(Client, implementation)
-  private var ownsFixtureServer = false
 
   private lazy val closedServer: Unit = {
     server.shutdown().get(30, TimeUnit.SECONDS)
     server.exit()
   }
 
-  override def afterAll(): Unit = {
-    closedServer
-    if (ownsFixtureServer)
-      assert(!Files.exists(fixture.resolve("project/target/active.json")), "the language server left its sbt server running")
-  }
+  override def afterAll(): Unit = closedServer
 
   /** Initializes `server` as an editor that, when `appliesEdits`, applies the server's edits and shows its documents. */
   private def initialize(server: HostProtocol.LanguageServerWithStatus, root: Path, appliesEdits: Boolean = true): InitializeResult = {
@@ -160,11 +155,25 @@ class LanguageServerTest extends munit.FunSuite {
     }
   }
 
-  test("initializes on the workspace's build and announces its features") {
-    ownsFixtureServer = BspImport.sbtServerState(fixture) match {
-      case BspImport.SbtServerState.Missing | BspImport.SbtServerState.Inactive(_) => true
-      case _ => false
+  // Linux process ids stay below 2^22: this one belongs to no process the server can see.
+  test("does not take a client process it cannot see for one that exited") {
+    val exited = new LinkedBlockingQueue[Int]()
+    val implementation = new ScalaLanguageServer(TestHost.host, code => { exited.add(code); () })
+    implementation.connect(new RecordingClient)
+    val root = Files.createTempDirectory("scala-psi-host-invisible-client")
+    try {
+      val params = new InitializeParams
+      params.setRootUri(root.toUri.toString)
+      params.setProcessId(Int.MaxValue)
+      implementation.initialize(params).get(10, TimeUnit.SECONDS)
+      assertEquals(Option(exited.poll(1, TimeUnit.SECONDS)), None)
+    } finally {
+      implementation.exit()
+      Files.delete(root)
     }
+  }
+
+  test("initializes on the workspace's build and announces its features") {
     val capabilities = initialize(server, fixture).getCapabilities
     assertEquals(capabilities.getTextDocumentSync.getLeft, TextDocumentSyncKind.Incremental)
     assert(capabilities.getHoverProvider.getLeft)

@@ -16,6 +16,8 @@
   state (`scalaPsiHost/state`) and a status report (`scalaPsiHost/status`). The VS Code extension shows the state in
   the status bar and has *Show Status* and *Show Log File* commands.
 - Memory: the platform's reparse copies of edited files are no longer kept.
+- Lifecycle: the server ends with its client (its input ending, or its process exiting when the server can see it)
+  and leaves the build's sbt server running for its other clients.
 
 ## 0.1.0-a1 — 2026-10-28
 

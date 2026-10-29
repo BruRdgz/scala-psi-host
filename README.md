@@ -208,8 +208,6 @@ after a full GC grows by about 0.3 MB per edit (see [Known limitations](#known-l
   open). Choosing a suggestion with a handler is two edits (undo takes two steps).
 - Formatting uses the IntelliJ formatter with Scala's default code style: the project's code style and
   `.scalafmt.conf` are not read.
-- The sbt server the build connection starts is stopped when the server ends; it should be left running, as sbt
-  shares it with other clients (planned).
 - Scala 2 has no document compilation (its compiler has no stable interface to call); Scala 2 errors come from the
   plugin, or from the build's compile when compiler errors are enabled for Scala 2.
 - Java sources are parsed at the highest language level, not the build's.

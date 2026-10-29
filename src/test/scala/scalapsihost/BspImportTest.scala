@@ -1,12 +1,13 @@
 package scalapsihost
 
+import com.google.gson.JsonObject
 import com.intellij.lang.annotation.HighlightSeverity
 
-import java.net.UnixDomainSocketAddress
-import java.nio.channels.ServerSocketChannel
+import java.net.{URI, UnixDomainSocketAddress}
+import java.nio.channels.SocketChannel
 import java.nio.file.{Files, Path}
 import scala.concurrent.duration.*
-import scala.util.Using
+import scala.util.{Try, Using}
 
 /**
  * A real build through BSP: `fixtures/bsp-project` (sbt; `app` depends on `core` and compiles with `-Xsource:3`;
@@ -21,69 +22,16 @@ class BspImportTest extends munit.FunSuite {
   private lazy val imported = BspImport.importBuild(fixture)
   private def module(name: String) = imported.find(_.spec.name == name).getOrElse(fail(s"no module $name in ${imported.map(_.spec.name)}"))
 
-  test("sbt server liveness distinguishes missing, stale and uncertain metadata") {
-    import BspImport.SbtServerState.*
-    val root = Files.createTempDirectory(Path.of("target"), "sbt-")
-    val active = Files.createDirectories(root.resolve("project/target")).resolve("active.json")
-    val socket = root.toAbsolutePath.resolve("sock")
-    try {
-      assertEquals(BspImport.sbtServerState(root), Missing)
-      for (text <- Seq("{", "{}", """{"uri":"tcp://127.0.0.1:1234"}""")) {
-        Files.writeString(active, text)
-        assert(BspImport.sbtServerState(root) match {
-          case Unknown(_) => true
-          case _ => false
-        }, text)
-      }
-      Files.writeString(active, s"""{"uri":"local://$socket"}""")
-      Using.resource(ServerSocketChannel.open(java.net.StandardProtocolFamily.UNIX)) { listener =>
-        listener.bind(UnixDomainSocketAddress.of(socket))
-        assertEquals(BspImport.sbtServerState(root), Live(socket))
-      }
-      assert(Files.exists(socket), "a leftover socket must not establish liveness")
-      assertEquals(BspImport.sbtServerState(root), Inactive(socket))
-      Files.delete(socket)
-      assertEquals(BspImport.sbtServerState(root), Inactive(socket))
-    } finally {
-      Files.deleteIfExists(socket)
-      Files.deleteIfExists(active)
-      Files.delete(root.resolve("project/target"))
-      Files.delete(root.resolve("project"))
-      Files.delete(root)
-    }
+  test("closing a connection leaves the sbt server running for the build's other clients") {
+    BspImport.connect(fixture).close()
+    assert(sbtServerListening(), "closing the connection stopped the sbt server")
   }
 
-  test("only the connection that started sbt stops it, including after a reload") {
-    import BspImport.SbtServerState.*
-    assert(BspImport.sbtServerState(fixture) match {
-      case Missing | Inactive(_) => true
-      case _ => false
-    }, "the ownership test needs an idle fixture; an existing external server is left untouched")
-    val owner = BspImport.connect(fixture)
-    try {
-      val live = BspImport.sbtServerState(fixture)
-      assert(live match {
-        case Live(_) => true
-        case _ => false
-      }, live.toString)
-      Using.resource(BspImport.connect(fixture)) { borrowed =>
-        assert(borrowed.modules().nonEmpty)
-      }
-      assertEquals(BspImport.sbtServerState(fixture), live, "closing a borrowed connection stopped sbt")
-      owner.reload()
-      assertEquals(BspImport.sbtServerState(fixture), live, "reimport restarted sbt")
-    } finally owner.close()
-    assert(sbtServerGone(), "the owned sbt server survived close")
-    owner.close()
-    assert(sbtServerGone(), "a repeated close started sbt again")
-  }
-
-  // sbt goes on its own time once asked to shut down, slower on a busy machine than close() waits for.
-  private def sbtServerGone(): Boolean = {
-    val active = fixture.resolve("project/target/active.json")
-    val deadline = 30.seconds.fromNow
-    while (Files.exists(active) && deadline.hasTimeLeft()) Thread.sleep(100)
-    !Files.exists(active)
+  // While sbt's server runs, project/target/active.json names the socket it listens on.
+  private def sbtServerListening(): Boolean = {
+    val active = BspImport.gson.fromJson(Files.readString(fixture.resolve("project/target/active.json")), classOf[JsonObject])
+    val socket = Path.of(URI.create(active.get("uri").getAsString).getPath)
+    Try(Using.resource(SocketChannel.open(UnixDomainSocketAddress.of(socket)))(_ => ())).isSuccess
   }
 
   test("imports the build's Scala targets with their settings") {

@@ -162,7 +162,9 @@ final class ScalaLanguageServer(
       try {
         val process = ProcessHandle.of(pid.longValue())
         if (process.isPresent) process.get().onExit().thenRun(() => exit())
-        else exit()
+        // A client in another PID namespace (a container, a Flatpak sandbox) is invisible, not dead: the server then
+        // ends with its input.
+        else HostLog.info(s"client process $pid is not visible; the server ends when its input ends")
       } catch { case NonFatal(e) => HostLog.warn(s"could not watch client process $pid", e) }
     }
     CompletableFuture.completedFuture(new InitializeResult(capabilities, new ServerInfo("scala-psi-host", "0.1")))
@@ -212,9 +214,13 @@ final class ScalaLanguageServer(
     }
   }
 
+  /** Answers null once the project is closed, also when closing it failed or overran: the client then sends `exit`. */
   override def shutdown(): CompletableFuture[AnyRef] = {
     shutdownRequested = true
-    closing
+    closing.exceptionally { e =>
+      HostLog.warn("could not close the project on shutdown", e)
+      null
+    }
   }
 
   private lazy val closing: CompletableFuture[AnyRef] = {
@@ -228,8 +234,8 @@ final class ScalaLanguageServer(
     closed.orTimeout(EndingDeadlineSeconds, TimeUnit.SECONDS)
   }
 
+  /** What closing the project logs still goes to the client, while it listens; only then is its log closed. */
   override def exit(): Unit = if (ending.compareAndSet(false, true)) {
-    clientLog.foreach(_.close())
     HostLog.info(s"exiting (${if (shutdownRequested) "after a shutdown request" else "without a shutdown request"})")
     try closing.get(EndingDeadlineSeconds, TimeUnit.SECONDS)
     catch {
@@ -237,7 +243,10 @@ final class ScalaLanguageServer(
         HostLog.warn("interrupted while closing the project", e)
         Thread.currentThread().interrupt()
       case NonFatal(e) => HostLog.warn("could not close the project before exiting", e)
-    } finally exitProcess(if (shutdownRequested) 0 else 1)
+    } finally {
+      clientLog.foreach(_.close())
+      exitProcess(if (shutdownRequested) 0 else 1)
+    }
   }
 
   /**
