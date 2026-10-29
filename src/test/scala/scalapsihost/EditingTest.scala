@@ -72,4 +72,63 @@ class EditingTest extends munit.FunSuite {
       host.closeSource(b)
     }
   }
+
+  test("completion renders member signatures and replaces only the UTF-16 prefix") {
+    val text = "object Complete { val emoji = \"😀\"; def message(n: Int): String = \"hi\"; Complete.mes }"
+    val file = host.openFile(Path.of("/editing/Complete.scala"), text, module).asInstanceOf[ScalaFile]
+    try {
+      import scala.jdk.CollectionConverters.*
+      val offset = text.indexOf("Complete.mes") + "Complete.mes".length
+      val result = host.completion(file, offset)
+      val item = result.getItems.asScala.find(_.getFilterText == "message").getOrElse(fail(result.toString))
+      assertEquals(item.getKind, org.eclipse.lsp4j.CompletionItemKind.Method)
+      assert(item.getDetail.contains("Int") && item.getDetail.contains("String"), item.toString)
+      val edit = item.getTextEdit.getLeft
+      assertEquals(edit.getNewText, "message")
+      assertEquals(edit.getRange.getStart.getCharacter, offset - 3)
+      assertEquals(edit.getRange.getEnd.getCharacter, offset)
+      assertEquals(host.read(file.getText), text)
+    } finally host.closeSource(file)
+  }
+
+  test("completion preserves overloads and deprecation, and excludes classes needing an import") {
+    import scala.jdk.CollectionConverters.*
+    val hidden = host.openFile(Path.of("/editing/Hidden.scala"), "package hidden\nclass ZebraUnimported", module)
+    val text = "package visible\nobject Lookup { @deprecated(\"old\", \"1\") def message(n: Int): String = \"\"; " +
+      "def message(n: String): Int = 0; Lookup.mes }"
+    val file = host.openFile(Path.of("/editing/Lookup.scala"), text, module).asInstanceOf[ScalaFile]
+    try {
+      val items = host.completion(file, text.indexOf("Lookup.mes") + "Lookup.mes".length).getItems.asScala
+        .filter(_.getFilterText == "message")
+      assertEquals(items.size, 2)
+      assertEquals(items.map(_.getDetail).distinct.size, 2)
+      assertEquals(items.count(i => Option(i.getTags).exists(_.contains(org.eclipse.lsp4j.CompletionItemTag.Deprecated))), 1)
+      for ((expression, filtered) <- Seq("val value: ZebraUn = ???" -> "import", "val value: Any = new ZebraUn" -> "insertion")) {
+        val changed = s"package visible\nobject Lookup { $expression }"
+        host.edit(file, 0, host.read(file.getTextLength), changed)
+        val entry = s"Completion.filtered.$filtered"
+        val before = CallLog.snapshot.toMap.getOrElse(entry, 0)
+        val completed = host.completion(file, changed.indexOf("ZebraUn") + "ZebraUn".length)
+        assert(!completed.getItems.asScala.exists(_.getFilterText == "ZebraUnimported"), completed.toString)
+        assert(CallLog.snapshot.toMap.getOrElse(entry, 0) > before, s"the $filtered candidate was not encountered")
+      }
+    } finally {
+      host.closeSource(file)
+      host.closeSource(hidden)
+    }
+  }
+
+  test("completion ranks a local before a named argument and emits its trivial assignment edit") {
+    import scala.jdk.CollectionConverters.*
+    val text = "object Named { def use = { val namelocal = \"s\"; " +
+      "def printName(nameParam: String = \"Unknown\"): Unit = (); printName(name) } }"
+    val file = host.openFile(Path.of("/editing/Named.scala"), text, module).asInstanceOf[ScalaFile]
+    try {
+      val items = host.completion(file, text.indexOf("printName(name)") + "printName(name".length).getItems.asScala.toSeq
+      val names = items.map(_.getFilterText)
+      assert(names.contains("namelocal") && names.contains("nameParam"), names)
+      assert(names.indexOf("namelocal") < names.indexOf("nameParam"), names)
+      assertEquals(items.find(_.getFilterText == "nameParam").get.getTextEdit.getLeft.getNewText, "nameParam = ")
+    } finally host.closeSource(file)
+  }
 }

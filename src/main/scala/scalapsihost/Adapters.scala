@@ -49,6 +49,9 @@ private[scalapsihost] object HostLock {
   def isReading: Boolean = lock.getReadHoldCount > 0
   def isWriting: Boolean = lock.isWriteLockedByCurrentThread
 
+  /** An editor notification can cancel reads before its queued write acquires the documents thread. */
+  def cancelQueries(): Unit = queries.forEach(_.cancel())
+
   /** A read without its own cancellation (the platform's `runReadAction`): the lock only. */
   def readLocked[T](body: => T): T =
     if (isReading || isWriting) body
@@ -78,7 +81,7 @@ private[scalapsihost] object HostLock {
   def write[T](body: => T): T = {
     // A read lock cannot become a write lock: waiting for it here would wait for this thread's own read forever.
     if (isReading && !isWriting) throw new IllegalStateException("an edit cannot start inside a read")
-    if (!isWriting) queries.forEach(_.cancel())
+    if (!isWriting) cancelQueries()
     lock.writeLock.lock()
     try body
     finally lock.writeLock.unlock()
@@ -134,6 +137,53 @@ def dispatch(answer: PartialFunction[(String, Array[AnyRef]), AnyRef]): Dispatch
     if (answer.isDefinedAt((method, args))) { CallLog.hit(method); answer((method, args)) }
     else CallLog.unsupported(method)
   }
+
+/** A completion request's editor state, without a UI or any insertion operations. */
+private[scalapsihost] object CompletionEditor {
+  def apply(document: com.intellij.openapi.editor.Document, project: com.intellij.openapi.project.Project,
+            offset: Int): com.intellij.openapi.editor.Editor = {
+    import com.intellij.openapi.editor.{Caret, CaretModel, Editor, SelectionModel}
+    import com.intellij.openapi.util.{Key, UserDataHolderBase}
+    val data = new UserDataHolderBase
+    lazy val editor: Editor = tableProxy(classOf[Editor], "CompletionEditor") {
+      case ("getDocument", _) => document
+      case ("getProject", _) => project
+      case ("getCaretModel", _) => model
+      case ("getSelectionModel", _) => selection
+      case ("getUserData", Array(k: Key[?])) => data.getUserData(k).asInstanceOf[AnyRef]
+      case ("putUserData", Array(k: Key[?], value)) => putData(k, value); null
+    }
+    // Reflection erases Key's type parameter, as in the project's user-data table.
+    def putData(key: Key[?], value: AnyRef): Unit = data.putUserData(key.asInstanceOf[Key[AnyRef]], value)
+    lazy val caret: Caret = tableProxy(classOf[Caret], "CompletionCaret") {
+      case ("getEditor", _) => editor
+      case ("getOffset" | "getSelectionStart" | "getSelectionEnd", _) => Integer.valueOf(offset)
+      case ("hasSelection", _) => java.lang.Boolean.FALSE
+    }
+    lazy val model: CaretModel = tableProxy(classOf[CaretModel], "CompletionCaretModel") {
+      case ("getCurrentCaret" | "getPrimaryCaret", _) => caret
+      case ("getOffset", _) => Integer.valueOf(offset)
+      case ("getAllCarets", _) => java.util.List.of(caret)
+    }
+    lazy val selection: SelectionModel = tableProxy(classOf[SelectionModel], "CompletionSelection") {
+      case ("getSelectionStart" | "getSelectionEnd", _) => Integer.valueOf(offset)
+      case ("hasSelection", _) => java.lang.Boolean.FALSE
+    }
+    editor
+  }
+}
+
+/** The host has no annotation inference engine; declared annotations remain in PSI. */
+private[scalapsihost] final class HostInferredAnnotationsManager extends com.intellij.codeInsight.InferredAnnotationsManager {
+  override def findInferredAnnotations(owner: com.intellij.psi.PsiModifierListOwner): Array[com.intellij.psi.PsiAnnotation] = {
+    CallLog.hit("InferredAnnotationsManager.findInferredAnnotations")
+    com.intellij.psi.PsiAnnotation.EMPTY_ARRAY
+  }
+  override def findInferredAnnotation(owner: com.intellij.psi.PsiModifierListOwner, name: String): com.intellij.psi.PsiAnnotation = {
+    CallLog.hit("InferredAnnotationsManager.findInferredAnnotation")
+    null
+  }
+}
 
 /**
  * The fixed service table of one component manager (the Application or the Project object). Only services

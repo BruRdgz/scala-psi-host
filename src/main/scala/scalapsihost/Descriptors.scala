@@ -13,6 +13,11 @@ import scala.util.Using
 /** An extension-point *declaration* (name → interface or bean class) read from descriptor XML. */
 final case class EpDecl(name: String, className: String, kind: ExtensionPoint.Kind, dynamic: Boolean, fromScalaPlugin: Boolean)
 
+/** Descriptor attributes retained for bean extension points, including their platform ordering constraints. */
+final case class ExtensionBean(attributes: Map[String, String]) {
+  def implementation: String = attributes.getOrElse("implementationClass", attributes.getOrElse("implementation", ""))
+}
+
 /**
  * Reads plugin and platform descriptors as data only: extension-point declarations and registry-key defaults.
  * Nothing here loads a plugin, instantiates an extension or registers a service.
@@ -66,7 +71,11 @@ object Descriptors {
    * Implementation classes the Scala plugin's descriptors register for extension point `epName` (fully qualified),
    * in declaration order. Read as data; the caller decides which extension points it loads.
    */
-  def scalaExtensions(scalaPluginJars: Seq[Path], epName: String): Seq[String] = {
+  def scalaExtensions(scalaPluginJars: Seq[Path], epName: String): Seq[String] =
+    scalaExtensionBeans(scalaPluginJars, epName).map(_.implementation).filter(_.nonEmpty)
+
+  /** Bean attributes are data: the host still explicitly chooses which implementations it registers. */
+  def scalaExtensionBeans(scalaPluginJars: Seq[Path], epName: String): Seq[ExtensionBean] = {
     val factory = DocumentBuilderFactory.newInstance()
     for {
       jar <- scalaPluginJars
@@ -80,8 +89,10 @@ object Descriptors {
       i <- 0 until children.getLength
       e <- Option(children.item(i)).collect { case el: org.w3c.dom.Element => el }
       if s"$namespace.${e.getTagName}" == epName
-      implementation = e.getAttribute("implementation") if implementation.nonEmpty
-    } yield implementation
+    } yield ExtensionBean((0 until e.getAttributes.getLength).map { a =>
+      val attribute = e.getAttributes.item(a)
+      attribute.getNodeName -> attribute.getNodeValue
+    }.toMap)
   }
 
   private def xmlEntries(jar: Path): Seq[(String, Array[Byte])] =

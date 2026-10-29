@@ -110,6 +110,14 @@ final class ProjectSession private (
 
   def text(path: Path): String = host.read(file(path).getText)
 
+  /** Scala completion preserves the file's module context and uses the host's cancellable read. */
+  def completion(path: Path, at: LineColumn): org.eclipse.lsp4j.CompletionList = host.read {
+    file(path) match {
+      case f: ScalaFile => host.completion(f, offset(document(f), at))
+      case _ => new org.eclipse.lsp4j.CompletionList(false, java.util.List.of())
+    }
+  }
+
   /**
    * Applies an editor change: the text between `start` and `end` becomes `replacement`; without a range, the whole
    * text is replaced.

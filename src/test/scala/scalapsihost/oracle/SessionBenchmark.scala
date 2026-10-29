@@ -1,7 +1,7 @@
 package scalapsihost.oracle
 
 import scalapsihost.lsp.ProjectSession
-import scalapsihost.{HostConfig, LineColumn, ScalaPsiHost}
+import scalapsihost.{CallLog, HostConfig, LineColumn, ScalaPsiHost}
 
 import java.io.File
 import java.nio.file.{Files, Path}
@@ -50,6 +50,7 @@ object SessionBenchmark {
         val (_, ms) = timed(request)
         latencies(kind) = latencies.getOrElse(kind, Vector.empty) :+ ms
       }
+      positions.headOption.foreach { (path, at) => measure("completion (first request)")(session.completion(path, at)) }
       // Each file's problems first, as an editor opening it: later requests find the plugin's caches as they are then.
       for (path <- scalaFiles) measure("problems (per file)")(session.problems(path))
       for (path <- scalaFiles) {
@@ -61,6 +62,7 @@ object SessionBenchmark {
         measure("hover")(session.hover(path, at))
         measure("definition")(session.definition(path, at))
         measure("document highlights")(session.highlights(path, at))
+        measure("completion")(session.completion(path, at))
       }
       val heapAfterRequestsMb = usedHeapMb()
 
@@ -71,6 +73,9 @@ object SessionBenchmark {
         session.change(path, Some(end -> end), "\n// edit")
         measure("problems after an edit")(session.problems(path))
         measure("semantic tokens after an edit")(session.semanticTokens(path))
+        positions.find(_._1 == path).foreach { (_, at) =>
+          measure("completion after an edit")(session.completion(path, at))
+        }
         session.change(path, Some(end -> LineColumn(end.line + 1, "// edit".length)), "")
         usedHeapMb()
       }
@@ -79,6 +84,9 @@ object SessionBenchmark {
       lines += s"# Session benchmark: ${projectDir.getFileName}"
       lines += ""
       lines += s"JDK ${System.getProperty("java.version")}, max heap ${Runtime.getRuntime.maxMemory / (1024 * 1024)} MB, one thread."
+      lines += "Completion includes copying, contributors, classification and rendering (200-item LSP cap); server queueing and JSON transport are excluded."
+      lines += "For a real project with a BSP connection: `sbt --java-home /usr/lib/jvm/java-25 -batch " +
+        "'Test/runMain scalapsihost.oracle.SessionBenchmark /path/to/project target/session-benchmark.md --positions=1500 --rounds=60'`."
       lines += ""
       lines += s"- Scala files: ${scalaFiles.size}; sampled positions: ${positions.size}; edit rounds: $rounds" +
         editFile.fold(" (files in turn)")(f => s" (always ${projectDir.relativize(f)})")
@@ -98,6 +106,12 @@ object SessionBenchmark {
       lines += "## Heap by edit round (MB)"
       lines += ""
       lines += heapByRound.mkString(", ")
+      lines += ""
+      lines += "## Adapter observations"
+      lines += ""
+      val unexpected = CallLog.snapshot.filter((entry, _) => entry.startsWith("UNSUPPORTED ") || entry.startsWith("LOGGED ERROR "))
+      if (unexpected.isEmpty) lines += "No unsupported adapter calls or logged platform errors."
+      else for ((entry, count) <- unexpected) lines += s"- $entry: $count"
       Files.createDirectories(Path.of(reportPath).toAbsolutePath.getParent)
       Files.write(Path.of(reportPath), lines.result().asJava)
       println(s"session benchmark: report at $reportPath")

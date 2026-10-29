@@ -78,6 +78,14 @@ final class ScalaPsiHost private (
    */
   def read[T](query: => T): T = HostLock.query(query)
 
+  /** Cancels reads for an editor change already received but still waiting in the server's queue. */
+  private[scalapsihost] def cancelReads(): Unit = HostLock.cancelQueries()
+
+  /** BASIC completion runs under the same cancellable read as other semantic queries. */
+  def completion(file: ScalaFile, offset: Int): org.eclipse.lsp4j.CompletionList = HostLock.query {
+    Completion.complete(file, offset)
+  }
+
   /** A file outside the project: parsed, but invisible to symbol lookups (as the IDE's non-physical files). */
   def parse(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile = HostLock.readLocked {
     ScalaPsiElementFactory.createScalaFileFromText(text, features)(using new ProjectContext(project))
@@ -324,6 +332,26 @@ object ScalaPsiHost {
   /** Plugin extension points that carry language semantics; every other plugin extension point stays empty. */
   val SemanticExtensionPoints: Seq[String] = Seq("org.intellij.scala.syntheticMemberInjector")
 
+  /** Initialization, visible symbols, syntax and literal values; imports and generated edits need insert handlers. */
+  val CompletionContributors: Set[String] = Set(
+    "ScalaDumbAwareCompletionContributor", "ScalaBasicCompletionContributor",
+    "ScalaKeywordCompletionContributor", "ScalaLiteralTypeValuesCompletionContributor",
+  ).map("org.jetbrains.plugins.scala.lang.completion." + _)
+
+  /** The plugin's completion and proximity weighers, used with their declared keys and ordering. */
+  val CompletionWeighers: Set[String] = Set(
+    "ScalaContainingClassWeigher", "ScalaMethodCompletionWeigher", "ScalaByNameWeigher", "ScalaKindCompletionWeigher",
+    "ScalaScopeWeigher", "ScalaClassObjectWeigher", "ScalaExplicitlyImportedWeigher",
+  ).map("org.jetbrains.plugins.scala.lang.completion.weighter." + _)
+
+  /** Platform ordering anchors from the matching analysis-impl/lang-impl descriptors; statistics stay inert in BaseCompletionService. */
+  private val PlatformCompletionWeighers: Seq[ExtensionBean] = Seq(
+    ("StatisticsWeigher", "stats", "after prefix"), ("PriorityWeigher", "priority", "first"),
+    ("PrefixMatchingWeigher", "prefix", "after priority"), ("GroupingWeigher", "grouping", "last"),
+    ("ExplicitProximityWeigher", "explicitProximity", "after stats"), ("LookupElementProximityWeigher", "proximity", "after explicitProximity"),
+  ).map { (name, id, order) => ExtensionBean(Map("key" -> "completion", "id" -> id, "order" -> order,
+    "implementationClass" -> s"com.intellij.codeInsight.completion.$name")) }
+
   /**
    * Starts the host. The platform keeps the Application and the root extension area in process-wide statics,
    * so there is one host per JVM and it lives until the JVM exits.
@@ -387,6 +415,17 @@ object ScalaPsiHost {
       case ("getUserData", Array(k: Key[?])) => appData.getUserData(k).asInstanceOf[AnyRef]
       // Extension points resolve their declared class through the component manager.
       case ("loadClass", Array(name: String, _)) => Class.forName(name)
+      case ("isInjectionForExtensionSupported", _) => java.lang.Boolean.FALSE
+      // Completion bean extensions use the platform's lazy loader, without container injection.
+      case ("instantiateClass", Array(cls: Class[?], _)) if
+          ScalaPsiHost.CompletionContributors.contains(cls.getName) ||
+          ScalaPsiHost.CompletionWeighers.contains(cls.getName) ||
+          Set("com.intellij.codeInsight.completion.CompletionContributorEP", "com.intellij.psi.WeigherExtensionPoint").contains(cls.getName) =>
+        newPrivate(cls).asInstanceOf[AnyRef]
+      case ("instantiateClass", Array(name: String, _)) if
+          ScalaPsiHost.CompletionContributors(name) || ScalaPsiHost.CompletionWeighers(name) ||
+          PlatformCompletionWeighers.exists(_.implementation == name) =>
+        newPrivate(Class.forName(name))
       // Wraps an extension's failure for logging; the IDE adds plugin attribution, which the host does not track.
       case ("createError", Array(t: Throwable, _*)) => new RuntimeException(t)
       case ("runReadAction", Array(r: Runnable)) => HostLock.readLocked(r.run()); null
@@ -421,6 +460,46 @@ object ScalaPsiHost {
       val ep = area.getExtensionPoint[AnyRef](epName).asInstanceOf[ExtensionPointImpl[AnyRef]]
       implementations.foreach(name => ep.registerExtension(newPrivate(Class.forName(name).asInstanceOf[Class[AnyRef]]), root))
     }
+    // Descriptor beans preserve both the implementation attributes and the platform's id/order semantics.
+    val completionPlugin = new DefaultPluginDescriptor(PluginId.getId("org.intellij.scala"))
+    def registerCompletionBeans(epName: String, beans: Seq[ExtensionBean], plugin: com.intellij.openapi.extensions.PluginDescriptor): Unit = {
+      val ep = area.getExtensionPoint(epName).asInstanceOf[ExtensionPointImpl[?]]
+      val descriptors = beans.map { bean =>
+        val attributes = bean.attributes -- (if (epName.endsWith("weigher")) Seq("order") else Seq("id", "order"))
+        new com.intellij.openapi.extensions.ExtensionDescriptor(null, null, bean.attributes.getOrElse("id", null),
+          com.intellij.openapi.extensions.LoadingOrder.readOrder(bean.attributes.getOrElse("order", "")),
+          new com.intellij.util.xml.dom.XmlElement(epName.stripPrefix("com.intellij."), attributes.asJava, java.util.List.of(), null), true)
+      }
+      ep.registerExtensions(descriptors.asJava, plugin, java.util.List.of())
+    }
+    for (epName <- Seq("com.intellij.completion.contributor", "com.intellij.weigher")) {
+      declare(epName)
+      val beans = Descriptors.scalaExtensionBeans(config.scalaPluginJars, epName).filter { bean =>
+        if (epName.endsWith("contributor"))
+          bean.attributes.get("language").contains("Scala") && ScalaPsiHost.CompletionContributors(bean.implementation)
+        else ScalaPsiHost.CompletionWeighers(bean.implementation) && Set("completion", "proximity").contains(bean.attributes.getOrElse("key", ""))
+      }
+      if (beans.isEmpty) throw new IllegalStateException(s"no completion beans for $epName")
+      registerCompletionBeans(epName, beans, completionPlugin)
+    }
+    registerCompletionBeans("com.intellij.weigher", PlatformCompletionWeighers, new DefaultPluginDescriptor(PluginId.getId("com.intellij")))
+    for (name <- Seq("com.intellij.modcompletion.completionItemProvider", "com.intellij.modcompletion.completionItemFilter"))
+      CoreApplicationEnvironment.registerExtensionPoint(area, name, classOf[LanguageExtensionPoint[?]])
+    appServices.register(classOf[com.intellij.codeInsight.completion.CompletionService])(new Completion.Service)
+    appServices.register(classOf[com.intellij.codeInsight.CodeInsightSettings])(new com.intellij.codeInsight.CodeInsightSettings)
+    // Lookup presentation checks test-class icons; no test-framework integrations are installed in the host.
+    CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.testIntegration.TestFramework.EXTENSION_NAME,
+      classOf[com.intellij.testIntegration.TestFramework])
+    CoreApplicationEnvironment.registerExtensionPoint(area, "com.intellij.javaMainMethodProvider",
+      classOf[com.intellij.codeInsight.runner.JavaMainMethodProvider])
+    CoreApplicationEnvironment.registerExtensionPoint(area, "com.intellij.packageDirectoryProvider",
+      classOf[com.intellij.psi.PackageDirectoryProvider])
+    appServices.register(classOf[com.intellij.codeInsight.TestFrameworks])(newPrivate(classOf[com.intellij.codeInsight.TestFrameworksImpl]))
+    appServices.registerNull(classOf[com.intellij.codeInsight.completion.NewRdCompletionSupport])
+    appServices.register(classOf[com.intellij.codeInsight.completion.group.GroupedCompletion])(
+      tableProxy(classOf[com.intellij.codeInsight.completion.group.GroupedCompletion], "GroupedCompletion") {
+        case ("isEnabled", _) => java.lang.Boolean.FALSE
+      })
     // Platform extension points the plugin's PSI queries, with no extensions. Their declarations live in IDE
     // descriptors that are not on this classpath; the platform's own core environment declares them in code too.
     CoreApplicationEnvironment.registerExtensionPoint(area, FileIndentOptionsProvider.EP_NAME, classOf[FileIndentOptionsProvider])
@@ -594,6 +673,7 @@ object ScalaPsiHost {
     // Platform library implementations used by Java PSI of library classes and by PSI copies.
     appServices.register(classOf[com.intellij.psi.util.JavaClassSupers])(new com.intellij.psi.impl.JavaClassSupersImpl)
     appServices.register(classOf[com.intellij.psi.PsiSubstitutorFactory])(new com.intellij.psi.impl.PsiSubstitutorFactoryImpl)
+    appServices.register(classOf[com.intellij.psi.impl.file.PsiPackageImplementationHelper])(new com.intellij.core.CorePsiPackageImplementationHelper)
     appServices.register(classOf[com.intellij.psi.impl.source.codeStyle.IndentHelper])(new com.intellij.psi.impl.source.codeStyle.IndentHelperImpl)
 
     // ---- 2. Language registries and stub schema: explicit extensions only ---------------------
@@ -606,6 +686,9 @@ object ScalaPsiHost {
       new org.jetbrains.plugins.scala.lang.scaladoc.reflinks.ScalaDocRefLinkParserDefinition,
     )
     parserDefinitions.foreach(pd => LanguageParserDefinitions.INSTANCE.addExplicitExtension(pd.getFileNodeType.getLanguage, pd))
+    // beforeCompletion and lookup escaping must use Scala's operators and keywords, rather than the Java fallback.
+    com.intellij.lang.LanguageNamesValidation.INSTANCE.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE,
+      new org.jetbrains.plugins.scala.lang.refactoring.ScalaNamesValidator)
     // Java sources of mixed projects.
     LanguageParserDefinitions.INSTANCE.addExplicitExtension(com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.lang.java.JavaParserDefinition)
     // Java's typed leaves (PsiIdentifier, PsiKeyword, ...): Java PSI casts its tokens to them.
@@ -821,6 +904,13 @@ object ScalaPsiHost {
         java.lang.Boolean.valueOf(!isLibrary(f) && types.contains(org.jetbrains.jps.model.java.JavaSourceRootType.SOURCE))
     }
     projectServices.register(classOf[com.intellij.openapi.roots.ProjectFileIndex])(fileIndex)
+    // Java stub eligibility reads a persisted level as the source-content marker. The host owns source membership,
+    // and uses the same highest Java level here as in JavaPsiImplementationHelper, without persisting VFS attributes.
+    appServices.register(classOf[com.intellij.pom.java.InternalPersistentJavaLanguageLevelReaderService])(
+      tableProxy(classOf[com.intellij.pom.java.InternalPersistentJavaLanguageLevelReaderService], "JavaLanguageLevelReader") {
+        case ("getPersistedLanguageLevel", Array(f: VirtualFile)) =>
+          if (moduleModel.ofFile(f).isDefined) com.intellij.pom.java.LanguageLevel.HIGHEST else null
+      })
     // The same answers through the platform's facade (ClassFileViewProvider asks it before building Java PSI).
     projectServices.register(classOf[com.intellij.openapi.roots.FileIndexFacade])(new Host_FileIndexFacade(project, dispatch {
       case ("FileIndexFacade.isInLibraryClasses", Array(f: VirtualFile)) => java.lang.Boolean.valueOf(isLibraryClass(f))
@@ -893,6 +983,7 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.pom.tree.TreeAspect])(new com.intellij.pom.tree.TreeAspect)
     projectServices.register(classOf[com.intellij.psi.SmartPointerManager])(new com.intellij.psi.impl.smartPointers.SmartPointerManagerImpl(project))
     projectServices.register(classOf[com.intellij.psi.PsiElementFactory])(new com.intellij.psi.impl.PsiElementFactoryImpl(project))
+    projectServices.register(classOf[com.intellij.psi.PsiNameHelper])(com.intellij.psi.impl.PsiNameHelperImpl.getInstance())
     // One scope for everything, as one scope per module: the plugin keys its caches by scope, so a new object per
     // request would add entries on every lookup that are never found again.
     val everythingScope = new com.intellij.psi.search.EverythingGlobalScope(project)
@@ -903,10 +994,14 @@ object ScalaPsiHost {
     // finders come with the host's LibraryClassFinder, which takes the place of the IDE's PsiElementFinderImpl.
     projectServices.register(classOf[com.intellij.psi.JvmPsiConversionHelper])(new com.intellij.psi.impl.JvmPsiConversionHelperImpl)
     projectServices.register(classOf[com.intellij.psi.impl.source.resolve.ResolveCache])(new com.intellij.psi.impl.source.resolve.ResolveCache(project))
+    projectServices.register(classOf[com.intellij.psi.impl.migration.PsiMigrationManager])(new com.intellij.psi.impl.migration.PsiMigrationManager(project))
     // External (XML) annotations of library classes: the host attaches none.
     projectServices.register(classOf[com.intellij.codeInsight.ExternalAnnotationsManager])(new Host_ExternalAnnotationsManager(dispatch {
       case ("ExternalAnnotationsManager.findExternalAnnotationsFiles", _) => null
+      case ("ExternalAnnotationsManager.findExternalAnnotations", Array(_)) => com.intellij.psi.PsiAnnotation.EMPTY_ARRAY
+      case ("ExternalAnnotationsManager.findExternalAnnotations", Array(_, _)) => java.util.List.of()
     }))
+    projectServices.register(classOf[com.intellij.codeInsight.InferredAnnotationsManager])(new HostInferredAnnotationsManager)
     // Nullability annotations of library Java types: the host configures none (the IDE's defaults come from settings).
     projectServices.register(classOf[com.intellij.codeInsight.NullableNotNullManager])(new Host_NullableNotNullManager(project, dispatch {
       case ("NullableNotNullManager.getNullityDefault", _) => com.intellij.codeInsight.ContextNullabilityInfo.EMPTY
@@ -936,10 +1031,12 @@ object ScalaPsiHost {
       // suggestCompiledParameterName takes the first suggestion: none.
       case ("JavaCodeStyleManager.suggestVariableName", _) => com.intellij.psi.codeStyle.SuggestedNameInfo.NULL_INFO
     }))
-    // Java classes by short name, which auto-import fixes combine with the plugin's Scala index. The host has no
-    // Java short-name index yet (Java class files are read by qualified name): no Java class is offered.
+    // Scala enumeration uses the existing SymbolIndex through the plugin's cache. Java binaries remain unavailable.
+    lazy val scalaShortNames = new org.jetbrains.plugins.scala.caches.ScalaShortNamesCache(using project)
     projectServices.register(classOf[com.intellij.psi.search.PsiShortNamesCache])(new Host_PsiShortNamesCache(dispatch {
-      case ("PsiShortNamesCache.getClassesByName", _) => com.intellij.psi.PsiClass.EMPTY_ARRAY
+      case ("PsiShortNamesCache.getClassesByName", Array(name: String, scope: com.intellij.psi.search.GlobalSearchScope)) =>
+        scalaShortNames.getClassesByName(name, scope)
+      case ("PsiShortNamesCache.getAllClassNames", _) => scalaShortNames.getAllClassNames.sorted
     }))
     // Annotation lookups cache by owner; the host has no mirrored elements (light copies of sources), so an owner is
     // its own cache key.

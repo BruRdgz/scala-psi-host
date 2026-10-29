@@ -1,3 +1,4 @@
+AnnotationCacheOwnerNormalizer.doNormalize
 Application.assertReadAccessAllowed
 Application.assertWriteAccessAllowed
 Application.getDefaultModalityState
@@ -5,18 +6,25 @@ Application.getExtensionArea
 Application.getLockProhibitedAdvice (default)
 Application.getMessageBus
 Application.getService
+Application.getServiceIfCreated
+Application.instantiateClass
 Application.isDispatchThread
 Application.isDisposed
+Application.isInjectionForExtensionSupported
 Application.isInternal
 Application.isReadAccessAllowed
 Application.isUnitTestMode
 Application.isWriteAccessAllowed
 Application.loadClass
+Application.service com.intellij.codeInsight.CodeInsightSettings
+Application.service com.intellij.codeInsight.completion.CompletionService
+Application.service com.intellij.codeInsight.completion.group.GroupedCompletion
 Application.service com.intellij.lang.DefaultASTFactory
 Application.service com.intellij.lang.PsiBuilderFactory
 Application.service com.intellij.openapi.application.AsyncExecutionService
 Application.service com.intellij.openapi.application.TransactionGuard
 Application.service com.intellij.openapi.command.CommandProcessor
+Application.service com.intellij.openapi.editor.elf.Elf
 Application.service com.intellij.openapi.fileEditor.FileDocumentManager
 Application.service com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers
 Application.service com.intellij.openapi.progress.ProgressManager
@@ -24,10 +32,12 @@ Application.service com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 Application.service com.intellij.openapi.vfs.newvfs.ManagingFS
 Application.service com.intellij.psi.ExternalChangeActionUtil$PsiExternalChangeService
 Application.service com.intellij.psi.LanguageSubstitutors
+Application.service com.intellij.psi.PsiSubstitutorFactory
 Application.service com.intellij.psi.codeStyle.CodeStyleSettingsService
 Application.service com.intellij.psi.compiled.ClassFileDecompilers
 Application.service com.intellij.psi.impl.DocumentCommitProcessor
 Application.service com.intellij.psi.impl.java.stubs.JavaStubElementTypePsiElementMappingRegistry
+Application.service com.intellij.psi.impl.source.codeStyle.IndentHelper
 Application.service com.intellij.psi.stubs.StubElementRegistryService
 Application.service com.intellij.psi.stubs.StubIndex
 Application.service com.intellij.psi.stubs.StubTreeLoader
@@ -35,15 +45,26 @@ Application.service com.intellij.util.indexing.FileBasedIndex
 Application.service org.jetbrains.plugins.scala.lang.psi.api.expr.ExpectedTypes
 Application.service org.jetbrains.plugins.scala.scalaMeta.ScalaMetaApi
 Application.service org.jetbrains.plugins.scala.settings.ScalaApplicationSettings
+Application.service(null) com.intellij.codeInsight.completion.NewRdCompletionSupport
 Application.service(null) com.intellij.psi.ParsingDiagnostics$ParserDiagnosticsHandler
 Application.service(null) com.intellij.psi.impl.source.tree.mvcc.PsiVersioningGarbageCollector
 AsyncExecutionService.buildNonBlockingReadAction
 CodeStyleSettingsService.addListener
 CodeStyleSettingsService.getCustomCodeStyleSettingsFactories
+CodeStyleSettingsService.getFileTypeIndentOptionsFactories
 CodeStyleSettingsService.getLanguageCodeStyleProviders
+CompletionCaret.getOffset
+CompletionCaret.hasSelection
+CompletionCaretModel.getCurrentCaret
+CompletionEditor.getCaretModel
+CompletionEditor.getDocument
 DumbService.isAlternativeResolveEnabled
 DumbService.isDumb
 DumbService.queueTask
+Elf.isInElfScope
+Elf.runReadAction
+ExternalAnnotationsManager.findExternalAnnotations
+ExternalAnnotationsManager.findExternalAnnotationsFiles
 FileBasedIndex.processFilesContainingAnyKey
 FileIndexFacade.isInLibraryClasses
 FileManager.findCachedViewProvider
@@ -54,6 +75,11 @@ FileTypeManager.getFileTypeByExtension
 FileTypeManager.getFileTypeByFile
 FileTypeManager.getRegisteredFileTypes
 FileTypeManager.isFileIgnored
+GroupedCompletion.isEnabled
+InferredAnnotationsManager.findInferredAnnotation
+InjectedLanguageManager.getTopLevelFile
+InjectedLanguageManager.isInjectedViewProvider
+JavaPsiImplementationHelper.getEffectiveLanguageLevel
 LibraryTable.addListener
 LibraryTablesRegistrar.getLibraryTable
 ManagingFS.readAttribute
@@ -69,7 +95,12 @@ Project.getUserData
 Project.isDefault
 Project.isDisposed
 Project.putUserData
+Project.service com.intellij.codeInsight.AnnotationCacheOwnerNormalizer
+Project.service com.intellij.codeInsight.ExternalAnnotationsManager
+Project.service com.intellij.codeInsight.InferredAnnotationsManager
+Project.service com.intellij.codeInsight.JavaProjectCodeInsightSettings
 Project.service com.intellij.ide.util.PropertiesComponent
+Project.service com.intellij.lang.injection.InjectedLanguageManager
 Project.service com.intellij.lang.jvm.facade.JvmFacade
 Project.service com.intellij.openapi.module.ModuleManager
 Project.service com.intellij.openapi.project.DumbService
@@ -81,14 +112,21 @@ Project.service com.intellij.pom.tree.TreeAspect
 Project.service com.intellij.psi.JavaPsiFacade
 Project.service com.intellij.psi.JvmPsiConversionHelper
 Project.service com.intellij.psi.PsiDocumentManager
+Project.service com.intellij.psi.PsiElementFactory
 Project.service com.intellij.psi.PsiFileFactory
 Project.service com.intellij.psi.PsiManager
+Project.service com.intellij.psi.PsiNameHelper
+Project.service com.intellij.psi.PsiResolveHelper
 Project.service com.intellij.psi.SmartPointerManager
 Project.service com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager
+Project.service com.intellij.psi.impl.JavaPsiImplementationHelper
 Project.service com.intellij.psi.impl.ResolveScopeManager
 Project.service com.intellij.psi.impl.file.impl.JavaFileManager
+Project.service com.intellij.psi.impl.source.resolve.ResolveCache
 Project.service com.intellij.psi.search.ProjectScopeBuilder
+Project.service com.intellij.psi.search.PsiShortNamesCache
 Project.service com.intellij.psi.util.CachedValuesManager
+Project.service com.intellij.psi.util.PsiModificationTracker
 Project.service org.jetbrains.plugins.scala.caches.ScalaShortNamesCacheManager
 Project.service org.jetbrains.plugins.scala.components.libextensions.LibraryExtensionsManager
 Project.service org.jetbrains.plugins.scala.lang.macros.evaluator.ScalaMacroEvaluator
@@ -105,16 +143,22 @@ ProjectFileIndex.getModuleForFile
 ProjectFileIndex.isInLibrary
 ProjectFileIndex.isInLibraryClasses
 ProjectFileIndex.isInSourceContent
+ProjectFileIndex.isUnderSourceRootOfType
 ProjectRootManager.getFileIndex
 ProjectScopeBuilder.buildAllScope
 PsiManager.afterChange
+PsiManager.areElementsEquivalent
 PsiManager.beforeChange
 PsiManager.findDirectory
 PsiManager.findFile
 PsiManager.getFileManager
 PsiManager.getModificationTracker
 PsiManager.getProject
+PsiManager.isAssertOnFileLoading
 PsiManager.isBatchFilesProcessingMode
 PsiManager.isDisposed
+PsiShortNamesCache.getAllClassNames
+PsiShortNamesCache.getClassesByName
 ResolveScopeManager.getResolveScope
+StubIndex.getAllKeys
 StubIndex.processElements

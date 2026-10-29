@@ -60,6 +60,12 @@ final class ScalaLanguageServer(
   private val session = new CompletableFuture[ProjectSession]
   // Each document's latest version, as the client numbers them; diagnostics of older versions are dropped.
   private val versions = new ConcurrentHashMap[Path, Integer]()
+  // Changes are observed at receipt as well as application, so a queued request cannot publish an old completion.
+  private val completionVersions = new ConcurrentHashMap[String, AtomicInteger]()
+  private val completionGate = new Object
+  private var completing = false
+
+  private def completionVersion(uri: String): AtomicInteger = completionVersions.computeIfAbsent(uri, _ => new AtomicInteger())
 
   private def daemon(name: String): ThreadFactory = runnable => {
     val thread = new Thread(runnable, name)
@@ -152,6 +158,7 @@ final class ScalaLanguageServer(
     val capabilities = new ServerCapabilities
     capabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental)
     capabilities.setHoverProvider(true)
+    capabilities.setCompletionProvider(new CompletionOptions(false, java.util.List.of(".")))
     capabilities.setDefinitionProvider(true)
     capabilities.setTypeDefinitionProvider(true)
     capabilities.setDocumentHighlightProvider(true)
@@ -263,6 +270,9 @@ final class ScalaLanguageServer(
     CompletableFuture.supplyAsync(() =>
       try timed(kind, submitted)(request(session.join()))
       catch {
+        case e: ProcessCanceledException => throw new org.eclipse.lsp4j.jsonrpc.ResponseErrorException(
+          new org.eclipse.lsp4j.jsonrpc.messages.ResponseError(org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestCancelled,
+            "request cancelled by a newer edit", null))
         case NonFatal(e) =>
           HostLog.error(s"$kind failed", e)
           throw e
@@ -307,14 +317,19 @@ final class ScalaLanguageServer(
       }
     }
 
-    override def didChange(params: DidChangeTextDocumentParams): Unit = onDocuments("didChange") { s =>
-      sourcePath(s, params.getTextDocument.getUri).foreach { path =>
-        versions.put(path, params.getTextDocument.getVersion)
-        for (change <- params.getContentChanges.asScala) {
-          val range = Option(change.getRange).map(r => (lineColumn(r.getStart), lineColumn(r.getEnd)))
-          s.change(path, range, change.getText)
+    override def didChange(params: DidChangeTextDocumentParams): Unit = {
+      completionVersion(params.getTextDocument.getUri).incrementAndGet()
+      // Cancel only while the documents thread is completing; offset reads used by another edit must finish.
+      completionGate.synchronized { if (completing) host.cancelReads() }
+      onDocuments("didChange") { s =>
+        sourcePath(s, params.getTextDocument.getUri).foreach { path =>
+          versions.put(path, params.getTextDocument.getVersion)
+          for (change <- params.getContentChanges.asScala) {
+            val range = Option(change.getRange).map(r => (lineColumn(r.getStart), lineColumn(r.getEnd)))
+            s.change(path, range, change.getText)
+          }
+          scheduleDiagnostics(path)
         }
-        scheduleDiagnostics(path)
       }
     }
 
@@ -329,6 +344,22 @@ final class ScalaLanguageServer(
       s.hover(path, lineColumn(params.getPosition)).map { signature =>
         new Hover(new MarkupContent(MarkupKind.MARKDOWN, s"```scala\n$signature\n```"))
       }.orNull
+    }
+
+    override def completion(params: CompletionParams)
+        : CompletableFuture[LspEither[java.util.List[CompletionItem], CompletionList]] = {
+      val version = completionVersion(params.getTextDocument.getUri)
+      val submittedVersion = version.get()
+      onSource("completion", params.getTextDocument,
+        LspEither.forRight[java.util.List[CompletionItem], CompletionList](new CompletionList(false, java.util.List.of()))) { (s, path) =>
+        completionGate.synchronized { completing = true }
+        try {
+          if (version.get() != submittedVersion) throw new ProcessCanceledException
+          val result = s.completion(path, lineColumn(params.getPosition))
+          if (version.get() != submittedVersion) throw new ProcessCanceledException
+          LspEither.forRight(result)
+        } finally completionGate.synchronized { completing = false }
+      }
     }
 
     override def definition(params: DefinitionParams)

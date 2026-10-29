@@ -58,6 +58,11 @@ object TestHost {
     host.read {
       references(file).foreach(_.resolve())
       patternDefinitions(file).flatMap(_.expr).foreach(_.`type`())
+      val shortNames = com.intellij.psi.search.PsiShortNamesCache.getInstance(host.project)
+      shortNames.getAllClassNames
+      shortNames.getClassesByName("Box", com.intellij.psi.search.GlobalSearchScope.allScope(host.project))
     }
+    host.completion(file, scenarioSource.indexOf("inc(b)") + "inc".length)
+    host.completion(file, scenarioSource.indexOf("x + 1") + "x +".length)
   }
 }

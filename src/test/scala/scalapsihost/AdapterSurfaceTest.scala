@@ -21,6 +21,22 @@ class AdapterSurfaceTest extends munit.FunSuite {
     assertEquals(unsupported, Seq.empty)
   }
 
+  test("completion beans retain their descriptor implementations and weigher IDs") {
+    TestHost.host.read {
+      val contributors = com.intellij.codeInsight.completion.CompletionContributor.forLanguage(
+        org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE, null).asScala.map(_.getClass.getName).toSet
+      assertEquals(contributors, ScalaPsiHost.CompletionContributors)
+      val weighers = com.intellij.psi.WeighingService.getWeighers(com.intellij.codeInsight.completion.CompletionService.RELEVANCE_KEY)
+        .asScala.map(_.toString).toSeq
+      assertEquals(weighers.toSet, Set("scalaContainingClassWeigher", "scalaMethodCompletionWeigher", "scalaByNameWeigher",
+        "scalaKindWeigher", "ScopeWeigher", "stats", "priority", "prefix", "grouping", "explicitProximity", "proximity"))
+      assert(weighers.indexOf("scalaContainingClassWeigher") < weighers.indexOf("scalaKindWeigher"), weighers)
+      val proximity = com.intellij.psi.WeighingService.getWeighers(com.intellij.psi.util.proximity.PsiProximityComparator.WEIGHER_KEY)
+        .asScala.map(_.toString).toSet
+      assertEquals(proximity, Set("scalaClassObjectWeigher", "scalaExplicitlyImportedWeigher"))
+    }
+  }
+
   test("the adapter surface matches the reviewed list") {
     TestHost.runScenario()
     val actual = CallLog.snapshot.map(_._1).filterNot(isSymbolLookup)

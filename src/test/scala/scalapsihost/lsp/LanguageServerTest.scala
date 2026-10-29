@@ -39,10 +39,10 @@ class LanguageServerTest extends munit.FunSuite {
   }
 
   /** A server for `client`, connected to it as an editor connects (the server's own messages included). */
-  private def connect(client: RecordingClient): HostProtocol.LanguageServerWithStatus = {
+  private def connect(client: RecordingClient, implementation: ScalaLanguageServer = new ScalaLanguageServer(TestHost.host))
+      : HostProtocol.LanguageServerWithStatus = {
     val toServer = new PipedOutputStream
     val toClient = new PipedOutputStream
-    val implementation = new ScalaLanguageServer(TestHost.host)
     val serverSide = new LSPLauncher.Builder[HostProtocol.Client]().setLocalService(implementation)
       .setRemoteInterface(classOf[HostProtocol.Client]).setInput(new PipedInputStream(toServer)).setOutput(toClient).create()
     implementation.connect(serverSide.getRemoteProxy)
@@ -54,7 +54,8 @@ class LanguageServerTest extends munit.FunSuite {
   }
 
   private val Client = new RecordingClient
-  private lazy val server = connect(Client)
+  private lazy val implementation = new ScalaLanguageServer(TestHost.host)
+  private lazy val server = connect(Client, implementation)
   private var ownsFixtureServer = false
 
   override def afterAll(): Unit = {
@@ -141,6 +142,8 @@ class LanguageServerTest extends munit.FunSuite {
     val capabilities = initialize(server, fixture).getCapabilities
     assertEquals(capabilities.getTextDocumentSync.getLeft, TextDocumentSyncKind.Incremental)
     assert(capabilities.getHoverProvider.getLeft)
+    assertEquals(capabilities.getCompletionProvider.getTriggerCharacters.asScala.toSeq, Seq("."))
+    assertEquals(capabilities.getCompletionProvider.getResolveProvider, java.lang.Boolean.FALSE)
     assert(capabilities.getDefinitionProvider.getLeft)
     assert(capabilities.getTypeDefinitionProvider.getLeft)
     assert(capabilities.getDocumentHighlightProvider.getLeft)
@@ -294,6 +297,54 @@ class LanguageServerTest extends munit.FunSuite {
       (11, 13, None),
       (19, 20, None),
     ))
+  }
+
+  test("completes members, locals and keywords through the Scala contributors") {
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    def change(text: String, version: Int): Unit =
+      server.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
+        new VersionedTextDocumentIdentifier(main.toUri.toString, version),
+        java.util.List.of(new TextDocumentContentChangeEvent(text))))
+    def complete(text: String, marked: String, version: Int): Seq[CompletionItem] = {
+      change(text, version)
+      val offset = text.indexOf(marked) + marked.length
+      val before = text.substring(0, offset).split("\n", -1)
+      val result = server.getTextDocumentService.completion(new CompletionParams(document(main),
+        new Position(before.length - 1, before.last.length))).get(1, TimeUnit.MINUTES).getRight
+      assert(!result.isIncomplete)
+      result.getItems.asScala.toSeq
+    }
+    try {
+      val members = complete(original.replace("Greeting(\"world\").text", "Greeting(\"world\").te"), "Greeting(\"world\").te", 20)
+      val text = members.find(_.getFilterText == "text").getOrElse(fail(members.toString))
+      assert(text.getDetail.contains("String"), text.toString)
+      assertEquals(text.getKind, CompletionItemKind.Method)
+      assertEquals(text.getTextEdit.getLeft.getNewText, "text")
+      val locals = complete(original.replace("println(text)", "println(tex)"), "println(tex", 21)
+      assert(locals.exists(_.getFilterText == "text"), locals.toString)
+      val keywords = complete(original.replace("println(text)", "val next = tr"), "val next = tr", 22)
+      assert(keywords.exists(i => i.getFilterText == "true" && i.getKind == CompletionItemKind.Keyword), keywords.toString)
+    } finally change(original, 23)
+  }
+
+  test("a newer edit cancels a queued completion instead of returning stale items") {
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    val pending = scalapsihost.HostLock.write {
+      val request = implementation.getTextDocumentService.completion(new CompletionParams(document(main), new Position(6, 50)))
+      implementation.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
+        new VersionedTextDocumentIdentifier(main.toUri.toString, 24),
+        java.util.List.of(new TextDocumentContentChangeEvent(original))))
+      request
+    }
+    val error = intercept[java.util.concurrent.ExecutionException](pending.get(1, TimeUnit.MINUTES))
+    error.getCause match {
+      case cancelled: org.eclipse.lsp4j.jsonrpc.ResponseErrorException =>
+        assertEquals(cancelled.getResponseError.getCode, org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestCancelled.getValue)
+      case other => fail(s"completion was not cancelled: $other")
+    }
+    val current = implementation.getTextDocumentService.completion(new CompletionParams(document(main), new Position(6, 50)))
+      .get(1, TimeUnit.MINUTES)
+    assert(current.getRight.getItems.asScala.exists(_.getFilterText == "text"), current.toString)
   }
 
   private def filesChanged(changes: (Path, FileChangeType)*): Unit = {
