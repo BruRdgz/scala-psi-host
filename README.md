@@ -171,7 +171,9 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
 - `oracle.ProjectHighlighting <project> <report.md> [--plugin-errors]` — highlights a whole BSP project and reports
   errors, timings, heap and a class histogram; a file whose highlighting logged errors (a failed annotator) is not
   counted as clean. On a 522-file Scala 3 project: no errors with compiler errors (the
-  default), 81 with the plugin's type-aware checks (the same the IDE shows in its built-in mode).
+  default), 81 with the plugin's type-aware checks (the same the IDE shows in its built-in mode). On korolev v1.5.0
+  (Scala 2.13, 88 modules, 176 files, two versions of zio and cats-effect; its sbt 1.6.2 needs JDK 17) with
+  `--plugin-errors`: the 12 errors of the plugin's `KorolevProjectHighlightingTest`, at the same ranges, and none other.
 
 - `oracle.CompletionOracle <intellij-scala> <report.md>` — the plugin's completion tests: file fixtures, keyword
   completion, auto-import and the `completion3` test methods (parsed with the host's PSI; the resulting text after

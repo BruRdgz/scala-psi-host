@@ -31,7 +31,7 @@ The change engine and the formatter (beta 1), completion, signature help and the
 ## Alpha 2 — read-only features, and the gaps of alpha 1
 
 - The memory held per edit (`SessionBenchmark --edit-file`, about 0.3 MB per edit): locate it and let it go.
-- A real Scala 2 project as an acceptance test.
+- A real Scala 2 project as an acceptance test. **Done:** korolev v1.5.0 agrees with the plugin's own project test.
 
 ## Alpha 3 — project-wide search
 

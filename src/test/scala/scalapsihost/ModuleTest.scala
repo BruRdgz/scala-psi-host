@@ -1,6 +1,8 @@
 package scalapsihost
 
 import com.intellij.lang.annotation.HighlightSeverity
+import org.jetbrains.plugins.scala.caches.ScalaShortNamesCacheManager
+import org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiElementFactory
 
 import java.nio.file.Path
 
@@ -53,5 +55,38 @@ class ModuleTest extends munit.FunSuite {
       assertEquals(errorsIn(client, clientSource), Seq.empty)
       assertEquals(errorsIn(scala213, clientSource), Seq("Cannot resolve symbol lib"))
     } finally host.closeSource(libFile)
+  }
+
+  test("a package in an unrelated module does not shadow a library package") {
+    val unrelated = host.addModule(ModuleSpec("unrelated-package", "2.13.18", Seq.empty, Seq(library213)))
+    val hidden = host.openFile(Path.of("/unrelated/Hidden.scala"),
+      "package visibility.scala.child\nclass Hidden", unrelated)
+    try assertEquals(errorsIn(scala213, "package visibility\nobject Client { val xs = scala.List(1) }"), Seq.empty)
+    finally host.closeSource(hidden)
+  }
+
+  test("library signatures resolve against their own Scala version") {
+    val modules = Seq(scala213, scala212, scala213)
+    host.read {
+      val cache = ScalaShortNamesCacheManager.getInstance(using host.project)
+      for (module <- modules) {
+        val list = cache.getClassByFQName("scala.collection.immutable.List", host.modules.resolveScope(module))
+        val signature = ScalaPsiElementFactory.createTypeElementFromText("scala.collection.immutable.List[Int]", list, null)
+        val fromSignature = cache.getClassByFQName("scala.collection.immutable.List", signature.getResolveScope)
+        assertEquals(fromSignature.getContainingFile.getVirtualFile, list.getContainingFile.getVirtualFile)
+      }
+    }
+  }
+
+  test("a module's compile classpath replaces dependency library versions") {
+    val dependency = scala212
+    val client = host.addModule(ModuleSpec("resolved-classpath", "2.13.18", Seq.empty, Seq(library213),
+      dependsOn = Seq(dependency.spec.name)))
+    host.read {
+      val cache = ScalaShortNamesCacheManager.getInstance(using host.project)
+      val inClient = cache.getClassesByFQName("scala.collection.immutable.List", host.modules.resolveScope(client))
+      val in213 = cache.getClassesByFQName("scala.collection.immutable.List", host.modules.resolveScope(scala213))
+      assertEquals(inClient.map(_.getContainingFile.getVirtualFile).toSet, in213.map(_.getContainingFile.getVirtualFile).toSet)
+    }
   }
 }

@@ -55,6 +55,7 @@ final class ModuleModel(project: Project) {
     if (missing.nonEmpty) throw new IllegalArgumentException(s"module ${hostModule.spec.name} depends on unknown modules: ${missing.mkString(", ")}")
     if (modules.putIfAbsent(hostModule.spec.name, hostModule) != null)
       throw new IllegalArgumentException(s"module ${hostModule.spec.name} already exists")
+    libraryScopes.clear()
   }
 
   /** Removes a module whose sources were removed; modules that depend on it must be removed or added again too. */
@@ -63,6 +64,7 @@ final class ModuleModel(project: Project) {
     if (!removed.sources.isEmpty) throw new IllegalStateException(s"module $name still has sources")
     // Scopes of the modules that depend on it reach it.
     scopes.clear()
+    libraryScopes.clear()
   }
 
   private[scalapsihost] def addSource(file: VirtualFile, hostModule: HostModule): Unit = {
@@ -84,13 +86,32 @@ final class ModuleModel(project: Project) {
   // One scope object per module, as the IDE's ModuleWithDependenciesScope: the plugin keys its caches by scope,
   // so a new object per request would make every lookup miss and the caches grow without bound.
   private val scopes = new ConcurrentHashMap[HostModule, GlobalSearchScope]()
+  // Each library root's scope, asked for on every resolve from a library class: found once, None outside modules.
+  private val libraryScopes = new ConcurrentHashMap[VirtualFile, Option[GlobalSearchScope]]()
 
-  def resolveScope(hostModule: HostModule): GlobalSearchScope = scopes.computeIfAbsent(hostModule, newScope)
+  def resolveScope(hostModule: HostModule): GlobalSearchScope =
+    scopes.computeIfAbsent(hostModule, module => newScope(Seq(module)))
+
+  /**
+   * Where `file` resolves: a source in its module's scope, a library's class in the scope of the modules that have
+   * it, as the IDE's library scope; the JDK and libraries no module has are in none.
+   */
+  def resolveScope(file: VirtualFile): Option[GlobalSearchScope] = file match {
+    case library: LibraryFile => libraryScopes.computeIfAbsent(library.root, libraryScope)
+    case source => ofFile(source).map(resolveScope)
+  }
+
+  private def libraryScope(root: VirtualFile): Option[GlobalSearchScope] = {
+    val owners = all.filter(_.libraryRoots.contains(root))
+    Option.when(owners.nonEmpty)(newScope(owners))
+  }
 
   // A module's dependencies are fixed when it is added; its sources and the JDK roots are read on each check.
-  private def newScope(hostModule: HostModule): GlobalSearchScope = new GlobalSearchScope(project) {
-    private val reachable = withDependencies(hostModule)
-    private val roots = reachable.flatMap(_.libraryRoots).toSet
+  private def newScope(owners: Seq[HostModule]): GlobalSearchScope = new GlobalSearchScope(project) {
+    private val reachable = owners.flatMap(withDependencies).distinct
+    // A module's classpath is the build's resolved one, transitive jars included: the jars of the modules it depends on
+    // may be versions that resolution replaced (zio 1 for a module on zio 2), so only its own are reachable.
+    private val roots = owners.flatMap(_.libraryRoots).toSet
 
     override def contains(file: VirtualFile): Boolean = file match {
       case library: LibraryFile => roots.contains(rootOf(library)) || jdkRoots.contains(rootOf(library))
@@ -98,7 +119,7 @@ final class ModuleModel(project: Project) {
     }
     override def isSearchInModuleContent(module: Module): Boolean = reachable.exists(_.module eq module)
     override def isSearchInLibraries: Boolean = true
-    override def toString: String = s"ModuleWithDependencies(${hostModule.spec.name})"
+    override def toString: String = s"ModuleWithDependencies(${owners.map(_.spec.name).mkString(", ")})"
   }
 
   private def rootOf(file: VirtualFile): VirtualFile = {

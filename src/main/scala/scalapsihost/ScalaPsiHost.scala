@@ -32,6 +32,7 @@ import com.intellij.psi.{FileViewProvider, LanguageFileViewProviders, PsiClass, 
 import com.intellij.psi.presentation.java.{ClassPresentationProvider, FieldPresentationProvider}
 import com.intellij.psi.stubs.{LanguageStubDefinition, StubElementRegistryService, StubRegistryExtension}
 import com.intellij.psi.util.PsiModificationTracker
+import com.intellij.psi.impl.source.resolve.FileContextUtil
 import com.intellij.util.messages.impl.MessageBusFactoryImpl
 import org.jetbrains.plugins.scala.codeInsight.ScalaCodeInsightSettings
 import org.jetbrains.plugins.scala.externalLibraries.bm4.BetterMonadicForSupport
@@ -1250,13 +1251,13 @@ object ScalaPsiHost {
       m
     }
     projectServices.register(classOf[com.intellij.psi.impl.ResolveScopeManager])(new Host_ResolveScopeManager(dispatch {
-      // A module's files resolve in the module's scope; files outside modules (light files, library classes) see
-      // everything.
+      // Sources resolve in their module, library classes in the modules that have the library, anything else everywhere.
       case ("ResolveScopeManager.getResolveScope" | "ResolveScopeManager.getUseScope", Array(e: com.intellij.psi.PsiElement)) =>
-        val file = Option(e.getContainingFile).map(_.getOriginalFile.getViewProvider.getVirtualFile)
-        file.flatMap(moduleModel.ofFile).map(moduleModel.resolveScope).getOrElse(everythingScope)
+        // Stub types and other synthetic files carry their declaration's context, as ResolveScopeManagerImpl follows.
+        val file = Option(FileContextUtil.getContextFile(e)).map(_.getOriginalFile.getViewProvider.getVirtualFile)
+        file.flatMap(moduleModel.resolveScope).getOrElse(everythingScope)
       case ("ResolveScopeManager.getDefaultResolveScope", Array(f: VirtualFile)) =>
-        moduleModel.ofFile(f).map(moduleModel.resolveScope).getOrElse(everythingScope)
+        moduleModel.resolveScope(f).getOrElse(everythingScope)
     }))
     // Index-backed Scala symbol lookup: the real class, answered by the host's StubIndex.
     projectServices.register(classOf[org.jetbrains.plugins.scala.caches.ScalaShortNamesCacheManager])(

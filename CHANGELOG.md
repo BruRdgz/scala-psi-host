@@ -20,6 +20,10 @@
   state (`scalaPsiHost/state`) and a status report (`scalaPsiHost/status`). The VS Code extension shows the state in
   the status bar and has *Show Status* and *Show Log File* commands.
 - Memory: the platform's reparse copies of edited files are no longer kept.
+- Resolution as the IDE's scopes: a module sees its own resolved classpath (not the replaced library versions of the
+  modules it depends on), a library's classes resolve in the modules that have the library, synthetic files keep
+  their declaration's scope, and packages that sources declare do not leak other modules' subpackages. On korolev the
+  host agrees with the plugin's project test.
 - Lifecycle: the server ends with its client (its input ending, or its process exiting when the server can see it)
   and leaves the build's sbt server running for its other clients.
 - Formatting and completion's insert handlers no longer stop the other requests: they change a copy of the file
