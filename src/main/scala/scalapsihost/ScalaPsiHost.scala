@@ -1,6 +1,7 @@
 package scalapsihost
 
 import com.intellij.codeInsight.daemon.impl.{AnnotationHolderImpl, AnnotationSessionImpl}
+import com.intellij.codeInsight.intention.preview.IntentionPreviewUtils
 import com.intellij.core.{CoreApplicationEnvironment, CoreFileTypeRegistry}
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
@@ -416,6 +417,10 @@ object ScalaPsiHost {
     }
     lazy val appBus = MessageBusFactoryImpl.createRootBus(busOwner)
     lazy val area: ExtensionsAreaImpl = new ExtensionsAreaImpl(app)
+    // As IntentionPreviewUtils.write: a preview changes only its thread's nonphysical copy.
+    def runWriteAction[T](body: => T): T =
+      if (IntentionPreviewUtils.isIntentionPreviewActive) body else HostLock.write(body)
+
     // ApplicationEx, the interface the IDE's application implements: platform utilities cast to it.
     lazy val app: Application = tableProxy(classOf[com.intellij.openapi.application.ex.ApplicationEx], "Application") {
       case ("getService", Array(c: Class[?])) => appServices.get(c)
@@ -446,9 +451,9 @@ object ScalaPsiHost {
       case ("assertWriteAccessAllowed", _) =>
         if (!HostLock.isWriting) throw new IllegalStateException("write access is allowed inside write actions only")
         null
-      case ("runWriteAction", Array(r: Runnable)) => HostLock.write(r.run()); null
-      case ("runWriteAction", Array(c: com.intellij.openapi.util.Computable[?])) => HostLock.write(c.compute()).asInstanceOf[AnyRef]
-      case ("runWriteAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) => HostLock.write(c.compute()).asInstanceOf[AnyRef]
+      case ("runWriteAction", Array(r: Runnable)) => runWriteAction(r.run()); null
+      case ("runWriteAction", Array(c: com.intellij.openapi.util.Computable[?])) => runWriteAction(c.compute()).asInstanceOf[AnyRef]
+      case ("runWriteAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) => runWriteAction(c.compute()).asInstanceOf[AnyRef]
       case ("assertIsNonDispatchThread" | "assertReadAccessNotAllowed", _) => null
       case ("isUnitTestMode", _) => java.lang.Boolean.valueOf(config.unitTestMode)
       case ("isInternal" | "isEAP" | "isDisposed", _) => java.lang.Boolean.FALSE

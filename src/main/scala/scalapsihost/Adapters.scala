@@ -45,7 +45,8 @@ final class HostLogger(category: String) extends com.intellij.openapi.diagnostic
 }
 
 /**
- * The host's read/write lock, the IDE's read and write actions: queries read concurrently, an edit writes alone.
+ * The host's read/write lock, the IDE's read and write actions: queries and copy changes read concurrently,
+ * an editor edit writes alone.
  * An edit first cancels the running queries (their progress indicators), as the IDE cancels background reads for a
  * pending write: the platform's and the plugin's code checks for cancellation as it works, so a query stops with
  * `ProcessCanceledException` and releases the lock. The lock is fair: queries started after a waiting edit wait
@@ -100,14 +101,6 @@ private[scalapsihost] object HostLock {
         listeners.foreach(_.afterWriteIntentReadActionFinished(action))
       }
     }
-  }
-
-  /** A copy modification is cancelled by an editor write just like a semantic read. */
-  def modification[T](body: => T): T = write {
-    val indicator = new com.intellij.openapi.progress.EmptyProgressIndicator
-    queries.add(indicator)
-    try com.intellij.openapi.progress.ProgressManager.getInstance.runProcess((() => body): com.intellij.openapi.util.Computable[T], indicator)
-    finally queries.remove(indicator)
   }
 
   /** An editor notification can cancel reads before its queued write acquires the documents thread. */

@@ -2,7 +2,9 @@ package scalapsihost
 
 import com.intellij.codeInsight.completion.*
 import com.intellij.codeInsight.completion.impl.CompletionSorterImpl
+import com.intellij.codeInsight.intention.preview.IntentionPreviewUtils
 import com.intellij.codeInsight.lookup.{Classifier, Lookup, LookupElement, LookupElementBuilder, LookupElementPresentation, LookupElementRenderer, WeighingContext}
+import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.editor.impl.DocumentImpl
 import com.intellij.openapi.progress.{ProcessCanceledException, ProgressManager}
 import com.intellij.openapi.util.{Disposer, TextRange}
@@ -87,7 +89,7 @@ object Completion {
    * the lookup string there, or the suggestion is gone.
    */
   def insert(file: ScalaFile, start: Int, prefixText: String, lookup: String, identity: String): Option[Inserted] =
-    HostLock.modification {
+    HostLock.query {
       val end = start + lookup.length
       val text = file.getText
       if (!text.startsWith(lookup, start)) None
@@ -108,7 +110,7 @@ object Completion {
    * string replaces the prefix, then its insert handler runs as on `completionChar`.
    */
   private[scalapsihost] def choose(file: ScalaFile, offset: Int, lookup: String, completionChar: Char): Inserted =
-    HostLock.modification {
+    HostLock.query {
       completionResults(file, file.getText, offset) { results =>
         val chosen = sort(results).find(_.getLookupElement.getAllLookupStrings.contains(lookup))
           .getOrElse(throw new IllegalArgumentException(s"no suggestion for $lookup"))
@@ -123,12 +125,12 @@ object Completion {
     val (changed, editor) = ChangeEngine.run(file) { copy =>
       val document = copy.getViewProvider.getDocument
       document.replaceString(prefix.getStartOffset, prefix.getEndOffset, element.getLookupString)
-      val editor = new RequestEditor(document, copy.getProject, prefix.getStartOffset + element.getLookupString.length)
+      val editor = IntentionPreviewUtils.getPreviewEditor
+      editor.getCaretModel.moveToOffset(prefix.getStartOffset + element.getLookupString.length)
       runHandler(copy, editor, element, results.map(_.getLookupElement).toArray, prefix.getStartOffset, completionChar)
       editor
     }
-    try Inserted(changed, editor.editor.getCaretModel.getOffset)
-    finally editor.close()
+    Inserted(changed, editor.getCaretModel.getOffset)
   }
 
   /**
@@ -136,11 +138,11 @@ object Completion {
    * lookup gives it: the offsets of the inserted string and of the identifier it ends in, the suggestions, and the
    * character that chose it.
    */
-  private def runHandler(copy: ScalaFile, editor: RequestEditor, element: LookupElement, elements: Array[LookupElement],
+  private def runHandler(copy: ScalaFile, editor: Editor, element: LookupElement, elements: Array[LookupElement],
                          start: Int, completionChar: Char): Unit = {
     val document = copy.getViewProvider.getDocument
-    val tail = editor.editor.getCaretModel.getOffset
-    val identifierEnd = CompletionInitializationContext.calcDefaultIdentifierEnd(editor.editor, tail)
+    val tail = editor.getCaretModel.getOffset
+    val identifierEnd = CompletionInitializationContext.calcDefaultIdentifierEnd(editor, tail)
     val offsets = new OffsetMap(document)
     offsets.addOffset(CompletionInitializationContext.START_OFFSET, start)
     offsets.addOffset(CompletionInitializationContext.SELECTION_END_OFFSET, tail)
@@ -148,7 +150,7 @@ object Completion {
     try {
       // Replacing (Tab) also removes the rest of the identifier the caret was in.
       if (completionChar == Lookup.REPLACE_SELECT_CHAR && identifierEnd > tail) document.deleteString(tail, identifierEnd)
-      val context = new InsertionContext(offsets, completionChar, elements, copy, editor.editor, false)
+      val context = new InsertionContext(offsets, completionChar, elements, copy, editor, false)
       context.commitDocument()
       element.handleInsert(context)
       // What a handler leaves for later is UI (a parameter info popup, a dialog): its edits are made, the UI is not.

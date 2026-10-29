@@ -7,6 +7,9 @@ import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import scalapsihost.TestHost.{applyEdits, choose}
 
 import java.nio.file.Path
+import java.util.concurrent.{CountDownLatch, TimeUnit}
+import scala.concurrent.{Await, ExecutionContext, Future}
+import scala.concurrent.duration.Duration
 
 /**
  * Editing as an editor does it: a change to one file's text is reparsed in place and reaches every query that
@@ -266,7 +269,33 @@ class EditingTest extends munit.FunSuite {
     } finally host.closeSource(file)
   }
 
-  test("a newer edit cancels a copy modification and releases its write lock") {
+  test("formatting a copy completes while another thread holds a read") {
+    val text = "object Concurrent { val n=1+2 }\n"
+    val file = scalaFile("Concurrent", text)
+    val started = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
+    val reader = Future {
+      HostLock.readLocked {
+        started.countDown()
+        release.await()
+      }
+    }(using ExecutionContext.global)
+    try {
+      assert(started.await(30, TimeUnit.SECONDS), "the read did not start")
+      val formatting = Future {
+        ChangeEngine.format(file, None, 2, useTabs = false)
+      }(using ExecutionContext.global)
+      val result = Await.result(formatting, Duration(5, "s"))
+      assertEquals(result.text, "object Concurrent {\n  val n = 1 + 2\n}\n")
+      assertEquals(applyEdits(text, result.edits), result.text)
+    } finally {
+      release.countDown()
+      Await.result(reader, Duration(30, "s"))
+      host.closeSource(file)
+    }
+  }
+
+  test("a newer edit cancels a copy modification and releases its read lock") {
     val file = host.openFile(Path.of("/editing/Cancelled.scala"), "object Cancelled\n", module) match {
       case f: ScalaFile => f
       case other => fail(s"not Scala: $other")

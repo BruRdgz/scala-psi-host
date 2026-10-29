@@ -18,6 +18,8 @@
 - Memory: the platform's reparse copies of edited files are no longer kept.
 - Lifecycle: the server ends with its client (its input ending, or its process exiting when the server can see it)
   and leaves the build's sbt server running for its other clients.
+- Formatting and completion's insert handlers no longer stop the other requests: they change a copy of the file
+  under a read, as the IDE's intention preview does.
 
 ## 0.1.0-a1 — 2026-10-28
 

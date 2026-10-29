@@ -1,5 +1,6 @@
 package scalapsihost.oracle
 
+import com.intellij.codeInsight.intention.preview.IntentionPreviewUtils
 import com.intellij.psi.util.PsiTreeUtil
 import org.eclipse.lsp4j.CompletionItemKind
 import org.jetbrains.plugins.scala.LatestScalaVersions
@@ -11,7 +12,7 @@ import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScTypeDefinition
 import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunctionDefinition
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScClass
-import scalapsihost.{CallLog, ChangeEngine, Completion, RequestEditor, HostConfig, HostDispatchThread, HostLog, HostModule, ModuleSpec, ScalaPsiHost, TestHost}
+import scalapsihost.{CallLog, ChangeEngine, Completion, HostConfig, HostDispatchThread, HostLog, HostModule, ModuleSpec, ScalaPsiHost, TestHost}
 
 import java.io.File
 import java.nio.file.{Files, Path}
@@ -317,9 +318,9 @@ object CompletionOracle {
       val fix = ScalaImportTypeFix(reference)
       val candidates = fix.elements
       require(candidates.nonEmpty, "no import candidate")
-      Using.resource(new RequestEditor(copy.getViewProvider.getDocument, copy.getProject, offset)) { editor =>
-        fix.createAddImportAction(editor.editor).addImportTestOnly(candidates.head)
-      }
+      val editor = IntentionPreviewUtils.getPreviewEditor
+      editor.getCaretModel.moveToOffset(offset)
+      fix.createAddImportAction(editor).addImportTestOnly(candidates.head)
     }._1)
     HostDispatchThread.invokeAndWait(change)
     change.get()

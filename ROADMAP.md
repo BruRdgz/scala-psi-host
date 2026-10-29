@@ -25,8 +25,6 @@ agrees with the host, and the cases that do not agree are explained in the READM
 The change engine and the formatter (beta 1), and completion, signature help and the request-local `Editor`
 (beta 2) exist; their gaps are in the README's known limitations. Next, from the review of that work:
 
-- Copy changes under a read with an intention-preview session, as the platform does, instead of the write lock;
-  release a copy whose change fails early.
 - Inlay hints (parameter names, types, implicit and `using` arguments): the plugin's hints pass needs a platform
   module (hints filtering) that is not among the host's dependencies.
 - Scala 3 fixtures in the completion and parameter info oracles; file templates (override completion); live

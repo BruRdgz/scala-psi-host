@@ -10,8 +10,8 @@ import com.intellij.psi.impl.{BlockSupportImpl, BooleanRunnable, ChangedPsiRange
 import scala.jdk.CollectionConverters.*
 
 /**
- * Document commits as the IDE's DocumentCommitThread makes them, synchronously only (the host commits on the editing
- * thread, inside its write action): for each PSI file of the document, the range that changed since the last commit
+ * Document commits as the IDE's DocumentCommitThread makes them, synchronously only: editor documents commit under
+ * the write lock, preview copies under a read. For each PSI file, the range that changed since the last commit
  * is reparsed, and the resulting difference is applied to the existing tree, which sends the tree change events.
  */
 final class HostDocumentCommitProcessor extends DocumentCommitProcessor {

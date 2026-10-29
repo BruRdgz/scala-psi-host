@@ -153,7 +153,6 @@ final class ProjectSession private (
       : Option[CompletionFollowUp] =
     file(path) match {
       case f: ScalaFile =>
-        // The position is read before the insertion takes the write lock of its copy.
         val startOffset = host.read(offset(document(f), start))
         host.insertCompletion(f, startOffset, prefixText, lookup, identity).map { inserted =>
           val changes = host.read(inserted.result.edits.map(textChange(document(f), _)))
@@ -167,7 +166,6 @@ final class ProjectSession private (
   def formatting(path: Path, range: Option[(LineColumn, LineColumn)], indentSize: Int, useTabs: Boolean): Seq[TextChange] =
     file(path) match {
       case f: ScalaFile =>
-        // Positions are read before formatting takes the write lock of its copy.
         val selected = host.read(range.map((start, end) => new TextRange(offset(document(f), start), offset(document(f), end))))
         val edits = host.formatting(f, selected, indentSize, useTabs)
         host.read(edits.map(textChange(document(f), _)))
