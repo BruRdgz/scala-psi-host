@@ -21,7 +21,9 @@ import com.intellij.openapi.project.{DumbModeTask, DumbService, Project}
 import com.intellij.openapi.util.{Disposer, Key, UserDataHolderBase}
 import com.intellij.openapi.util.registry.Registry
 import com.intellij.openapi.vfs.VirtualFile
-import com.intellij.psi.{FileViewProvider, LanguageFileViewProviders, PsiManager}
+import com.intellij.navigation.ItemPresentationProviders
+import com.intellij.psi.{FileViewProvider, LanguageFileViewProviders, PsiClass, PsiField, PsiManager}
+import com.intellij.psi.presentation.java.{ClassPresentationProvider, FieldPresentationProvider}
 import com.intellij.psi.stubs.{LanguageStubDefinition, StubElementRegistryService, StubRegistryExtension}
 import com.intellij.psi.util.PsiModificationTracker
 import com.intellij.util.messages.impl.MessageBusFactoryImpl
@@ -770,6 +772,10 @@ object ScalaPsiHost {
     LanguageParserDefinitions.INSTANCE.addExplicitExtension(com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.lang.java.JavaParserDefinition)
     // Java's typed leaves (PsiIdentifier, PsiKeyword, ...): Java PSI casts its tokens to them.
     LanguageASTFactory.INSTANCE.addExplicitExtension(com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.psi.impl.source.tree.JavaASTFactory)
+    // Java classes and fields describe themselves through these (getPresentation): completion shows a library class
+    // after `new` with its package.
+    ItemPresentationProviders.INSTANCE.addExplicitExtension(classOf[PsiClass], new ClassPresentationProvider)
+    ItemPresentationProviders.INSTANCE.addExplicitExtension(classOf[PsiField], new FieldPresentationProvider)
     com.intellij.platform.syntax.psi.LanguageSyntaxDefinitions.getINSTANCE.addExplicitExtension(
       com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.java.frontback.psi.impl.syntax.JavaSyntaxDefinitionExtension)
     com.intellij.platform.syntax.psi.ElementTypeConverters.getInstance.addExplicitExtension(

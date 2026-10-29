@@ -4,7 +4,7 @@ import com.intellij.codeInsight.completion.*
 import com.intellij.codeInsight.completion.impl.CompletionSorterImpl
 import com.intellij.codeInsight.lookup.{Classifier, Lookup, LookupElement, LookupElementBuilder, LookupElementPresentation, LookupElementRenderer, WeighingContext}
 import com.intellij.openapi.editor.impl.DocumentImpl
-import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.{ProcessCanceledException, ProgressManager}
 import com.intellij.openapi.util.{Disposer, TextRange}
 import com.intellij.psi.*
 import com.intellij.psi.impl.PsiManagerEx
@@ -25,6 +25,7 @@ import scalapsihost.ChangeEngine.Edit
 
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
+import scala.util.control.NonFatal
 
 /**
  * BASIC completion as the IDE runs it: the plugin's contributors complete a copy of the file with a dummy identifier
@@ -90,8 +91,8 @@ object Completion {
         val handled = ranked.map(result => result -> handling(result.getLookupElement))
         val previewed = handled.collect { case (result, Handling.Preview) => result }.take(previews).toSet
         val suggestions = handled.flatMap {
-          case (result, Handling.Plain) => Some(suggestion(result, plainInsertion(result, offset)))
-          case (result, Handling.Preview) if previewed(result) => preview(file, offset, result, elements).map(suggestion(result, _))
+          case (result, Handling.Plain) => rendered(result, plainInsertion(result, offset))
+          case (result, Handling.Preview) if previewed(result) => preview(file, offset, result, elements).flatMap(rendered(result, _))
           case (_, Handling.Preview) => skipped("previewBudget")
           case (_, Handling.Unsupported(reason)) => skipped(reason)
         }
@@ -121,6 +122,16 @@ object Completion {
     CallLog.hit(s"Completion.skipped.$reason")
     None
   }
+
+  /** A suggestion the plugin fails to render is logged and left out: the others still make a list. */
+  private def rendered(result: CompletionResult, insertion: Insertion): Option[Suggestion] =
+    try Some(suggestion(result, insertion))
+    catch {
+      case e: ProcessCanceledException => throw e
+      case NonFatal(e) =>
+        HostLog.error(s"rendering the suggestion ${result.getLookupElement.getLookupString} failed", e)
+        skipped("renderingFailed")
+    }
 
   private def suggestion(result: CompletionResult, insertion: Insertion): Suggestion = {
     val element = result.getLookupElement

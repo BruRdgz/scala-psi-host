@@ -93,6 +93,17 @@ class EditingTest extends munit.FunSuite {
     } finally host.closeSource(file)
   }
 
+  test("completion after `new` presents library Java classes") {
+    val text = "object AfterNew { val t = new Threa; val l = new java.util.ArrayLi }"
+    val file = host.openFile(Path.of("/editing/AfterNew.scala"), text, module).asInstanceOf[ScalaFile]
+    try {
+      for ((prefix, name) <- Seq("new Threa" -> "Thread", "new java.util.ArrayLi" -> "ArrayList")) {
+        val result = host.completion(file, text.indexOf(prefix) + prefix.length)
+        assert(result.items.exists(_.filterText == name), s"$prefix: $result")
+      }
+    } finally host.closeSource(file)
+  }
+
   test("completion preserves overloads and deprecation, and inserts classes through import and constructor handlers") {
     val hidden = host.openFile(Path.of("/editing/Hidden.scala"), "package hidden\nclass ZebraUnimported", module)
     val text = "package visible\nobject Lookup { @deprecated(\"old\", \"1\") def message(n: Int): String = \"\"; " +
