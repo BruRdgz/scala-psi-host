@@ -81,10 +81,12 @@ final class ScalaPsiHost private (
   /** Cancels reads for an editor change already received but still waiting in the server's queue. */
   private[scalapsihost] def cancelReads(): Unit = HostLock.cancelQueries()
 
-  /** BASIC completion runs under the same cancellable read as other semantic queries. */
-  def completion(file: ScalaFile, offset: Int): org.eclipse.lsp4j.CompletionList = HostLock.query {
-    Completion.complete(file, offset)
-  }
+  /** Completion may preview insert handlers, so it enters the copy engine outside a semantic read. */
+  def completion(file: ScalaFile, offset: Int, options: Completion.Options = Completion.Options()): org.eclipse.lsp4j.CompletionList =
+    Completion.complete(file, offset, options = options)
+
+  def resolveCompletion(file: ScalaFile, item: org.eclipse.lsp4j.CompletionItem, version: Int): org.eclipse.lsp4j.CompletionItem =
+    Completion.resolve(file, item, version)
 
   /** Formatting returns edits against the current snapshot while leaving project PSI untouched. */
   def formatting(file: ScalaFile, range: Option[TextRange], options: org.eclipse.lsp4j.FormattingOptions): Seq[org.eclipse.lsp4j.TextEdit] =
@@ -503,6 +505,23 @@ object ScalaPsiHost {
     registerCompletionBeans("com.intellij.weigher", PlatformCompletionWeighers, new DefaultPluginDescriptor(PluginId.getId("com.intellij")))
     for (name <- Seq("com.intellij.modcompletion.completionItemProvider", "com.intellij.modcompletion.completionItemFilter"))
       CoreApplicationEnvironment.registerExtensionPoint(area, name, classOf[LanguageExtensionPoint[?]])
+    // These popup requests are optional UI hints; recording intent leaves the synchronous insertion valid without a popup.
+    projectServices.register(classOf[com.intellij.codeInsight.AutoPopupController])(new com.intellij.codeInsight.AutoPopupController {
+      override def autoPopupParameterInfo(editor: com.intellij.openapi.editor.Editor, element: com.intellij.psi.PsiElement): Unit =
+        CallLog.hit("Completion.popup.parameterInfo")
+      override def scheduleAutoPopup(editor: com.intellij.openapi.editor.Editor, kind: com.intellij.codeInsight.completion.CompletionType,
+                                    condition: com.intellij.openapi.util.Condition[? >: PsiFile]): Unit =
+        CallLog.hit("Completion.popup.completion")
+      override def autoPopupMemberLookup(editor: com.intellij.openapi.editor.Editor,
+                                        condition: com.intellij.openapi.util.Condition[? >: PsiFile]): Unit =
+        scheduleAutoPopup(editor, com.intellij.codeInsight.completion.CompletionType.BASIC, condition)
+      override def autoPopupMemberLookup(editor: com.intellij.openapi.editor.Editor, kind: com.intellij.codeInsight.completion.CompletionType,
+                                        condition: com.intellij.openapi.util.Condition[? >: PsiFile]): Unit =
+        scheduleAutoPopup(editor, kind, condition)
+      override def cancelAllRequests(): Unit = CallLog.unsupported("AutoPopupController.cancelAllRequests")
+      override def waitForDelayedActions(timeout: Long, unit: java.util.concurrent.TimeUnit): Unit =
+        CallLog.unsupported("AutoPopupController.waitForDelayedActions")
+    })
     appServices.register(classOf[com.intellij.codeInsight.completion.CompletionService])(new Completion.Service)
     appServices.register(classOf[com.intellij.codeInsight.CodeInsightSettings])(new com.intellij.codeInsight.CodeInsightSettings)
     // Lookup presentation checks test-class icons; no test-framework integrations are installed in the host.
@@ -721,12 +740,17 @@ object ScalaPsiHost {
     appServices.register(classOf[com.intellij.openapi.application.TransactionGuard])(new com.intellij.openapi.application.TransactionGuardImpl)
     // Annotations carry their quick fixes, which the platform wraps as intentions when the annotation is created.
     appServices.register(classOf[com.intellij.modcommand.ModCommandService])(new com.intellij.lang.impl.modcommand.ModCommandServiceImpl)
-    // References that string literals and doc comments get from contributors (in the IDE, file paths and URLs in
-    // text). The plugin's contributors are not loaded: those references serve navigation from text, not the
-    // language server's features, and file paths would need the IDE's file-reference layer.
+    // Interpolation references give completion its Scala prefix inside plain strings; file paths and URL providers need IDE navigation.
     appServices.register(classOf[com.intellij.psi.PsiReferenceService])(new com.intellij.psi.PsiReferenceServiceImpl)
-    appServices.register(classOf[com.intellij.psi.impl.source.resolve.reference.ReferenceProvidersRegistry])(
-      new com.intellij.psi.impl.source.resolve.reference.ReferenceProvidersRegistryImpl)
+    appServices.register(classOf[com.intellij.psi.impl.source.resolve.reference.ReferenceProvidersRegistry]) {
+      val registry = new com.intellij.psi.impl.source.resolve.reference.ReferenceProvidersRegistryImpl
+      val provider = newPrivate(Class.forName("org.jetbrains.plugins.scala.lang.references.InterpolatedStringReferenceProvider")
+        .asSubclass(classOf[com.intellij.psi.PsiReferenceProvider]))
+      registry.getRegistrar(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE).registerReferenceProvider(
+        com.intellij.patterns.PlatformPatterns.psiElement(classOf[org.jetbrains.plugins.scala.lang.psi.api.base.literals.ScStringLiteral]),
+        provider, com.intellij.psi.PsiReferenceRegistrar.DEFAULT_PRIORITY, root)
+      registry
+    }
     // Java module (JPMS) accessibility: the host has no module-info graph (its modules come from the build), so the
     // platform's graph-less implementation, which treats every class as accessible.
     appServices.register(classOf[com.intellij.psi.JavaModuleGraphHelper])(new com.intellij.psi.DumbJavaModuleGraphHelper)
@@ -1133,6 +1157,7 @@ object ScalaPsiHost {
     // No language injection in the host: every file is its own top-level file.
     projectServices.register(classOf[com.intellij.lang.injection.InjectedLanguageManager])(new Host_InjectedLanguageManager(dispatch {
       case ("InjectedLanguageManager.getTopLevelFile", Array(e: com.intellij.psi.PsiElement)) => e.getContainingFile
+      case ("InjectedLanguageManager.findInjectedElementAt", _) => null
       case ("InjectedLanguageManager.isInjectedViewProvider", _) => java.lang.Boolean.FALSE
       case ("InjectedLanguageManager.getCachedInjectedDocumentsInRange", _) => java.util.List.of()
       // There are no registered injectors, so enumeration has no injected fragments to visit.

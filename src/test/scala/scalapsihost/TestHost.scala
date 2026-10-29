@@ -44,6 +44,9 @@ object TestHost {
     host.openSource(scenarioSource)
   }
 
+  private lazy val completionModule = host.addModule(ModuleSpec("surface-completion", "2.13.18", Seq.empty,
+    Seq(Path.of(property("scalapsihost.fixture.scalaLibrary")))))
+
   def scenarioFile(): ScalaFile = scenario
 
   def references(file: ScalaFile): Seq[ScReferenceExpression] =
@@ -64,6 +67,41 @@ object TestHost {
     }
     host.completion(file, scenarioSource.indexOf("inc(b)") + "inc".length)
     host.completion(file, scenarioSource.indexOf("x + 1") + "x +".length)
+    val completionSource = "object InsertScenario { val x: ArrayBuff = ???; def invoke(n: Int): Unit = (); inv }"
+    val completionFile = host.openFile(Path.of("/surface/Insert.scala"), completionSource, completionModule) match {
+      case f: ScalaFile => f
+      case other => throw new IllegalStateException(s"not a Scala scenario: $other")
+    }
+    try {
+      val options = Completion.Options(snippets = true, resolve = true)
+      val items = host.completion(completionFile, completionSource.indexOf("ArrayBuff") + "ArrayBuff".length, options).getItems.asScala
+      items.find(i => i.getFilterText == "ArrayBuffer" && i.getData != null).foreach(host.resolveCompletion(completionFile, _, 0))
+      host.completion(completionFile, completionSource.indexOf("; inv") + "; inv".length)
+      host.edit(completionFile, 0, completionSource.length, completionSource.replace("ArrayBuff", "ArrayBuffer"))
+      host.edit(completionFile, 0, host.read(completionFile.getTextLength), completionSource)
+      host.diagnostics(completionFile)
+    } finally host.closeSource(completionFile)
+    for ((text, prefix) <- Seq(
+      ("object StringScenario { val member = 1; val s = \"$mem\" }", "$mem"),
+      ("object KeywordScenario {\n  val n = 1\n  n mat\n}", "mat"),
+      ("trait ImplementScenario { def run(): Unit }; object Use { new ImplementScen }", "ImplementScen"),
+      ("object ConstructorScenario { val value = new ArrayBuff }", "ArrayBuff"))) {
+      val source = host.openSource(text)
+      try host.completion(source, text.lastIndexOf(prefix) + prefix.length)
+      finally host.closeSource(source)
+    }
+    val settingsManager = com.intellij.psi.codeStyle.CodeStyleSettingsManager.getInstance(host.project)
+    val settings = host.read(settingsManager.getCurrentSettings.clone())
+    settings.getCustomSettings(classOf[org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings])
+      .setImportsWithPrefix(Array("scala.collection.mutable._"))
+    val prefixedText = "object PrefixScenario { val value = new ArrayBuff }"
+    val prefixed = host.openFile(Path.of("/surface/Prefix.scala"), prefixedText, completionModule) match {
+      case f: ScalaFile => f
+      case other => throw new IllegalStateException(s"not a Scala scenario: $other")
+    }
+    try settingsManager.computeWithLocalSettings(settings, _ =>
+      host.completion(prefixed, prefixedText.indexOf("ArrayBuff") + "ArrayBuff".length))
+    finally host.closeSource(prefixed)
     host.formatting(file, None, new org.eclipse.lsp4j.FormattingOptions(2, true))
     val importFile = host.parse("object ImportUser { val x: scala.collection.mutable.HashSet[Int] = ??? }")
     val target = host.read {

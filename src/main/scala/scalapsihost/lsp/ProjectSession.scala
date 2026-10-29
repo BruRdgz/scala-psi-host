@@ -110,12 +110,16 @@ final class ProjectSession private (
 
   def text(path: Path): String = host.read(file(path).getText)
 
-  /** Scala completion preserves the file's module context and uses the host's cancellable read. */
-  def completion(path: Path, at: LineColumn): org.eclipse.lsp4j.CompletionList = host.read {
-    file(path) match {
-      case f: ScalaFile => host.completion(f, offset(document(f), at))
-      case _ => new org.eclipse.lsp4j.CompletionList(false, java.util.List.of())
-    }
+  /** Positions are read before completion acquires its copy-modification scope. */
+  def completion(path: Path, at: LineColumn, options: scalapsihost.Completion.Options = scalapsihost.Completion.Options())
+      : org.eclipse.lsp4j.CompletionList = file(path) match {
+    case f: ScalaFile => host.completion(f, host.read(offset(document(f), at)), options)
+    case _ => new org.eclipse.lsp4j.CompletionList(false, java.util.List.of())
+  }
+
+  def resolveCompletion(path: Path, item: org.eclipse.lsp4j.CompletionItem, version: Int): org.eclipse.lsp4j.CompletionItem = file(path) match {
+    case f: ScalaFile => host.resolveCompletion(f, item, version)
+    case _ => throw new IllegalArgumentException("completion resolve requires a Scala source")
   }
 
   /** Copy modifications acquire their own write scope after positions have been read. */

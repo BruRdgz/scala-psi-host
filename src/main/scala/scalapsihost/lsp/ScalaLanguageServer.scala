@@ -46,6 +46,7 @@ final class ScalaLanguageServer(
 
   @volatile private var client: LanguageClient = scala.compiletime.uninitialized
   private var clientLog: Option[AutoCloseable] = None
+  @volatile private var completionOptions = scalapsihost.Completion.Options()
   @volatile private var watchesFiles = false
   @volatile private var reportsProgress = false
   @volatile private var state = new HostProtocol.ServerState("starting", "waiting for the client")
@@ -129,6 +130,12 @@ final class ScalaLanguageServer(
     watchesFiles = offered.flatMap(c => Option(c.getWorkspace)).flatMap(w => Option(w.getDidChangeWatchedFiles))
       .flatMap(w => Option(w.getDynamicRegistration)).exists(_.booleanValue)
     reportsProgress = offered.flatMap(c => Option(c.getWindow)).flatMap(w => Option(w.getWorkDoneProgress)).exists(_.booleanValue)
+    val completion = offered.flatMap(c => Option(c.getTextDocument)).flatMap(c => Option(c.getCompletion))
+      .flatMap(c => Option(c.getCompletionItem))
+    completionOptions = scalapsihost.Completion.Options(
+      snippets = completion.flatMap(c => Option(c.getSnippetSupport)).exists(_.booleanValue),
+      resolve = completion.flatMap(c => Option(c.getResolveSupport)).flatMap(c => Option(c.getProperties))
+        .exists(_.contains("additionalTextEdits")))
     val folders = Option(params.getWorkspaceFolders).map(_.asScala.toSeq).getOrElse(Seq.empty)
     val rootUri = folders.headOption.map(_.getUri).orElse(Option(params.getRootUri))
       .getOrElse(throw new IllegalArgumentException("the client sent no workspace folder or root URI"))
@@ -158,7 +165,7 @@ final class ScalaLanguageServer(
     val capabilities = new ServerCapabilities
     capabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental)
     capabilities.setHoverProvider(true)
-    capabilities.setCompletionProvider(new CompletionOptions(false, java.util.List.of(".")))
+    capabilities.setCompletionProvider(new CompletionOptions(true, java.util.List.of(".")))
     capabilities.setDocumentFormattingProvider(true)
     capabilities.setDocumentRangeFormattingProvider(true)
     capabilities.setDefinitionProvider(true)
@@ -376,9 +383,19 @@ final class ScalaLanguageServer(
         : CompletableFuture[LspEither[java.util.List[CompletionItem], CompletionList]] = {
       onCopyRequest("completion", params.getTextDocument,
         LspEither.forRight[java.util.List[CompletionItem], CompletionList](new CompletionList(false, java.util.List.of()))) { (s, path) =>
-        LspEither.forRight(s.completion(path, lineColumn(params.getPosition)))
+        LspEither.forRight(s.completion(path, lineColumn(params.getPosition),
+          completionOptions.copy(uri = params.getTextDocument.getUri, version = Option(versions.get(path)).fold(0)(_.intValue))))
       }
     }
+
+    override def resolveCompletionItem(item: CompletionItem): CompletableFuture[CompletionItem] =
+      if (item.getData == null) CompletableFuture.completedFuture(item)
+      else {
+        val recipe = scalapsihost.Completion.recipe(item)
+        onCopyRequest("completion resolve", new TextDocumentIdentifier(recipe.uri), throw new ProcessCanceledException) { (s, path) =>
+          s.resolveCompletion(path, item, Option(versions.get(path)).fold(0)(_.intValue))
+        }
+      }
 
     override def formatting(params: DocumentFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
       onCopyRequest("formatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>

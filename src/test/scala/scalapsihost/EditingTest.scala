@@ -84,14 +84,14 @@ class EditingTest extends munit.FunSuite {
       assertEquals(item.getKind, org.eclipse.lsp4j.CompletionItemKind.Method)
       assert(item.getDetail.contains("Int") && item.getDetail.contains("String"), item.toString)
       val edit = item.getTextEdit.getLeft
-      assertEquals(edit.getNewText, "message")
+      assertEquals(edit.getNewText, "message()")
       assertEquals(edit.getRange.getStart.getCharacter, offset - 3)
       assertEquals(edit.getRange.getEnd.getCharacter, offset)
       assertEquals(host.read(file.getText), text)
     } finally host.closeSource(file)
   }
 
-  test("completion preserves overloads and deprecation, and excludes classes needing an import") {
+  test("completion preserves overloads and deprecation, and inserts classes through import and constructor handlers") {
     import scala.jdk.CollectionConverters.*
     val hidden = host.openFile(Path.of("/editing/Hidden.scala"), "package hidden\nclass ZebraUnimported", module)
     val text = "package visible\nobject Lookup { @deprecated(\"old\", \"1\") def message(n: Int): String = \"\"; " +
@@ -103,14 +103,17 @@ class EditingTest extends munit.FunSuite {
       assertEquals(items.size, 2)
       assertEquals(items.map(_.getDetail).distinct.size, 2)
       assertEquals(items.count(i => Option(i.getTags).exists(_.contains(org.eclipse.lsp4j.CompletionItemTag.Deprecated))), 1)
-      for ((expression, filtered) <- Seq("val value: ZebraUn = ???" -> "import", "val value: Any = new ZebraUn" -> "insertion")) {
+      for (expression <- Seq("val value: ZebraUn = ???", "val value: Any = new ZebraUn")) {
         val changed = s"package visible\nobject Lookup { $expression }"
         host.edit(file, 0, host.read(file.getTextLength), changed)
-        val entry = s"Completion.filtered.$filtered"
-        val before = CallLog.snapshot.toMap.getOrElse(entry, 0)
         val completed = host.completion(file, changed.indexOf("ZebraUn") + "ZebraUn".length)
-        assert(!completed.getItems.asScala.exists(_.getFilterText == "ZebraUnimported"), completed.toString)
-        assert(CallLog.snapshot.toMap.getOrElse(entry, 0) > before, s"the $filtered candidate was not encountered")
+        val selected = completed.getItems.asScala.find(_.getFilterText == "ZebraUnimported").getOrElse(fail(completed.toString))
+        assertEquals(selected.getTextEdit.getLeft.getNewText, "ZebraUnimported")
+        val imports = selected.getAdditionalTextEdits.asScala.toSeq
+        assert(imports.exists(_.getNewText.contains("import hidden.ZebraUnimported")), imports)
+        val edits = (imports :+ selected.getTextEdit.getLeft).sortBy(e => (e.getRange.getStart.getLine, e.getRange.getStart.getCharacter))
+        assert(applyEdits(changed, edits).contains(expression.replace("ZebraUn", "ZebraUnimported")))
+        assertEquals(host.read(file.getText), changed)
       }
     } finally {
       host.closeSource(file)
@@ -131,6 +134,104 @@ class EditingTest extends munit.FunSuite {
       assertEquals(items.find(_.getFilterText == "nameParam").get.getTextEdit.getLeft.getNewText, "nameParam = ")
     } finally host.closeSource(file)
   }
+  test("completion resolve replays a versioned recipe and snippets retain the handler caret") {
+    import scala.jdk.CollectionConverters.*
+    val target = host.openFile(Path.of("/editing/ResolveTarget.scala"), "package imported\nclass ResolveTarget(n: Int)\n", module)
+    val text = "object ResolveUser { val x = new ResolveT }"
+    val file = host.openFile(Path.of("/editing/ResolveUser.scala"), text, module) match {
+      case f: ScalaFile => f
+      case other => fail(s"not Scala: $other")
+    }
+    val offset = text.indexOf("ResolveT }") + "ResolveT".length
+    try {
+      for (snippets <- Seq(false, true)) {
+        val options = Completion.Options(snippets, true, "file:///editing/ResolveUser.scala", 1)
+        val list = host.completion(file, offset, options)
+        val item = list.getItems.asScala.find(_.getFilterText == "ResolveTarget").getOrElse(fail(list.toString))
+        assertEquals(item.getTextEdit.getLeft.getNewText, if (snippets) "ResolveTarget($0)" else "ResolveTarget()")
+        assertEquals(item.getAdditionalTextEdits, null)
+        assert(item.getData != null)
+        val resolved = host.resolveCompletion(file, item, 1)
+        assert(resolved.getAdditionalTextEdits.asScala.exists(_.getNewText.contains("import imported.ResolveTarget")))
+        intercept[com.intellij.openapi.progress.ProcessCanceledException](host.resolveCompletion(file, item, 2))
+      }
+      val item = host.completion(file, offset, Completion.Options(resolve = true)).getItems.asScala
+        .find(_.getFilterText == "ResolveTarget").get
+      host.edit(file, 0, 0, "// changed\n")
+      intercept[com.intellij.openapi.progress.ProcessCanceledException](host.resolveCompletion(file, item, 0))
+    } finally { host.closeSource(file); host.closeSource(target) }
+  }
+
+  test("string, backtick and keyword handlers preserve surrounding text and their caret") {
+    import scala.jdk.CollectionConverters.*
+    val cases = Seq(
+      ("object Strings { val member = 1; val s = \"$mem<caret>\" }", "member", "object Strings { val member = 1; val s = s\"$member<caret>\" }"),
+      ("object Strings { object value { val member = 1 }; val s = s\"$value.mem<caret>\" }", "member",
+        "object Strings { object value { val member = 1 }; val s = s\"${value.member<caret>}\" }"),
+      ("object Ticks { def `type`(): Unit = (); Ticks.`ty<caret>` }", "`type`", "object Ticks { def `type`(): Unit = (); Ticks.`type`()<caret> }"),
+      ("object Keywords {\n  val n = 1\n  n mat<caret>\n}", "match", "object Keywords {\n  val n = 1\n  n match {\n    case <caret>\n  }\n}")
+    )
+    for ((marked, lookup, expected) <- cases) {
+      val offset = marked.indexOf("<caret>")
+      val text = marked.replace("<caret>", "")
+      val file = host.openFile(Path.of("/editing/Handler.scala"), text, module) match {
+        case f: ScalaFile => f
+        case other => fail(s"not Scala: $other")
+      }
+      try {
+        val items = host.completion(file, offset, Completion.Options(snippets = true)).getItems.asScala
+        val item = items.find(_.getFilterText == lookup).getOrElse(fail(items.toString))
+        val primary = item.getTextEdit.getLeft
+        val replacement = primary.getNewText.replace("$0", "<caret>").replace("\\$", "$").replace("\\}", "}").replace("\\\\", "\\")
+        val edits = (Option(item.getAdditionalTextEdits).map(_.asScala.toSeq).getOrElse(Seq.empty) :+
+          new org.eclipse.lsp4j.TextEdit(primary.getRange, replacement)).sortBy(e => (e.getRange.getStart.getLine, e.getRange.getStart.getCharacter))
+        assertEquals(applyEdits(text, edits), expected)
+        assertEquals(host.read(file.getText), text)
+      } finally host.closeSource(file)
+    }
+  }
+
+  test("prefix binding and constructor adjustment advertise their final primary edit before resolve") {
+    import scala.jdk.CollectionConverters.*
+    val manager = com.intellij.psi.codeStyle.CodeStyleSettingsManager.getInstance(host.project)
+    val settings = host.read(manager.getCurrentSettings.clone())
+    settings.getCustomSettings(classOf[org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings])
+      .setImportsWithPrefix(Array("scala.collection.mutable._"))
+    for (expression <- Seq("val value: ArrayBuff = ???", "val value = new ArrayBuff")) {
+      val text = s"object PrefixUser { $expression }"
+      val file = host.openFile(Path.of("/editing/PrefixUser.scala"), text, module) match {
+        case f: ScalaFile => f
+        case other => fail(s"not Scala: $other")
+      }
+      try manager.computeWithLocalSettings(settings, _ => {
+        val items = host.completion(file, text.indexOf("ArrayBuff") + "ArrayBuff".length,
+          Completion.Options(resolve = true)).getItems.asScala
+        val item = items.find(_.getFilterText == "ArrayBuffer").getOrElse(fail(items.toString))
+        assert(item.getTextEdit.getLeft.getNewText.startsWith("mutable.ArrayBuffer"), item.toString)
+        val primary = item.getTextEdit.getLeft
+        val resolved = host.resolveCompletion(file, item, 0)
+        assertEquals(resolved.getTextEdit.getLeft, primary)
+        assert(resolved.getAdditionalTextEdits.asScala.exists(_.getNewText.contains("import scala.collection.mutable")), resolved.toString)
+      }) finally host.closeSource(file)
+    }
+  }
+
+  test("constructors requiring implementation UI are filtered explicitly") {
+    import scala.jdk.CollectionConverters.*
+    val text = "trait NeedsImplementation { def run(): Unit }; object User { new NeedsImpl }"
+    val file = host.openFile(Path.of("/editing/NeedsImplementation.scala"), text, module) match {
+      case f: ScalaFile => f
+      case other => fail(s"not Scala: $other")
+    }
+    try {
+      val key = "Completion.filtered.implementationDialog"
+      val before = CallLog.snapshot.toMap.getOrElse(key, 0)
+      val items = host.completion(file, text.lastIndexOf("NeedsImpl") + "NeedsImpl".length).getItems.asScala
+      assert(!items.exists(_.getFilterText == "NeedsImplementation"), items)
+      assert(CallLog.snapshot.toMap.getOrElse(key, 0) > before)
+    } finally host.closeSource(file)
+  }
+
   private def applyEdits(text: String, edits: Seq[org.eclipse.lsp4j.TextEdit]): String = {
     val document = new com.intellij.openapi.editor.impl.DocumentImpl(text, true)
     def offset(p: org.eclipse.lsp4j.Position): Int = document.getLineStartOffset(p.getLine) + p.getCharacter

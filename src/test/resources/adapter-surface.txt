@@ -12,6 +12,7 @@ Application.getMessageBus
 Application.getService
 Application.getServiceIfCreated
 Application.instantiateClass
+Application.invokeLater
 Application.isDispatchThread
 Application.isDisposed
 Application.isInjectionForExtensionSupported
@@ -27,6 +28,7 @@ Application.service com.intellij.codeInsight.completion.CompletionService
 Application.service com.intellij.codeInsight.completion.group.GroupedCompletion
 Application.service com.intellij.formatting.Formatter
 Application.service com.intellij.formatting.FormattingProgressCallbackFactory
+Application.service com.intellij.internal.statistic.eventLog.StatisticsEventLogProvidersHolder
 Application.service com.intellij.lang.DefaultASTFactory
 Application.service com.intellij.lang.PsiBuilderFactory
 Application.service com.intellij.openapi.application.AsyncExecutionService
@@ -40,17 +42,21 @@ Application.service com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 Application.service com.intellij.openapi.vfs.encoding.EncodingManager
 Application.service com.intellij.openapi.vfs.newvfs.ManagingFS
 Application.service com.intellij.psi.ExternalChangeActionUtil$PsiExternalChangeService
+Application.service com.intellij.psi.JavaModuleGraphHelper
 Application.service com.intellij.psi.LanguageSubstitutors
+Application.service com.intellij.psi.PsiReferenceService
 Application.service com.intellij.psi.PsiSubstitutorFactory
 Application.service com.intellij.psi.codeStyle.CodeStyleSettingsService
 Application.service com.intellij.psi.compiled.ClassFileDecompilers
 Application.service com.intellij.psi.impl.DocumentCommitProcessor
 Application.service com.intellij.psi.impl.java.stubs.JavaStubElementTypePsiElementMappingRegistry
 Application.service com.intellij.psi.impl.source.codeStyle.IndentHelper
+Application.service com.intellij.psi.impl.source.resolve.reference.ReferenceProvidersRegistry
 Application.service com.intellij.psi.stubs.StubElementRegistryService
 Application.service com.intellij.psi.stubs.StubIndex
 Application.service com.intellij.psi.stubs.StubTreeLoader
 Application.service com.intellij.psi.util.PsiVersioningService
+Application.service com.intellij.util.concurrency.TransferredWriteActionService
 Application.service com.intellij.util.indexing.FileBasedIndex
 Application.service org.jetbrains.plugins.scala.lang.psi.api.expr.ExpectedTypes
 Application.service org.jetbrains.plugins.scala.scalaMeta.ScalaMetaApi
@@ -62,9 +68,13 @@ AsyncExecutionService.buildNonBlockingReadAction
 CodeStyleSettingsService.addListener
 CodeStyleSettingsService.getCustomCodeStyleSettingsFactories
 CodeStyleSettingsService.getLanguageCodeStyleProviders
+Completion.filtered.implementationDialog
+Completion.popup.parameterInfo
 CompletionCaret.getOffset
 CompletionCaret.hasSelection
 CompletionCaretModel.getCurrentCaret
+CompletionCaretModel.getOffset
+CompletionCaretModel.moveToOffset
 CompletionEditor.getCaretModel
 CompletionEditor.getDocument
 DumbService.isAlternativeResolveEnabled
@@ -85,11 +95,15 @@ FileManager.getCachedPsiFile
 FileManager.setViewProvider
 FileTypeManager.getFileTypeByExtension
 FileTypeManager.getFileTypeByFile
+FileTypeManager.getFileTypeByFileName
 FileTypeManager.getRegisteredFileTypes
 FileTypeManager.isFileIgnored
 FormattingProgressCallbackFactory.createProgressCallback
 GroupedCompletion.isEnabled
+HighlightingLevelManager.shouldInspect
+IncompleteDependenciesService.getState
 InferredAnnotationsManager.findInferredAnnotation
+InjectedLanguageManager.findInjectedElementAt
 InjectedLanguageManager.getCachedInjectedDocumentsInRange
 InjectedLanguageManager.getTopLevelFile
 InjectedLanguageManager.isInjectedViewProvider
@@ -100,8 +114,20 @@ ManagingFS.readAttribute
 ManagingFS.writeAttribute
 MessageBusOwner.isDisposed
 MessageBusOwner.isParentLazyListenersIgnored (default)
+Module.getModuleTypeName
+Module.getName
+Module.getProject
+Module.getService
+Module.getUserData
+Module.isDisposed
 ModuleManager.getModules
+ModuleRootManager.getContentEntries
+ModuleRootManager.orderEntries
 NonBlockingReadAction.executeSynchronously
+OrderEnumerator.forEachLibrary
+OrderEnumerator.withoutDepModules
+OrderEnumerator.withoutModuleSourceEntries
+OrderEnumerator.withoutSdk
 Project.getExtensionArea
 Project.getMessageBus
 Project.getService
@@ -110,14 +136,17 @@ Project.isDefault
 Project.isDisposed
 Project.putUserData
 Project.service com.intellij.codeInsight.AnnotationCacheOwnerNormalizer
+Project.service com.intellij.codeInsight.AutoPopupController
 Project.service com.intellij.codeInsight.ExternalAnnotationsManager
 Project.service com.intellij.codeInsight.InferredAnnotationsManager
 Project.service com.intellij.codeInsight.JavaProjectCodeInsightSettings
+Project.service com.intellij.codeInsight.daemon.impl.analysis.HighlightingLevelManager
 Project.service com.intellij.ide.util.PropertiesComponent
 Project.service com.intellij.lang.injection.InjectedLanguageManager
 Project.service com.intellij.lang.jvm.facade.JvmFacade
 Project.service com.intellij.openapi.module.ModuleManager
 Project.service com.intellij.openapi.project.DumbService
+Project.service com.intellij.openapi.project.IncompleteDependenciesService
 Project.service com.intellij.openapi.roots.FileIndexFacade
 Project.service com.intellij.openapi.roots.ProjectFileIndex
 Project.service com.intellij.openapi.roots.ProjectRootManager
@@ -150,6 +179,7 @@ Project.service org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.Syn
 Project.service org.jetbrains.plugins.scala.lang.psi.types.ScMatchType$MatchTypeReductionCacheService
 Project.service org.jetbrains.plugins.scala.lang.psi.types.api.ParameterizedType$SubstitutorCacheService
 Project.service org.jetbrains.plugins.scala.lang.psi.types.api.StdTypes
+Project.service org.jetbrains.plugins.scala.project.settings.ScalaCompilerConfiguration
 Project.service org.jetbrains.plugins.scala.settings.ScalaProjectSettings
 Project.service org.jetbrains.plugins.scala.util.UnloadAwareDisposable$UnloadAwareDisposableService
 ProjectFileIndex.findContainingLibraries
@@ -157,13 +187,19 @@ ProjectFileIndex.findContainingSdks
 ProjectFileIndex.getModuleForFile
 ProjectFileIndex.isInLibrary
 ProjectFileIndex.isInLibraryClasses
+ProjectFileIndex.isInLibrarySource
 ProjectFileIndex.isInSourceContent
 ProjectFileIndex.isUnderSourceRootOfType
 ProjectRootManager.getFileIndex
+ProjectRootManager.getModuleRootManager
 ProjectScopeBuilder.buildAllScope
 PsiManager.afterChange
 PsiManager.areElementsEquivalent
 PsiManager.beforeChange
+PsiManager.beforeChildReplacement
+PsiManager.beforeChildrenChange
+PsiManager.childReplaced
+PsiManager.childrenChanged
 PsiManager.findDirectory
 PsiManager.findFile
 PsiManager.findFile(context)
@@ -181,5 +217,9 @@ ScalaCodeStyleProvider.getDefaultCommonSettings
 ScalaCodeStyleProvider.getDocCommentSettings
 ScalaCodeStyleProvider.getLanguage
 ScalaCodeStyleProvider.useBaseLanguageCommonSettings (default)
+ScalaSdkLibrary.getKind
+ScalaSdkLibrary.getName
+ScalaSdkLibrary.getProperties
 StubIndex.getAllKeys
 StubIndex.processElements
+TransferredWriteActionService.runOnEdtWithTransferredWriteActionAndWait

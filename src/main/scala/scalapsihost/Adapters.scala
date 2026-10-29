@@ -211,39 +211,79 @@ def dispatch(answer: PartialFunction[(String, Array[AnyRef]), AnyRef]): Dispatch
     else CallLog.unsupported(method)
   }
 
-/** A completion request's editor state, without a UI or any insertion operations. */
-private[scalapsihost] object CompletionEditor {
-  def apply(document: com.intellij.openapi.editor.Document, project: com.intellij.openapi.project.Project,
-            offset: Int): com.intellij.openapi.editor.Editor = {
-    import com.intellij.openapi.editor.{Caret, CaretModel, Editor, SelectionModel}
-    import com.intellij.openapi.util.{Key, UserDataHolderBase}
-    val data = new UserDataHolderBase
-    lazy val editor: Editor = tableProxy(classOf[Editor], "CompletionEditor") {
-      case ("getDocument", _) => document
-      case ("getProject", _) => project
-      case ("getCaretModel", _) => model
-      case ("getSelectionModel", _) => selection
-      case ("getUserData", Array(k: Key[?])) => data.getUserData(k).asInstanceOf[AnyRef]
-      case ("putUserData", Array(k: Key[?], value)) => putData(k, value); null
+/** A request-local editor tracks positions through document and PSI changes, including imports before the caret. */
+private[scalapsihost] final class CompletionEditor(document: com.intellij.openapi.editor.Document,
+                                                  project: com.intellij.openapi.project.Project, offset: Int) extends AutoCloseable {
+  import com.intellij.openapi.editor.{Caret, CaretModel, Editor, SelectionModel}
+  import com.intellij.openapi.editor.event.{DocumentEvent, DocumentListener}
+  import com.intellij.openapi.util.{Key, UserDataHolderBase}
+
+  private val data = new UserDataHolderBase
+  private var caretOffset = offset
+  private var selectionStart = offset
+  private var selectionEnd = offset
+  private val listener = new DocumentListener {
+    override def documentChanged(event: DocumentEvent): Unit = {
+      def shifted(at: Int, right: Boolean): Int =
+        if (at < event.getOffset || at == event.getOffset && !right) at
+        else if (at > event.getOffset + event.getOldLength) at + event.getNewLength - event.getOldLength
+        else event.getOffset + event.getNewLength
+      val hadSelection = selectionStart != selectionEnd
+      caretOffset = shifted(caretOffset, true)
+      selectionStart = shifted(selectionStart, false)
+      selectionEnd = shifted(selectionEnd, true)
+      if (!hadSelection || selectionStart == selectionEnd) removeSelection()
     }
-    // Reflection erases Key's type parameter, as in the project's user-data table.
-    def putData(key: Key[?], value: AnyRef): Unit = data.putUserData(key.asInstanceOf[Key[AnyRef]], value)
-    lazy val caret: Caret = tableProxy(classOf[Caret], "CompletionCaret") {
-      case ("getEditor", _) => editor
-      case ("getOffset" | "getSelectionStart" | "getSelectionEnd", _) => Integer.valueOf(offset)
-      case ("hasSelection", _) => java.lang.Boolean.FALSE
-    }
-    lazy val model: CaretModel = tableProxy(classOf[CaretModel], "CompletionCaretModel") {
-      case ("getCurrentCaret" | "getPrimaryCaret", _) => caret
-      case ("getOffset", _) => Integer.valueOf(offset)
-      case ("getAllCarets", _) => java.util.List.of(caret)
-    }
-    lazy val selection: SelectionModel = tableProxy(classOf[SelectionModel], "CompletionSelection") {
-      case ("getSelectionStart" | "getSelectionEnd", _) => Integer.valueOf(offset)
-      case ("hasSelection", _) => java.lang.Boolean.FALSE
-    }
-    editor
   }
+  document.addDocumentListener(listener)
+
+  private def move(at: Int): Unit = {
+    require(at >= 0 && at <= document.getTextLength, s"caret outside document: $at")
+    caretOffset = at
+    removeSelection()
+  }
+  private def removeSelection(): Unit = { selectionStart = caretOffset; selectionEnd = caretOffset }
+  private def select(start: Int, end: Int): Unit = {
+    require(start >= 0 && start <= end && end <= document.getTextLength, "selection outside document")
+    selectionStart = start
+    selectionEnd = end
+  }
+
+  lazy val editor: Editor = tableProxy(classOf[Editor], "CompletionEditor") {
+    case ("getDocument", _) => document
+    case ("getProject", _) => project
+    case ("getCaretModel", _) => model
+    case ("getSelectionModel", _) => selection
+    case ("getUserData", Array(k: Key[?])) => data.getUserData(k).asInstanceOf[AnyRef]
+    case ("putUserData", Array(k: Key[?], value)) => putData(k, value); null
+  }
+  // Reflection erases Key's type parameter, as in the project's user-data table.
+  private def putData(key: Key[?], value: AnyRef): Unit = data.putUserData(key.asInstanceOf[Key[AnyRef]], value)
+  private lazy val caret: Caret = tableProxy(classOf[Caret], "CompletionCaret") {
+    case ("getEditor", _) => editor
+    case ("getOffset", _) => Integer.valueOf(caretOffset)
+    case ("getSelectionStart", _) => Integer.valueOf(selectionStart)
+    case ("getSelectionEnd", _) => Integer.valueOf(selectionEnd)
+    case ("hasSelection", _) => java.lang.Boolean.valueOf(selectionStart != selectionEnd)
+    case ("moveToOffset", Array(at: Integer)) => move(at.intValue); null
+    case ("setSelection", Array(start: Integer, end: Integer)) => select(start.intValue, end.intValue); null
+    case ("removeSelection", _) => removeSelection(); null
+  }
+  private lazy val model: CaretModel = tableProxy(classOf[CaretModel], "CompletionCaretModel") {
+    case ("getCurrentCaret" | "getPrimaryCaret", _) => caret
+    case ("getOffset", _) => Integer.valueOf(caretOffset)
+    case ("getAllCarets", _) => java.util.List.of(caret)
+    case ("moveToOffset", Array(at: Integer)) => move(at.intValue); null
+  }
+  private lazy val selection: SelectionModel = tableProxy(classOf[SelectionModel], "CompletionSelection") {
+    case ("getSelectionStart", _) => Integer.valueOf(selectionStart)
+    case ("getSelectionEnd", _) => Integer.valueOf(selectionEnd)
+    case ("hasSelection", _) => java.lang.Boolean.valueOf(selectionStart != selectionEnd)
+    case ("setSelection", Array(start: Integer, end: Integer)) => select(start.intValue, end.intValue); null
+    case ("removeSelection", _) => removeSelection(); null
+  }
+
+  def close(): Unit = document.removeDocumentListener(listener)
 }
 
 /** The host has no annotation inference engine; declared annotations remain in PSI. */

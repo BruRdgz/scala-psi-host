@@ -130,10 +130,11 @@ lazy val root = (project in file("."))
       (out / "bin" / "scala-psi-host").setExecutable(true)
       out
     },
-    // The language server test opens the BSP fixture's modules in the JVM's one host, which another suite also
-    // does: it runs in a JVM of its own.
+    // The language server's fixture modules and the measured adapter ledger each need their own host JVM:
+    // other suites may open the same modules or record calls outside the surface scenario.
     Test / testGrouping := {
-      val (own, shared) = (Test / definedTests).value.partition(_.name == "scalapsihost.lsp.LanguageServerTest")
+      val isolated = Set("scalapsihost.lsp.LanguageServerTest", "scalapsihost.AdapterSurfaceTest")
+      val (own, shared) = (Test / definedTests).value.partition(test => isolated(test.name))
       val fork = Tests.SubProcess((Test / forkOptions).value)
       Seq(Tests.Group("shared", shared, fork)) ++ own.map(test => Tests.Group(test.name, Seq(test), fork))
     },

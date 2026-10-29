@@ -1,7 +1,7 @@
 package scalapsihost.oracle
 
 import scalapsihost.lsp.ProjectSession
-import scalapsihost.{CallLog, HostConfig, LineColumn, ScalaPsiHost}
+import scalapsihost.{CallLog, Completion, HostConfig, LineColumn, ScalaPsiHost}
 
 import java.io.File
 import java.nio.file.{Files, Path}
@@ -46,9 +46,10 @@ object SessionBenchmark {
       val positions = identifiers.indices.by(step).map(identifiers).take(positionCount)
 
       val latencies = scala.collection.mutable.LinkedHashMap.empty[String, Vector[Long]]
-      def measure[T](kind: String)(request: => T): Unit = {
-        val (_, ms) = timed(request)
+      def measure[T](kind: String)(request: => T): T = {
+        val (result, ms) = timed(request)
         latencies(kind) = latencies.getOrElse(kind, Vector.empty) :+ ms
+        result
       }
       positions.headOption.foreach { (path, at) => measure("completion (first request)")(session.completion(path, at)) }
       // Each file's problems first, as an editor opening it: later requests find the plugin's caches as they are then.
@@ -64,6 +65,25 @@ object SessionBenchmark {
         measure("document highlights")(session.highlights(path, at))
         measure("completion")(session.completion(path, at))
       }
+      for ((path, at) <- positions) measure("completion (warm positions)")(session.completion(path, at))
+      // Repeated import completion gives resolve its own samples rather than timing absent recipes as successes.
+      val resolvePath = scalaFiles.head
+      val baseline = session.text(resolvePath)
+      val resolveSource = baseline + "\nobject CompletionLatency { val value: ArrayBuff = ??? }\n"
+      session.change(resolvePath, None, resolveSource)
+      try {
+        val offset = resolveSource.lastIndexOf("ArrayBuff") + "ArrayBuff".length
+        val before = resolveSource.substring(0, offset).split("\n", -1)
+        val at = LineColumn(before.length - 1, before.last.length)
+        val options = Completion.Options(snippets = true, resolve = true, uri = resolvePath.toUri.toString)
+        // Forty requests expose warm p95 while keeping the fixture benchmark inexpensive.
+        for (_ <- 0 until 40) {
+          val list = measure("completion import list")(session.completion(resolvePath, at, options))
+          val item = list.getItems.asScala.find(i => i.getFilterText == "ArrayBuffer" && i.getData != null)
+            .getOrElse(throw new IllegalStateException("benchmark import completion supplied no resolve recipe"))
+          measure("completion resolve")(session.resolveCompletion(resolvePath, item, 0))
+        }
+      } finally session.change(resolvePath, None, baseline)
       val heapAfterRequestsMb = usedHeapMb()
 
       val heapByRound = (0 until rounds).map { round =>
@@ -84,7 +104,7 @@ object SessionBenchmark {
       lines += s"# Session benchmark: ${projectDir.getFileName}"
       lines += ""
       lines += s"JDK ${System.getProperty("java.version")}, max heap ${Runtime.getRuntime.maxMemory / (1024 * 1024)} MB, one thread."
-      lines += "Completion includes copying, contributors, classification and rendering (200-item LSP cap); server queueing and JSON transport are excluded."
+      lines += "Completion includes contributors, classification, rendering and at most eight handler previews (200-item LSP cap). Import-list and resolve samples use ArrayBuffer on the fixture, with snippets and additionalTextEdits resolve; server queueing and JSON transport are excluded."
       lines += "For a real project with a BSP connection: `sbt --java-home /usr/lib/jvm/java-25 -batch " +
         "'Test/runMain scalapsihost.oracle.SessionBenchmark /path/to/project target/session-benchmark.md --positions=1500 --rounds=60'`."
       lines += ""

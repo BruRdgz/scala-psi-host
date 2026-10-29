@@ -68,6 +68,16 @@ class LanguageServerTest extends munit.FunSuite {
   private def initialize(server: HostProtocol.LanguageServerWithStatus, root: Path): InitializeResult = {
     val params = new InitializeParams
     params.setWorkspaceFolders(java.util.List.of(new WorkspaceFolder(root.toUri.toString, root.getFileName.toString)))
+    val item = new CompletionItemCapabilities
+    item.setSnippetSupport(true)
+    item.setResolveSupport(new CompletionItemResolveSupportCapabilities(java.util.List.of("additionalTextEdits")))
+    val completion = new CompletionCapabilities
+    completion.setCompletionItem(item)
+    val text = new TextDocumentClientCapabilities
+    text.setCompletion(completion)
+    val capabilities = new ClientCapabilities
+    capabilities.setTextDocument(text)
+    params.setCapabilities(capabilities)
     server.initialize(params).get(1, TimeUnit.MINUTES)
   }
 
@@ -143,7 +153,7 @@ class LanguageServerTest extends munit.FunSuite {
     assertEquals(capabilities.getTextDocumentSync.getLeft, TextDocumentSyncKind.Incremental)
     assert(capabilities.getHoverProvider.getLeft)
     assertEquals(capabilities.getCompletionProvider.getTriggerCharacters.asScala.toSeq, Seq("."))
-    assertEquals(capabilities.getCompletionProvider.getResolveProvider, java.lang.Boolean.FALSE)
+    assertEquals(capabilities.getCompletionProvider.getResolveProvider, java.lang.Boolean.TRUE)
     assert(capabilities.getDocumentFormattingProvider.getLeft)
     assert(capabilities.getDocumentRangeFormattingProvider.getLeft)
     assert(capabilities.getDefinitionProvider.getLeft)
@@ -321,12 +331,40 @@ class LanguageServerTest extends munit.FunSuite {
       val text = members.find(_.getFilterText == "text").getOrElse(fail(members.toString))
       assert(text.getDetail.contains("String"), text.toString)
       assertEquals(text.getKind, CompletionItemKind.Method)
-      assertEquals(text.getTextEdit.getLeft.getNewText, "text")
+      assertEquals(text.getTextEdit.getLeft.getNewText, "text$0")
+      assertEquals(server.getTextDocumentService.resolveCompletionItem(text).get(1, TimeUnit.MINUTES), text)
       val locals = complete(original.replace("println(text)", "println(tex)"), "println(tex", 21)
       assert(locals.exists(_.getFilterText == "text"), locals.toString)
       val keywords = complete(original.replace("println(text)", "val next = tr"), "val next = tr", 22)
       assert(keywords.exists(i => i.getFilterText == "true" && i.getKind == CompletionItemKind.Keyword), keywords.toString)
     } finally change(original, 23)
+  }
+
+  test("resolves import edits over JSON-RPC and rejects recipes after a document change") {
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    val text = "package app\nobject ResolveClient { val c: Coun = ??? }"
+    def change(value: String, version: Int): Unit = server.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
+      new VersionedTextDocumentIdentifier(main.toUri.toString, version), java.util.List.of(new TextDocumentContentChangeEvent(value))))
+    try {
+      change(text, 24)
+      val list = server.getTextDocumentService.completion(new CompletionParams(document(main),
+        new Position(1, text.split("\n")(1).indexOf("Coun") + 4))).get(1, TimeUnit.MINUTES).getRight
+      val item = list.getItems.asScala.find(_.getFilterText == "Counter").getOrElse(fail(list.toString))
+      assertEquals(item.getTextEdit.getLeft.getNewText, "Counter$0")
+      assertEquals(item.getInsertTextFormat, InsertTextFormat.Snippet)
+      assertEquals(item.getAdditionalTextEdits, null)
+      val resolved = server.getTextDocumentService.resolveCompletionItem(item).get(1, TimeUnit.MINUTES)
+      assert(resolved.getAdditionalTextEdits.asScala.exists(_.getNewText.contains("import core.Counter")), resolved.toString)
+      assertEquals(resolved.getTextEdit, item.getTextEdit)
+      change(text + "\n", 25)
+      val error = intercept[java.util.concurrent.ExecutionException](
+        server.getTextDocumentService.resolveCompletionItem(item).get(1, TimeUnit.MINUTES))
+      error.getCause match {
+        case response: org.eclipse.lsp4j.jsonrpc.ResponseErrorException =>
+          assertEquals(response.getResponseError.getCode, org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestCancelled.getValue)
+        case other => fail(s"unexpected stale-resolve error: $other")
+      }
+    } finally change(original, 26)
   }
 
   test("a newer edit cancels a queued completion instead of returning stale items") {
