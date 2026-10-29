@@ -15,15 +15,15 @@ agrees with the host, and the cases that do not agree are explained in the READM
 - **C. Change engine.** A change runs on a non-physical copy of the file, as the platform's intention preview does;
   the difference with the original becomes a `WorkspaceEdit`. Needs `CodeStyleManager` and the formatter, which
   almost every modification of the plugin calls.
-- **D. Caret-bound features.** An `Editor` object in the fixed tables (document, caret, selection, nothing more;
+- **D. Caret-bound features.** An `Editor` object in the fixed tables (document, caret, selection, settings and lexer;
   `AdapterSurfaceTest` shows what the plugin uses of it), a completion context (`CompletionParameters`, the copy with
   a dummy identifier), and a parameter-info UI context that records what `updateUI` renders.
 - **E. Inspections.** The plugin's `LocalInspectionTool`s run without UI against a fixed profile, the IDE's default.
 
 ## Done ahead of order (2026-10-29)
 
-The change engine and the formatter (beta 1), completion, signature help and the request-local `Editor`
-(beta 2), and inlay hints exist; their gaps are in the README's known limitations. Next, from the review of that work:
+The change engine and the formatter (beta 1), completion, signature help, selection ranges and the request-local
+`Editor` (beta 2), and inlay hints exist; their gaps are in the README's known limitations. Next, from the review of that work:
 
 - Scala 3 fixtures in the completion and parameter info oracles; file templates (override completion); live
   templates as snippets.
@@ -53,7 +53,8 @@ The change engine and the formatter (beta 1), completion, signature help and the
 ## Beta 2 — completion and inspections
 
 - The `Editor` object.
-- Selection ranges: the plugin's word-selection handlers, which read the editor's settings and lexer.
+- Selection ranges. **Done:** successive Extend Selection steps through `SelectWordUtil`, the platform's base
+  handlers and the plugin's descriptor-registered handlers; the editor supplies default settings and its layered lexer.
 - Completion (oracles: `completion`, `completion3`, `keywordCompletion`) and signature help (oracle:
   `parameterInfo`), with a latency budget (p95 under 150 ms on the acceptance projects).
 - Inspections as diagnostics, with their quick fixes as code actions. Oracle: `inspections`.

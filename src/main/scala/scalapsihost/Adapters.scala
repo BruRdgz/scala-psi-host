@@ -222,15 +222,30 @@ def dispatch(answer: PartialFunction[(String, Array[AnyRef]), AnyRef]): Dispatch
 /** A request-local editor tracks positions through document and PSI changes, including imports before the caret. */
 private[scalapsihost] final class RequestEditor(document: com.intellij.openapi.editor.Document,
                                                   project: com.intellij.openapi.project.Project, offset: Int) extends AutoCloseable {
-  import com.intellij.openapi.editor.{Caret, CaretModel, Editor, SelectionModel}
+  import com.intellij.openapi.editor.{Caret, CaretModel, Editor, EditorSettings, SelectionModel}
+  import com.intellij.openapi.editor.ex.util.LexerEditorHighlighter
+  import com.intellij.psi.PsiDocumentManager
+  import org.jetbrains.plugins.scala.highlighter.ScalaSyntaxHighlighterFactory
   import com.intellij.openapi.editor.event.{DocumentEvent, DocumentListener}
   import com.intellij.openapi.editor.colors.EditorColorsManager
-  import com.intellij.openapi.util.{Key, UserDataHolderBase}
+  import com.intellij.openapi.util.{Key, TextRange, UserDataHolderBase}
 
   private val data = new UserDataHolderBase
   private var caretOffset = offset
   private var selectionStart = offset
   private var selectionEnd = offset
+  private lazy val settings = tableProxy(classOf[EditorSettings], "SelectionSettings") {
+    // AbstractWordSelectioner and ScalaStringLiteralSelectioner read the platform's default camel-word mode.
+    case ("isCamelWords", _) => java.lang.Boolean.FALSE
+  }
+  // Selection queries do not edit the document; the highlighter lexes its request-local snapshot.
+  private lazy val highlighter = {
+    val file = PsiDocumentManager.getInstance(project).getPsiFile(document)
+    val syntax = ScalaSyntaxHighlighterFactory.createScalaSyntaxHighlighter(project, file.getVirtualFile, file.getLanguage)
+    val result = new LexerEditorHighlighter(syntax, EditorColorsManager.getInstance.getGlobalScheme)
+    result.setText(document.getImmutableCharSequence)
+    result
+  }
   private val listener = new DocumentListener {
     override def documentChanged(event: DocumentEvent): Unit = {
       def shifted(at: Int, right: Boolean): Int =
@@ -263,6 +278,10 @@ private[scalapsihost] final class RequestEditor(document: com.intellij.openapi.e
     case ("getProject", _) => project
     case ("getCaretModel", _) => model
     case ("getSelectionModel", _) => selection
+    // Word selection reads isCamelWords; it never changes editor settings.
+    case ("getSettings", _) => settings
+    // EditorActionUtil's lexeme boundaries and InjectedFileReferenceSelectioner's escapes use the layered lexer.
+    case ("getHighlighter", _) => highlighter
     // A source editor, rather than a one-line input field.
     case ("isOneLineMode", _) => java.lang.Boolean.FALSE
     // The host has no editor-specific color scheme.
@@ -278,6 +297,8 @@ private[scalapsihost] final class RequestEditor(document: com.intellij.openapi.e
     case ("getSelectionStart", _) => Integer.valueOf(selectionStart)
     case ("getSelectionEnd", _) => Integer.valueOf(selectionEnd)
     case ("hasSelection", _) => java.lang.Boolean.valueOf(selectionStart != selectionEnd)
+    // SelectWordUtil checks whether the current selection still fits inside whitespace before expanding it.
+    case ("getSelectionRange", _) => new TextRange(selectionStart, selectionEnd)
     case ("moveToOffset", Array(at: Integer)) => move(at.intValue); null
     case ("setSelection", Array(start: Integer, end: Integer)) => select(start.intValue, end.intValue); null
     case ("removeSelection", _) => removeSelection(); null

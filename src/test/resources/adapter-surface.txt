@@ -1,3 +1,4 @@
+AdvancedSettings.editor.selection.expand-whitespaces
 AnnotationCacheOwnerNormalizer.doNormalize
 Application.addReadActionListener
 Application.addSuspendingWriteActionListener (default)
@@ -39,6 +40,7 @@ Application.service com.intellij.openapi.editor.colors.EditorColorsManager
 Application.service com.intellij.openapi.editor.elf.Elf
 Application.service com.intellij.openapi.fileEditor.FileDocumentManager
 Application.service com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers
+Application.service com.intellij.openapi.options.advanced.AdvancedSettings
 Application.service com.intellij.openapi.progress.ProgressManager
 Application.service com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 Application.service com.intellij.openapi.vfs.encoding.EncodingManager
@@ -74,7 +76,11 @@ CodeStyleSettingsService.getLanguageCodeStyleProviders
 Completion.laterRunnableSkipped
 Completion.popup.parameterInfo
 CompletionCaret.getOffset
+CompletionCaret.getSelectionEnd
+CompletionCaret.getSelectionRange
+CompletionCaret.getSelectionStart
 CompletionCaret.hasSelection
+CompletionCaret.setSelection
 CompletionCaretModel.getCurrentCaret
 CompletionCaretModel.getOffset
 CompletionCaretModel.moveToOffset
@@ -198,8 +204,11 @@ ProjectScopeBuilder.buildAllScope
 PsiManager.afterChange
 PsiManager.areElementsEquivalent
 PsiManager.beforeChange
+PsiManager.beforeChildAddition
+PsiManager.beforeChildRemoval
 PsiManager.beforeChildReplacement
 PsiManager.beforeChildrenChange
+PsiManager.childAdded
 PsiManager.childReplaced
 PsiManager.childrenChanged
 PsiManager.findDirectory
@@ -217,7 +226,9 @@ PsiShortNamesCache.getClassesByName
 RequestEditor.getCaretModel
 RequestEditor.getColorsScheme
 RequestEditor.getDocument
+RequestEditor.getHighlighter
 RequestEditor.getProject
+RequestEditor.getSettings
 RequestEditor.isOneLineMode
 ResolveScopeManager.getResolveScope
 ResolveScopeManager.getUseScope
@@ -228,6 +239,7 @@ ScalaCodeStyleProvider.useBaseLanguageCommonSettings (default)
 ScalaSdkLibrary.getKind
 ScalaSdkLibrary.getName
 ScalaSdkLibrary.getProperties
+SelectionSettings.isCamelWords
 StubIndex.getAllKeys
 StubIndex.processElements
 TransferredWriteActionService.runOnEdtWithTransferredWriteActionAndWait

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Selection ranges from the platform's and Scala plugin's word-selection handlers: each parent replays the next
+  Extend Selection step, with the plugin's layered lexer and default editor settings. The selection oracle agrees
+  on 38 cases; one ScalaDoc fixture expects an extra step before the final newline.
 - Inlay hints from the plugin's hints pass: definition types, parameter names, implicit and `using` arguments,
   conversions, method chains and type arguments, within the requested range. Uses the plugin's settings; range
   hints require the IDE's concrete editor and are disabled. The distribution includes a small platform slice rather

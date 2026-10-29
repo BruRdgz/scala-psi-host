@@ -148,6 +148,7 @@ final class ScalaLanguageServer(
     capabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental)
     capabilities.setHoverProvider(true)
     capabilities.setInlayHintProvider(true)
+    capabilities.setSelectionRangeProvider(true)
     capabilities.setCompletionProvider(new CompletionOptions(/* resolveProvider = */ false, java.util.List.of(".")))
     // A call's opening parenthesis or bracket shows the signatures; a comma moves to the next parameter.
     capabilities.setSignatureHelpProvider(new SignatureHelpOptions(java.util.List.of("(", "[", ","), java.util.List.of(",")))
@@ -421,6 +422,20 @@ final class ScalaLanguageServer(
     override def signatureHelp(params: SignatureHelpParams): CompletableFuture[SignatureHelp] =
       onSource("signatureHelp", params.getTextDocument, null) { (s, path) =>
         s.signatures(path, lineColumn(params.getPosition)).filter(_.items.nonEmpty).map(signatureHelpOf).orNull
+      }
+
+    override def selectionRange(params: SelectionRangeParams): CompletableFuture[JavaList[SelectionRange]] =
+      onSource("selectionRange", params.getTextDocument, JavaList.of[SelectionRange]()) { (s, path) =>
+        s.selectionRanges(path, params.getPositions.asScala.toSeq.map(lineColumn)).map { chain =>
+          chain.map { r =>
+            val selected = new SelectionRange
+            selected.setRange(range(r))
+            selected
+          }.reduceRight { (child, parent) =>
+            child.setParent(parent)
+            child
+          }
+        }.asJava
       }
 
     override def formatting(params: DocumentFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =

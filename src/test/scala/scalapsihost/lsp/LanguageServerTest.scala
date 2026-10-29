@@ -179,6 +179,7 @@ class LanguageServerTest extends munit.FunSuite {
     assertEquals(capabilities.getTextDocumentSync.getLeft, TextDocumentSyncKind.Incremental)
     assert(capabilities.getHoverProvider.getLeft)
     assert(capabilities.getInlayHintProvider.getLeft)
+    assert(capabilities.getSelectionRangeProvider.getLeft)
     assertEquals(capabilities.getCompletionProvider.getTriggerCharacters.asScala.toSeq, Seq("."))
     assertEquals(capabilities.getCompletionProvider.getResolveProvider, java.lang.Boolean.FALSE)
     assert(capabilities.getDocumentFormattingProvider.getLeft)
@@ -371,6 +372,16 @@ class LanguageServerTest extends munit.FunSuite {
       val current = signature.getParameters.get(signature.getActiveParameter).getLabel.getRight
       assertEquals(signature.getLabel.substring(current.getFirst, current.getSecond), "times: Int")
     } finally change(original, 41)
+  }
+
+  test("selection ranges follow successive Extend Selection steps") {
+    val selected = server.getTextDocumentService.selectionRange(new SelectionRangeParams(document(counter),
+      JavaList.of(new Position(16, 23)))).get(1, TimeUnit.MINUTES).asScala.toSeq
+    assertEquals(selected.size, 1)
+    val word = selected.head
+    assertEquals(word.getRange, new Range(new Position(16, 21), new Position(16, 26)))
+    assertEquals(word.getParent.getRange, new Range(new Position(16, 2), new Position(16, 26)))
+    assertEquals(word.getParent.getParent.getRange, new Range(new Position(16, 0), new Position(17, 0)))
   }
 
   test("folds imports, doc comments and bodies, leaving closing braces visible") {

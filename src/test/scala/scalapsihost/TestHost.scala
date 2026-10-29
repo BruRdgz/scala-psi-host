@@ -111,6 +111,11 @@ object TestHost {
       host.edit(completionFile, 0, host.read(completionFile.getTextLength), completionSource)
       host.diagnostics(completionFile)
       host.inlayHints(completionFile)
+      host.selectionRanges(completionFile, completionSource.indexOf("values"))
+      val selectionText = "object SelectionScenario {\n  val path = s\"/one/$value\\n/two\"\n  \n}\n"
+      host.edit(completionFile, 0, host.read(completionFile.getTextLength), selectionText)
+      for (offset <- Seq(selectionText.indexOf("one"), selectionText.indexOf("\n  \n") + 2, selectionText.length))
+        host.selectionRanges(completionFile, offset)
     } finally host.closeSource(completionFile)
     for ((text, prefix, lookup) <- Seq(
       ("object StringScenario { val member = 1; val s = \"$mem\" }", "$mem", "member"),

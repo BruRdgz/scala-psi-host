@@ -15,7 +15,7 @@ val Fixtures = config("fixtures").hide
 val Fixtures212 = config("fixtures212").hide
 // Downloaded only as input to the slice task, never a compile or runtime dependency.
 val InlayPlatform = config("inlay-platform").hide
-val inlayPlatformJar = taskKey[File]("The platform classes used by the Scala hints pass")
+val inlayPlatformJar = taskKey[File]("The platform classes used by Scala hints and word selection")
 
 val scalaPluginJars = taskKey[Seq[File]]("The Scala plugin's jars that go on the classpath")
 
@@ -121,6 +121,7 @@ lazy val root = (project in file("."))
         "com/intellij/codeInsight/hint/TooltipGroup.class", // ImplicitHintsPass: ErrorTooltip initialization.
         "com/intellij/codeInsight/daemon/impl/HintRenderer.class", // TextPartsHintRenderer: expanded implicit labels in the oracle.
         "com/intellij/codeInsight/daemon/impl/HintRenderer$Companion.class", // TextPartsHintRenderer: its renderer base's companion.
+        "com/intellij/openapi/editor/actions/EditorActionUtil.class", // SelectWordUtil: word/lexeme boundaries in the editor's lexer.
       )
       val directory = target.value / "inlay-platform"
       val out = directory / s"scala-inlay-platform-$platformVersion.jar"

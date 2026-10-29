@@ -1,6 +1,7 @@
 # scala-psi-host
 
-> **Alpha.** Diagnostics, hover, go-to-definition, completion, signature help, inlay hints and formatting work;
+> **Alpha.** Diagnostics, hover, go-to-definition, completion, signature help, inlay hints, selection ranges and
+> formatting work;
 > references, rename and code actions do not exist yet. See [ROADMAP.md](ROADMAP.md) and
 > [Known limitations](#known-limitations).
 
@@ -9,8 +10,8 @@ application container**. The plugin source is not modified: the host builds the 
 answers, through fixed tables, what the plugin and the IntelliJ platform's PSI libraries ask of their environment.
 
 It serves LSP diagnostics, hover, go to definition and type definition, document highlights, document symbols,
-folding ranges, semantic tokens, completion, signature help, inlay hints and formatting for sbt (or any BSP) builds,
-Scala 2 and 3, with Java sources in mixed projects.
+folding ranges, semantic tokens, completion, signature help, inlay hints, selection ranges and formatting for sbt
+(or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
 
 Completion lists the suggestions of the plugin's completion contributors, ordered by its weighers; a suggestion's
 insert handler (parentheses, imports, generated code) runs once the user has chosen it, as in the IDE: the item's
@@ -22,6 +23,10 @@ Inlay hints come from the plugin's `ImplicitHintsPass`: inferred definition type
 `using` arguments, conversions, method chains and type arguments. The plugin's settings and defaults apply (parameter
 names and local/member variable types are off by default); implicit hints are enabled. Only the two range-hint
 options are disabled, since their presentation requires the IDE's concrete editor.
+
+Selection ranges replay Extend Selection through the platform's `SelectWordUtil`, with its base handlers and the
+plugin's handlers and filter registered from descriptors. Each parent is the next IDE step, using the current
+selection, the editor's default settings and the plugin's layered highlighting lexer.
 
 Symbols and folding are the plugin's structure view and folding builder; highlights and type definition, its access
 detector and type-declaration provider; semantic tokens, the colors its highlighting visitor and color-scheme
@@ -188,6 +193,9 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   and settings: **152 agree, 0 disagree, 9 skip**. Types: 25 agree; parameters: 13; type arguments: 62; implicit
   arguments: 38 (Scala 2 and 3); conversions: 14 (Scala 2 and 3). Eight source tests need Java setup, navigation or
   tooltip assertions; the additional range probe is skipped because range hints require `EditorImpl`.
+- `oracle.SelectionOracle <intellij-scala> <report.md>` — the plugin's selectioner tests, step by step: ScalaDoc
+  2 agree, 1 disagree; interpolated strings 27 agree; ordinary strings 9 agree; no skips. The multiline/single-line
+  helper runs both variants. See the trailing-newline disagreement below.
 - `oracle.SessionBenchmark <project> <report.md>` — latency and memory of a session as the language server runs it:
   requests at identifiers sampled over the project's files, then rounds of edits with heap samples.
 
@@ -230,6 +238,11 @@ the last (measured with `-XX:SoftRefLRUPolicyMSPerMB=0`, so the plugin's soft-re
   mode with compiler highlighting disabled, and reports inherited Scala 2 cases once.
 - Formatting uses the IntelliJ formatter with Scala's default code style: the project's code style and
   `.scalafmt.conf` are not read.
+- Selection ranges: `ScalaDocCommentSelectionerTest.testMainContentSelection` expects the multiline class without
+  its final newline, then the whole file. This platform's `WordSelectioner` delegates to
+  `ExtendWordSelectionHandlerBase.expandToWholeLine`, which includes that newline for the multiline class, so the
+  host reaches the whole file one step earlier. Editor settings use the platform defaults (camel words off,
+  whitespace expansion on); client editor preferences are not imported.
 - Scala 2 has no document compilation (its compiler has no stable interface to call); Scala 2 errors come from the
   plugin, or from the build's compile when compiler errors are enabled for Scala 2.
 - Java sources are parsed at the highest language level, not the build's.

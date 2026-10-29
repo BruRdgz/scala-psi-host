@@ -3,32 +3,37 @@ package scalapsihost
 import com.intellij.codeInsight.daemon.impl.{AnnotationHolderImpl, AnnotationSessionImpl}
 import com.intellij.codeInsight.hints.settings.ParameterNameHintsSettings
 import com.intellij.codeInsight.hints.{InlayParameterHintsExtension, InlayParameterHintsProvider}
+import com.intellij.codeInsight.editorActions.ExtendWordSelectionHandler
 import com.intellij.codeInsight.intention.preview.IntentionPreviewUtils
 import com.intellij.core.{CoreApplicationEnvironment, CoreFileTypeRegistry}
+import com.intellij.ide.highlighter.HtmlFileHighlighter
+import com.intellij.lang.html.HTMLLanguage
 import com.intellij.lang.java.JavaLanguage
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
 import com.intellij.psi.{PsiErrorElement, PsiFile, SyntaxTraverser}
 import com.intellij.psi.codeStyle.FileIndentOptionsProvider
 import com.intellij.psi.impl.source.tree.TreeCopyHandler
-import com.intellij.lang.{DefaultASTFactory, DefaultASTFactoryImpl, LanguageASTFactory, LanguageExtensionPoint, LanguageParserDefinitions, ParserDefinition, PsiBuilderFactory}
+import com.intellij.lang.{DefaultASTFactory, DefaultASTFactoryImpl, Language, LanguageASTFactory, LanguageCommenters, LanguageExtensionPoint, LanguageParserDefinitions, ParserDefinition, PsiBuilderFactory}
+import com.intellij.lang.parser.DummyBlockWordSelectionFilter
 import com.intellij.lang.impl.PsiBuilderFactoryImpl
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.application.{Application, ApplicationManager, ModalityState}
 import com.intellij.openapi.extensions.{DefaultPluginDescriptor, Extensions, PluginId}
 import com.intellij.openapi.extensions.impl.{ExtensionPointImpl, ExtensionsAreaImpl}
-import com.intellij.openapi.fileTypes.FileTypeRegistry
+import com.intellij.openapi.fileTypes.{FileTypeRegistry, SyntaxHighlighter, SyntaxHighlighterFactory, SyntaxHighlighterLanguageFactory}
+import com.intellij.openapi.options.advanced.{AdvancedSettings, AdvancedSettingType}
 import com.intellij.openapi.module.Module
 import com.intellij.openapi.progress.{EmptyProgressIndicator, ProgressManager}
 import com.intellij.openapi.progress.impl.CoreProgressManager
 import com.intellij.openapi.project.{DumbModeTask, DumbService, Project}
-import com.intellij.openapi.util.{Disposer, Key, UserDataHolderBase}
+import com.intellij.openapi.util.{Condition, Disposer, Key, UserDataHolderBase}
 import com.intellij.openapi.util.registry.Registry
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.featureStatistics.FeatureUsageTracker
 import com.intellij.lang.parameterInfo.{LanguageParameterInfo, ParameterInfoHandler}
 import com.intellij.navigation.ItemPresentationProviders
-import com.intellij.psi.{FileViewProvider, LanguageFileViewProviders, PsiClass, PsiField, PsiManager}
+import com.intellij.psi.{FileViewProvider, LanguageFileViewProviders, PsiClass, PsiElement, PsiField, PsiManager}
 import com.intellij.psi.presentation.java.{ClassPresentationProvider, FieldPresentationProvider}
 import com.intellij.psi.stubs.{LanguageStubDefinition, StubElementRegistryService, StubRegistryExtension}
 import com.intellij.psi.util.PsiModificationTracker
@@ -37,9 +42,14 @@ import com.intellij.util.messages.impl.MessageBusFactoryImpl
 import org.jetbrains.plugins.scala.codeInsight.ScalaCodeInsightSettings
 import org.jetbrains.plugins.scala.externalLibraries.bm4.BetterMonadicForSupport
 import org.jetbrains.plugins.scala.externalLibraries.kindProjector.KindProjectorUtil
+import org.jetbrains.plugins.scala.highlighter.{ScalaCommenter, ScalaSyntaxHighlighterFactory}
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiElementFactory
 import org.jetbrains.plugins.scala.project.{ProjectContext, ScalaFeatures}
+import org.jetbrains.plugins.scalaDoc.ScalaDocLanguage
+import org.jetbrains.plugins.scalaDoc.highlighter.ScalaDocSyntaxHighlighter
+import org.jetbrains.plugins.scalaDirective.ScalaDirectiveLanguage
+import org.jetbrains.plugins.scalaDirective.highlighter.ScalaDirectiveSyntaxHighlighter
 
 import java.io.File
 import java.nio.file.{Files, Path}
@@ -99,6 +109,9 @@ final class ScalaPsiHost private (
 
   /** The signatures of the call around `offset`, as the IDE's parameter info shows them. */
   def parameterInfo(file: ScalaFile, offset: Int): Option[ParameterInfo.Signatures] = ParameterInfo.at(file, offset)
+
+  /** Successive Extend Selection ranges, smallest first. */
+  def selectionRanges(file: ScalaFile, offset: Int): Seq[TextRange] = SelectionRanges.at(file, offset)
 
   /** What the insert handler of a chosen suggestion changes (see [[Completion.insert]]). */
   def insertCompletion(file: ScalaFile, start: Int, prefixText: String, lookup: String, identity: String)
@@ -362,6 +375,7 @@ object ScalaPsiHost {
     "org.intellij.scala.syntheticMemberInjector",
     // The inheritors of a class, from the stub index: case clauses and exhaustive matches list a sealed type's.
     "com.intellij.directClassInheritorsSearch", "com.intellij.classInheritorsSearch",
+    "com.intellij.extendWordSelectionHandler", "com.intellij.basicWordSelectionFilter",
   )
 
   /**
@@ -508,6 +522,19 @@ object ScalaPsiHost {
     if (pluginEps.isEmpty)
       throw new IllegalStateException(s"no extension points declared by the Scala plugin jars ${config.scalaPluginJars.mkString(", ")}; are they on the classpath?")
     pluginEps.foreach(d => declare(d.name))
+    // The base handlers in intellij.platform.lang.impl.xml also run for Scala, before the plugin's handlers.
+    declare(ExtendWordSelectionHandler.EP_NAME.getName)
+    val selectioners = area.getExtensionPoint[ExtendWordSelectionHandler](ExtendWordSelectionHandler.EP_NAME.getName)
+    val baseSelectioners = Seq("PlainTextLineSelectioner", "NaturalLanguageTextSelectioner", "WordSelectioner", "LineCommentSelectioner",
+      "BlockCommentSelectioner", "InjectedFileReferenceSelectioner").map("com.intellij.codeInsight.editorActions.wordSelection." + _) :+
+      "com.intellij.ide.highlighter.custom.impl.CustomFileTypeSelectWordHandler"
+    for (name <- baseSelectioners) {
+      val handler = newPrivate(Class.forName(name))
+      selectioners.registerExtension(classOf[ExtendWordSelectionHandler].cast(handler), root)
+    }
+    declare("com.intellij.basicWordSelectionFilter")
+    val wordFilters = area.getExtensionPoint[Condition[PsiElement]]("com.intellij.basicWordSelectionFilter")
+    wordFilters.registerExtension(new DummyBlockWordSelectionFilter, root)
     // The plugin's extension points whose extensions are language semantics, loaded as its descriptors register
     // them. syntheticMemberInjector: case-class and companion members, context bounds, enums, `derives`, and the
     // members library macros generate (Monocle, Circe, Simulacrum, ...), as the IDE always runs them.
@@ -822,6 +849,30 @@ object ScalaPsiHost {
       new org.jetbrains.plugins.scala.lang.scaladoc.reflinks.ScalaDocRefLinkParserDefinition,
     )
     parserDefinitions.foreach(pd => LanguageParserDefinitions.INSTANCE.addExplicitExtension(pd.getFileNodeType.getLanguage, pd))
+    // Word selection uses the same layered lexer as a Scala editor, including string escapes and ScalaDoc.
+    declare(SyntaxHighlighterLanguageFactory.EP_NAME.getName)
+    SyntaxHighlighterFactory.LANGUAGE_FACTORY.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE,
+      new ScalaSyntaxHighlighterFactory)
+    for ((language, highlighter) <- Seq[(Language, SyntaxHighlighter)](
+      ScalaDocLanguage.INSTANCE -> new ScalaDocSyntaxHighlighter,
+      ScalaDirectiveLanguage.INSTANCE -> new ScalaDirectiveSyntaxHighlighter,
+      HTMLLanguage.INSTANCE -> new HtmlFileHighlighter)) {
+      SyntaxHighlighterFactory.LANGUAGE_FACTORY.addExplicitExtension(language, new SyntaxHighlighterFactory {
+        override def getSyntaxHighlighter(project: Project, file: VirtualFile): SyntaxHighlighter = highlighter
+      })
+    }
+    LanguageCommenters.INSTANCE.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE, new ScalaCommenter)
+    // The platform descriptor's default enables whitespace expansion. Other advanced settings remain unsupported.
+    appServices.register(classOf[AdvancedSettings])(new AdvancedSettings {
+      override protected def getSetting(id: String): AnyRef = id match {
+        case "editor.selection.expand-whitespaces" =>
+          CallLog.answered("AdvancedSettings.editor.selection.expand-whitespaces")
+          java.lang.Boolean.TRUE
+        case _ => CallLog.unsupported(s"AdvancedSettings.getSetting $id")
+      }
+      override protected def getDefault(id: String): AnyRef = CallLog.unsupported(s"AdvancedSettings.getDefault $id")
+      override def setSetting(id: String, value: Any, kind: AdvancedSettingType): Unit = CallLog.unsupported(s"AdvancedSettings.setSetting $id")
+    })
     // Parameter info for arguments, type arguments and patterns: the plugin's handlers, as its descriptors register them.
     for (bean <- Descriptors.scalaExtensionBeans(config.scalaPluginJars, "com.intellij.codeInsight.parameterInfo")
          if bean.attributes.get("language").contains("Scala")) {

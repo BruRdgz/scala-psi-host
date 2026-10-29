@@ -158,6 +158,20 @@ final class ProjectSession private (
     case _ => None
   }
 
+  /** Each position's Extend Selection chain. An unexpandable caret still has its empty range, as LSP requires. */
+  def selectionRanges(path: Path, positions: Seq[LineColumn]): Seq[Seq[(LineColumn, LineColumn)]] = file(path) match {
+    case f: ScalaFile => host.read {
+      val d = document(f)
+      positions.map { at =>
+        val cursor = offset(d, at)
+        val ranges = host.selectionRanges(f, cursor)
+        val chain = if (ranges.isEmpty) Seq(new TextRange(cursor, cursor)) else ranges
+        chain.map(r => position(d, r.getStartOffset) -> position(d, r.getEndOffset))
+      }
+    }
+    case _ => Seq.empty
+  }
+
   /**
    * Runs the insert handler of the suggestion `identity`, whose lookup string `lookup` the editor has put at `start`
    * in place of `prefixText` (see [[Completion.insert]]). None when the file no longer has it there.
