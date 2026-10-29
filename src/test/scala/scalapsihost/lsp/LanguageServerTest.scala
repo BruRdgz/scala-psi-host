@@ -360,8 +360,9 @@ class LanguageServerTest extends munit.FunSuite {
     } finally change(original, 26)
   }
 
-  test("a newer edit cancels a queued completion instead of returning stale items") {
+  test("completion answers for its position while the user types on, as editors expect") {
     val original = Files.readString(main).replace("val text: String", "val text: Int")
+    // The next keystroke arrives before the completion has run.
     val pending = scalapsihost.HostLock.write {
       val request = implementation.getTextDocumentService.completion(new CompletionParams(document(main), new Position(6, 50)))
       implementation.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
@@ -369,15 +370,8 @@ class LanguageServerTest extends munit.FunSuite {
         java.util.List.of(new TextDocumentContentChangeEvent(original))))
       request
     }
-    val error = intercept[java.util.concurrent.ExecutionException](pending.get(1, TimeUnit.MINUTES))
-    error.getCause match {
-      case cancelled: org.eclipse.lsp4j.jsonrpc.ResponseErrorException =>
-        assertEquals(cancelled.getResponseError.getCode, org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestCancelled.getValue)
-      case other => fail(s"completion was not cancelled: $other")
-    }
-    val current = implementation.getTextDocumentService.completion(new CompletionParams(document(main), new Position(6, 50)))
-      .get(1, TimeUnit.MINUTES)
-    assert(current.getRight.getItems.asScala.exists(_.getFilterText == "text"), current.toString)
+    val answered = pending.get(1, TimeUnit.MINUTES)
+    assert(answered.getRight.getItems.asScala.exists(_.getFilterText == "text"), answered.toString)
   }
 
   test("formats the fixture buffer and a selected range using the request's tab options") {

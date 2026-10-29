@@ -65,7 +65,7 @@ final class ScalaLanguageServer(
   private val session = new CompletableFuture[ProjectSession]
   // Each document's latest version, as the client numbers them; diagnostics of older versions are dropped.
   private val versions = new ConcurrentHashMap[Path, Integer]()
-  // Edits counted as they arrive, before their turn on the documents thread (see onCopyRequest).
+  // Edits counted as they arrive, before their turn on the documents thread (see onEditsRequest).
   private val editsReceived = new AtomicLong()
 
   private def daemon(name: String): ThreadFactory = runnable => {
@@ -321,12 +321,13 @@ final class ScalaLanguageServer(
     new ResponseErrorException(new ResponseError(code, message, null))
 
   /**
-   * A request answered with edits of the document's text (completion, formatting): an edit received after it makes
-   * them wrong. A running one is cancelled as the edit arrives; one still waiting for its turn, or one the
-   * cancellation came too late for, is answered as cancelled.
+   * A request answered with edits the editor applies to the document as it is (formatting): an edit received after
+   * the request would make them apply to text they were not computed for, so the request is answered as cancelled.
+   * Completion is not one: its items are for the position it was asked at, and the editor narrows them down itself
+   * as the user types on.
    */
-  private def onCopyRequest[T](kind: String, document: TextDocumentIdentifier, outside: => T)
-                              (request: (ProjectSession, Path) => T): CompletableFuture[T] = {
+  private def onEditsRequest[T](kind: String, document: TextDocumentIdentifier, outside: => T)
+                               (request: (ProjectSession, Path) => T): CompletableFuture[T] = {
     val received = editsReceived.get()
     def checkNoNewerEdit(): Unit = if (editsReceived.get() != received) throw new ProcessCanceledException
     onSource(kind, document, outside) { (s, path) =>
@@ -357,7 +358,6 @@ final class ScalaLanguageServer(
 
     override def didChange(params: DidChangeTextDocumentParams): Unit = {
       editsReceived.incrementAndGet()
-      host.cancelReads()
       onDocuments("didChange") { s =>
         sourcePath(s, params.getTextDocument.getUri).foreach { path =>
           versions.put(path, params.getTextDocument.getVersion)
@@ -384,18 +384,18 @@ final class ScalaLanguageServer(
     }
 
     override def completion(params: CompletionParams): CompletableFuture[LspEither[java.util.List[CompletionItem], CompletionList]] =
-      onCopyRequest("completion", params.getTextDocument, LspEither.forRight(new CompletionList())) { (s, path) =>
+      onSource("completion", params.getTextDocument, LspEither.forRight(new CompletionList())) { (s, path) =>
         val choices = s.completion(path, lineColumn(params.getPosition))
         LspEither.forRight(new CompletionList(choices.incomplete, choices.items.zipWithIndex.map(completionItem).asJava))
       }
 
     override def formatting(params: DocumentFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
-      onCopyRequest("formatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
+      onEditsRequest("formatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
         textEdits(s.formatting(path, None, params.getOptions.getTabSize, !params.getOptions.isInsertSpaces))
       }
 
     override def rangeFormatting(params: DocumentRangeFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
-      onCopyRequest("rangeFormatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
+      onEditsRequest("rangeFormatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
         val range = params.getRange
         val options = params.getOptions
         textEdits(s.formatting(path, Some(lineColumn(range.getStart) -> lineColumn(range.getEnd)), options.getTabSize,

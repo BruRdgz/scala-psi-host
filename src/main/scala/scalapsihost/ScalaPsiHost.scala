@@ -78,9 +78,6 @@ final class ScalaPsiHost private (
    */
   def read[T](query: => T): T = HostLock.query(query)
 
-  /** Cancels reads for an editor change already received but still waiting in the server's queue. */
-  private[scalapsihost] def cancelReads(): Unit = HostLock.cancelQueries()
-
   /** The completion suggestions at `offset`. Not inside a read: inserting a suggestion changes a copy of the file. */
   def completion(file: ScalaFile, offset: Int): Completion.Suggestions = Completion.complete(file, offset)
 
