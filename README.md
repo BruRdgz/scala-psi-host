@@ -1,7 +1,7 @@
 # scala-psi-host
 
-> **Alpha.** Diagnostics, hover and go-to-definition work on real projects; much of what an editor expects
-> (completion, references, rename, formatting) does not exist yet. See [ROADMAP.md](ROADMAP.md) and
+> **Alpha.** Diagnostics, hover, go-to-definition, completion, signature help and formatting work on real projects;
+> references, rename, code actions and inlay hints do not exist yet. See [ROADMAP.md](ROADMAP.md) and
 > [Known limitations](#known-limitations).
 
 A Scala language server built on the IntelliJ Scala plugin's PSI and type checker, running **without an IntelliJ
@@ -9,7 +9,14 @@ application container**. The plugin source is not modified: the host builds the 
 answers, through fixed tables, what the plugin and the IntelliJ platform's PSI libraries ask of their environment.
 
 It serves LSP diagnostics, hover, go to definition and type definition, document highlights, document symbols,
-folding ranges and semantic tokens for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
+folding ranges, semantic tokens, completion, signature help and formatting for sbt (or any BSP) builds, Scala 2 and
+3, with Java sources in mixed projects.
+
+Completion lists the suggestions of the plugin's completion contributors, ordered by its weighers; a suggestion's
+insert handler (parentheses, imports, generated code) runs once the user has chosen it, as in the IDE: the item's
+command asks the server, which applies the handler's edits (`workspace/applyEdit`) and moves the caret
+(`window/showDocument`). Formatting is the IntelliJ formatter; a change runs on a copy of the file and comes back as
+minimal edits.
 Symbols and folding are the plugin's structure view and folding builder; highlights and type definition, its access
 detector and type-declaration provider; semantic tokens, the colors its highlighting visitor and color-scheme
 annotator give identifiers (the editor's grammar colors keywords, literals and comments).
@@ -156,6 +163,14 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   errors, timings, heap and a class histogram. On a 522-file Scala 3 project: no errors with compiler errors (the
   default), 81 with the plugin's type-aware checks (the same the IDE shows in its built-in mode).
 
+- `oracle.CompletionOracle <intellij-scala> <report.md>` — the plugin's completion tests: file fixtures, keyword
+  completion, auto-import and the `completion3` test methods (parsed with the host's PSI; the resulting text after
+  the chosen suggestion's handler). completion3: 118 agree, 11 disagree; keywords 70 of 70; Scala 3 fixtures are
+  not replayed yet.
+- `oracle.FormatterOracle <intellij-scala> <report.md>` — the plugin's file-based formatter tests: 187 of 187 (its
+  inline Scala test methods are not replayed).
+- `oracle.ParameterInfoOracle <intellij-scala> <report.md>` — the plugin's parameter info tests: 104 agree,
+  3 disagree (library versions), 35 skip (Scala 3 fixtures).
 - `oracle.SessionBenchmark <project> <report.md>` — latency and memory of a session as the language server runs it:
   requests at identifiers sampled over the project's files, then rounds of edits with heap samples.
 
@@ -187,6 +202,14 @@ after a full GC grows by about 0.3 MB per edit (see [Known limitations](#known-l
 - Requests are answered one at a time, in order: while a file's problems or semantic tokens are computed (seconds
   for the slowest files) or the build reloads, other requests wait.
 
+- Completion: the override contributor (member bodies come from the IDE's file templates) and the unresolved-name
+  contributor (it reads the IDE daemon's highlights) do not run; handlers that start live templates insert their
+  code without tab stops; a weigher failing on a suggestion whose PSI has no containing file leaves it out (cause
+  open). Choosing a suggestion with a handler is two edits (undo takes two steps).
+- Formatting uses the IntelliJ formatter with Scala's default code style: the project's code style and
+  `.scalafmt.conf` are not read.
+- The sbt server the build connection starts is stopped when the server ends; it should be left running, as sbt
+  shares it with other clients (planned).
 - Scala 2 has no document compilation (its compiler has no stable interface to call); Scala 2 errors come from the
   plugin, or from the build's compile when compiler errors are enabled for Scala 2.
 - Java sources are parsed at the highest language level, not the build's.
