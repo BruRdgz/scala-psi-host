@@ -64,5 +64,13 @@ object TestHost {
     }
     host.completion(file, scenarioSource.indexOf("inc(b)") + "inc".length)
     host.completion(file, scenarioSource.indexOf("x + 1") + "x +".length)
+    host.formatting(file, None, new org.eclipse.lsp4j.FormattingOptions(2, true))
+    val importFile = host.parse("object ImportUser { val x: scala.collection.mutable.HashSet[Int] = ??? }")
+    val target = host.read {
+      com.intellij.psi.JavaPsiFacade.getInstance(host.project).findClass("scala.collection.mutable.HashSet",
+        com.intellij.psi.search.GlobalSearchScope.allScope(host.project))
+    }
+    ChangeEngine.run(importFile)(_.addImportForClass(target, null))
+
   }
 }

@@ -118,6 +118,17 @@ final class ProjectSession private (
     }
   }
 
+  /** Copy modifications acquire their own write scope after positions have been read. */
+  def formatting(path: Path, range: Option[(LineColumn, LineColumn)], options: org.eclipse.lsp4j.FormattingOptions)
+      : Seq[org.eclipse.lsp4j.TextEdit] = file(path) match {
+    case f: ScalaFile =>
+      val selected = host.read {
+        range.map((start, end) => new TextRange(offset(document(f), start), offset(document(f), end)))
+      }
+      host.formatting(f, selected, options)
+    case _ => Seq.empty
+  }
+
   /**
    * Applies an editor change: the text between `start` and `end` becomes `replacement`; without a range, the whole
    * text is replaced.

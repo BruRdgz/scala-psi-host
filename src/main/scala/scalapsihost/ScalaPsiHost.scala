@@ -86,6 +86,10 @@ final class ScalaPsiHost private (
     Completion.complete(file, offset)
   }
 
+  /** Formatting returns edits against the current snapshot while leaving project PSI untouched. */
+  def formatting(file: ScalaFile, range: Option[TextRange], options: org.eclipse.lsp4j.FormattingOptions): Seq[org.eclipse.lsp4j.TextEdit] =
+    ChangeEngine.format(file, range, options).edits
+
   /** A file outside the project: parsed, but invisible to symbol lookups (as the IDE's non-physical files). */
   def parse(text: String, features: ScalaFeatures = ScalaFeatures.default): ScalaFile = HostLock.readLocked {
     ScalaPsiElementFactory.createScalaFileFromText(text, features)(using new ProjectContext(project))
@@ -119,7 +123,10 @@ final class ScalaPsiHost private (
     // The document manager learns of document changes as a document listener (in the IDE, through the editor's
     // global event multicaster), so that a commit reparses what changed.
     val documents = com.intellij.psi.PsiDocumentManager.getInstance(project)
-    documents.getDocument(file).addDocumentListener(documents.asInstanceOf[com.intellij.openapi.editor.event.DocumentListener])
+    documents match {
+      case manager: HostPsiDocumentManager => manager.listenTo(documents.getDocument(file))
+      case other => throw new IllegalStateException(s"unexpected document manager: ${other.getClass.getName}")
+    }
     file
   }
 
@@ -256,6 +263,8 @@ final class ScalaPsiHost private (
     lazy val rootManager: com.intellij.openapi.roots.ModuleRootManager = new Host_ModuleRootManager(dispatch {
       case ("ModuleRootManager.orderEntries", _) => orderEntries
       case ("ModuleRootManager.getModule", _) => module
+      // Host modules declare source membership, but no content entries or inherited package prefixes.
+      case ("ModuleRootManager.getContentEntries", _) => Array.empty[com.intellij.openapi.roots.ContentEntry]
     })
     lazy val module: Module = tableProxy(classOf[Module], "Module") {
       case ("getName", _) => hostModule.spec.name
@@ -390,13 +399,21 @@ object ScalaPsiHost {
       case ("getServiceIfCreated", Array(c: Class[?])) => appServices.get(c)
       case ("getExtensionArea", _) => area
       case ("getMessageBus", _) => appBus
-      // The host has no UI thread and no write actions: every caller may read.
+      // UI dispatch and access ownership are supplied by the host's threads and lock.
       case ("isDispatchThread", _) => java.lang.Boolean.valueOf(HostDispatchThread.isCurrent)
-      case ("isWriteIntentLockAcquired", _) => java.lang.Boolean.FALSE
+      case ("isWriteIntentLockAcquired", _) => java.lang.Boolean.valueOf(HostLock.hasWriteIntent)
+      case ("runWriteIntentReadAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) =>
+        HostLock.writeIntent(c.compute()).asInstanceOf[AnyRef]
+      case ("addReadActionListener", Array(listener: com.intellij.openapi.application.ReadActionListener, parent: Disposable)) =>
+        HostLock.addReadListener(listener, parent); null
+      case ("addWriteIntentReadActionListener", Array(listener: com.intellij.openapi.application.WriteIntentReadActionListener, parent: Disposable)) =>
+        HostLock.addIntentListener(listener, parent); null
+      case ("addWriteActionListener", Array(listener: com.intellij.openapi.application.WriteActionListener, parent: Disposable)) =>
+        HostLock.addWriteListener(listener, parent); null
       // Reads and writes are the host's lock (HostLock): access is allowed where the thread holds it.
-      case ("isReadAccessAllowed", _) => java.lang.Boolean.valueOf(HostLock.isReading || HostLock.isWriting)
+      case ("isReadAccessAllowed", _) => java.lang.Boolean.valueOf(HostLock.isReading || HostLock.hasWriteIntent)
       case ("assertReadAccessAllowed", _) =>
-        if (!HostLock.isReading && !HostLock.isWriting) throw new IllegalStateException("read access is allowed inside read or write actions only")
+        if (!HostLock.isReading && !HostLock.hasWriteIntent) throw new IllegalStateException("read access is allowed inside read or write actions only")
         null
       case ("isWriteAccessAllowed", _) => java.lang.Boolean.valueOf(HostLock.isWriting)
       // Work for the UI thread runs on the host's dispatch thread.
@@ -408,6 +425,7 @@ object ScalaPsiHost {
         null
       case ("runWriteAction", Array(r: Runnable)) => HostLock.write(r.run()); null
       case ("runWriteAction", Array(c: com.intellij.openapi.util.Computable[?])) => HostLock.write(c.compute()).asInstanceOf[AnyRef]
+      case ("runWriteAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) => HostLock.write(c.compute()).asInstanceOf[AnyRef]
       case ("assertIsNonDispatchThread" | "assertReadAccessNotAllowed", _) => null
       case ("isUnitTestMode", _) => java.lang.Boolean.valueOf(config.unitTestMode)
       case ("isInternal" | "isEAP" | "isDisposed", _) => java.lang.Boolean.FALSE
@@ -590,10 +608,29 @@ object ScalaPsiHost {
       val cls = Class.forName("com.intellij.psi.ExternalChangeActionUtil$PsiExternalChangeService").asInstanceOf[Class[AnyRef]]
       appServices.register(cls)(newPrivate(cls))
     }
+    // The plugin's settings provider links UI classes absent from this classpath. Its customizeDefaults sets
+    // these three indent sizes to 2 and KEEP_FIRST_COLUMN_COMMENT to false; the settings bean owns import defaults.
+    val scalaStyleProvider = tableProxy(classOf[com.intellij.psi.codeStyle.LanguageCodeStyleProvider], "ScalaCodeStyleProvider") {
+      case ("getLanguage", _) => org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE
+      case ("getDefaultCommonSettings", _) =>
+        val common = new com.intellij.psi.codeStyle.CommonCodeStyleSettings(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE)
+        val indent = common.initIndentOptions()
+        val ScalaDefaultIndentSize = 2
+        indent.INDENT_SIZE = ScalaDefaultIndentSize
+        indent.TAB_SIZE = ScalaDefaultIndentSize
+        indent.CONTINUATION_INDENT_SIZE = ScalaDefaultIndentSize
+        common.KEEP_FIRST_COLUMN_COMMENT = false
+        common
+      case ("getDocCommentSettings", _) => com.intellij.psi.codeStyle.DocCommentSettings.DEFAULTS
+      case ("createCustomSettings", Array(settings: com.intellij.psi.codeStyle.CodeStyleSettings)) =>
+        new org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings(settings)
+    }
     appServices.register(classOf[com.intellij.psi.codeStyle.CodeStyleSettingsService])(
       tableProxy(classOf[com.intellij.psi.codeStyle.CodeStyleSettingsService], "CodeStyleSettingsService") {
         case ("addListener", _) => null
-        case ("getFileTypeIndentOptionsFactories" | "getLanguageCodeStyleProviders", _) => java.util.List.of()
+        case ("getFileTypeIndentOptionsFactories", _) => java.util.List.of()
+        case ("getLanguageCodeStyleProviders", _) =>
+          java.util.List.of(scalaStyleProvider)
         // Only Scala's custom settings bean, with defaults; not the settings-UI provider.
         case ("getCustomCodeStyleSettingsFactories", _) =>
           java.util.List.of(new com.intellij.psi.codeStyle.CustomCodeStyleSettingsFactory {
@@ -601,6 +638,29 @@ object ScalaPsiHost {
               new org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings(s)
           })
       })
+    appServices.register(classOf[com.intellij.formatting.Formatter])(new com.intellij.formatting.FormatterImpl)
+    appServices.register(classOf[com.intellij.formatting.FormattingProgressCallbackFactory])(
+      tableProxy(classOf[com.intellij.formatting.FormattingProgressCallbackFactory], "FormattingProgressCallbackFactory") {
+        // The optional UI callback is absent; cancellation uses the request's progress indicator.
+        case ("createProgressCallback", _) => null
+      })
+    CoreApplicationEnvironment.registerExtensionPoint(area, "com.intellij.lang.formatter", classOf[LanguageExtensionPoint[?]])
+    com.intellij.lang.LanguageFormatting.INSTANCE.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE,
+      new org.jetbrains.plugins.scala.lang.formatting.ScalaFormattingModelBuilder)
+    CoreApplicationEnvironment.registerExtensionPoint(area, "com.intellij.lang.importOptimizer", classOf[LanguageExtensionPoint[?]])
+    com.intellij.lang.LanguageImportStatements.INSTANCE.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE,
+      new org.jetbrains.plugins.scala.editor.importOptimizer.ScalaImportOptimizer)
+    for (name <- Seq("com.intellij.formattingService", "com.intellij.lang.formatter.restriction", "com.intellij.externalFormatProcessor",
+                     "com.intellij.preFormatProcessor", "com.intellij.postFormatProcessor", "com.intellij.disabledIndentRangesProvider", "com.intellij.documentWriteAccessGuard")) declare(name)
+    area.getExtensionPoint[com.intellij.formatting.service.FormattingService]("com.intellij.formattingService")
+      .registerExtension(new com.intellij.formatting.service.CoreFormattingService, root)
+    area.getExtensionPoint[com.intellij.lang.LanguageFormattingRestriction]("com.intellij.lang.formatter.restriction")
+      .registerExtension(new org.jetbrains.plugins.scala.lang.formatting.ScalaLanguageFormattingRestriction, root)
+    area.getExtensionPoint[com.intellij.psi.impl.source.codeStyle.PreFormatProcessor]("com.intellij.preFormatProcessor")
+      .registerExtension(new org.jetbrains.plugins.scala.lang.formatting.processors.ScalaDocNewlinedPreFormatProcessor, root)
+    val postProcessors = area.getExtensionPoint[com.intellij.psi.impl.source.codeStyle.PostFormatProcessor]("com.intellij.postFormatProcessor")
+    postProcessors.registerExtension(new org.jetbrains.plugins.scala.lang.formatting.processors.ScalaBracePostFormatProcessor, root)
+    postProcessors.registerExtension(new org.jetbrains.plugins.scala.lang.formatting.processors.ScalaTrailingCommaProcessor, root)
     val symbolIndex = new SymbolIndex
     appServices.register(classOf[com.intellij.psi.stubs.StubIndex])(symbolIndex.stubIndex)
     // The project library table, which the host never changes; LibraryExtensionsManager subscribes to it.
@@ -872,6 +932,10 @@ object ScalaPsiHost {
         else if (vp == null) viewProviders.remove(f)
         else viewProviders.put(f, vp.asInstanceOf[FileViewProvider])
         null
+      case ("forceReload", Array(f: VirtualFile)) if isTemporary(f) &&
+          Option(cachedViewProvider(f)).forall(vp => !vp.supportsSendingPsiEvents()) =>
+        // FileManagerImpl drops nonphysical providers on reload; it never reloads their backing file from disk.
+        f.putUserData(temporaryViewProvider, null); null
       case ("findViewProvider", Array(f: VirtualFile)) => viewProvider(f)
       case ("findFile", Array(f: VirtualFile)) =>
         if (f.isDirectory) null else { val vp = viewProvider(f); vp.getPsi(vp.getBaseLanguage) }
@@ -929,10 +993,9 @@ object ScalaPsiHost {
     psiManagerRef = psiManager
     projectServices.register(classOf[PsiManager])(psiManager)
     projectServices.register(classOf[PsiModificationTracker])(psiModTracker)
-    // PSI <-> document synchronization: the core implementation used by headless compilers (package-private).
+    // PSI <-> document synchronization without the IDE's global editor event multicaster.
     projectServices.register(classOf[com.intellij.psi.PsiDocumentManager]) {
-      val documents = newPrivate(Class.forName("com.intellij.core.CorePsiDocumentManager"), project)
-        .asInstanceOf[com.intellij.psi.impl.PsiDocumentManagerBase]
+      val documents = new HostPsiDocumentManager(project)
       // Commits are explicit and synchronous (ScalaPsiHost.edit), never the IDE's background commit after typing.
       documents.disableBackgroundCommit(root)
       documents
@@ -979,7 +1042,9 @@ object ScalaPsiHost {
     projectServices.register(classOf[org.jetbrains.plugins.scala.project.settings.ScalaCompilerConfiguration])(
       new org.jetbrains.plugins.scala.project.settings.ScalaCompilerConfiguration(project))
     // PSI write path: the plugin edits non-physical copies (e.g. for-comprehension desugaring).
-    projectServices.register(classOf[com.intellij.pom.PomModel])(new com.intellij.pom.core.impl.PomModelImpl(project))
+    projectServices.register(classOf[com.intellij.pom.PomModel])(
+      classOf[com.intellij.pom.PomModel].cast(newPrivate(
+        Class.forName("com.intellij.psi.impl.source.PostprocessReformattingAspectImpl$LangPomModel"), project)))
     projectServices.register(classOf[com.intellij.pom.tree.TreeAspect])(new com.intellij.pom.tree.TreeAspect)
     projectServices.register(classOf[com.intellij.psi.SmartPointerManager])(new com.intellij.psi.impl.smartPointers.SmartPointerManagerImpl(project))
     projectServices.register(classOf[com.intellij.psi.PsiElementFactory])(new com.intellij.psi.impl.PsiElementFactoryImpl(project))
@@ -1063,17 +1128,15 @@ object ScalaPsiHost {
     appServices.register(classOf[com.intellij.openapi.project.DefaultProjectFactory])(new Host_DefaultProjectFactory(dispatch {
       case ("DefaultProjectFactory.getDefaultProject", _) => project
     }))
-    // Code style: the host never formats, so actions "with the formatter disabled" (reparse results applied to the
-    // tree) just run.
-    projectServices.register(classOf[com.intellij.psi.codeStyle.CodeStyleManager])(new Host_CodeStyleManager(dispatch {
-      case ("CodeStyleManager.performActionWithFormatterDisabled", Array(r: Runnable)) => r.run(); null
-      case ("CodeStyleManager.performActionWithFormatterDisabled", Array(c: com.intellij.openapi.util.Computable[?])) =>
-        c.compute().asInstanceOf[AnyRef]
-    }))
+    projectServices.register(classOf[com.intellij.psi.codeStyle.CodeStyleManager])(
+      new com.intellij.psi.impl.source.codeStyle.CodeStyleManagerImpl(project))
     // No language injection in the host: every file is its own top-level file.
     projectServices.register(classOf[com.intellij.lang.injection.InjectedLanguageManager])(new Host_InjectedLanguageManager(dispatch {
       case ("InjectedLanguageManager.getTopLevelFile", Array(e: com.intellij.psi.PsiElement)) => e.getContainingFile
       case ("InjectedLanguageManager.isInjectedViewProvider", _) => java.lang.Boolean.FALSE
+      case ("InjectedLanguageManager.getCachedInjectedDocumentsInRange", _) => java.util.List.of()
+      // There are no registered injectors, so enumeration has no injected fragments to visit.
+      case ("InjectedLanguageManager.enumerate", _) => null
     }))
     // JVM-language-neutral class lookup that JavaPsiFacadeImpl also consults; no other JVM language provides classes.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.lang.jvm.facade.JvmElementProvider.EP_NAME.getName,
@@ -1088,6 +1151,7 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager]) {
       val m = new com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager(project, /* loadExtensions = */ false)
       m.USE_PER_PROJECT_SETTINGS = true
+      m.setMainProjectCodeStyle(new com.intellij.psi.codeStyle.CodeStyleSettings)
       m
     }
     projectServices.register(classOf[com.intellij.psi.impl.ResolveScopeManager])(new Host_ResolveScopeManager(dispatch {

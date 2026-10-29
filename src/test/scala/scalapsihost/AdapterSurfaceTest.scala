@@ -37,6 +37,23 @@ class AdapterSurfaceTest extends munit.FunSuite {
     }
   }
 
+  test("formatting and imports use the reviewed Scala implementations and defaults") {
+    TestHost.host.read {
+      val language = org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE
+      assert(com.intellij.lang.LanguageFormatting.INSTANCE.forLanguage(language)
+        .isInstanceOf[org.jetbrains.plugins.scala.lang.formatting.ScalaFormattingModelBuilder])
+      val optimizers = com.intellij.lang.LanguageImportStatements.INSTANCE.allForLanguage(language).asScala
+      assertEquals(optimizers.map(_.getClass.getName).toSeq, Seq("org.jetbrains.plugins.scala.editor.importOptimizer.ScalaImportOptimizer"))
+      val settings = com.intellij.psi.codeStyle.CodeStyleSettingsManager.getInstance(TestHost.host.project).getCurrentSettings
+      val indent = settings.getCommonSettings(language).getIndentOptions
+      assertEquals((indent.INDENT_SIZE, indent.TAB_SIZE, indent.CONTINUATION_INDENT_SIZE), (2, 2, 2))
+      val scala = settings.getCustomSettings(classOf[org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings])
+      assertEquals(scala.FORMATTER, org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings.INTELLIJ_FORMATTER)
+      assertEquals(scala.getClassCountToUseImportOnDemand, 5)
+      assert(scala.isAddFullQualifiedImports && scala.isSortImports && !scala.isSortAsScalastyle)
+    }
+  }
+
   test("the adapter surface matches the reviewed list") {
     TestHost.runScenario()
     val actual = CallLog.snapshot.map(_._1).filterNot(isSymbolLookup)

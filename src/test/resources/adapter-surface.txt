@@ -1,4 +1,8 @@
 AnnotationCacheOwnerNormalizer.doNormalize
+Application.addReadActionListener
+Application.addSuspendingWriteActionListener (default)
+Application.addWriteActionListener
+Application.addWriteIntentReadActionListener
 Application.assertReadAccessAllowed
 Application.assertWriteAccessAllowed
 Application.getDefaultModalityState
@@ -15,10 +19,14 @@ Application.isInternal
 Application.isReadAccessAllowed
 Application.isUnitTestMode
 Application.isWriteAccessAllowed
+Application.isWriteIntentLockAcquired
 Application.loadClass
+Application.runReadAction
 Application.service com.intellij.codeInsight.CodeInsightSettings
 Application.service com.intellij.codeInsight.completion.CompletionService
 Application.service com.intellij.codeInsight.completion.group.GroupedCompletion
+Application.service com.intellij.formatting.Formatter
+Application.service com.intellij.formatting.FormattingProgressCallbackFactory
 Application.service com.intellij.lang.DefaultASTFactory
 Application.service com.intellij.lang.PsiBuilderFactory
 Application.service com.intellij.openapi.application.AsyncExecutionService
@@ -29,6 +37,7 @@ Application.service com.intellij.openapi.fileEditor.FileDocumentManager
 Application.service com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers
 Application.service com.intellij.openapi.progress.ProgressManager
 Application.service com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
+Application.service com.intellij.openapi.vfs.encoding.EncodingManager
 Application.service com.intellij.openapi.vfs.newvfs.ManagingFS
 Application.service com.intellij.psi.ExternalChangeActionUtil$PsiExternalChangeService
 Application.service com.intellij.psi.LanguageSubstitutors
@@ -41,6 +50,7 @@ Application.service com.intellij.psi.impl.source.codeStyle.IndentHelper
 Application.service com.intellij.psi.stubs.StubElementRegistryService
 Application.service com.intellij.psi.stubs.StubIndex
 Application.service com.intellij.psi.stubs.StubTreeLoader
+Application.service com.intellij.psi.util.PsiVersioningService
 Application.service com.intellij.util.indexing.FileBasedIndex
 Application.service org.jetbrains.plugins.scala.lang.psi.api.expr.ExpectedTypes
 Application.service org.jetbrains.plugins.scala.scalaMeta.ScalaMetaApi
@@ -51,7 +61,6 @@ Application.service(null) com.intellij.psi.impl.source.tree.mvcc.PsiVersioningGa
 AsyncExecutionService.buildNonBlockingReadAction
 CodeStyleSettingsService.addListener
 CodeStyleSettingsService.getCustomCodeStyleSettingsFactories
-CodeStyleSettingsService.getFileTypeIndentOptionsFactories
 CodeStyleSettingsService.getLanguageCodeStyleProviders
 CompletionCaret.getOffset
 CompletionCaret.hasSelection
@@ -63,20 +72,25 @@ DumbService.isDumb
 DumbService.queueTask
 Elf.isInElfScope
 Elf.runReadAction
+EncodingManager.getDefaultCharset
 ExternalAnnotationsManager.findExternalAnnotations
 ExternalAnnotationsManager.findExternalAnnotationsFiles
 FileBasedIndex.processFilesContainingAnyKey
 FileIndexFacade.isInLibraryClasses
 FileManager.findCachedViewProvider
+FileManager.findCachedViewProviders
 FileManager.findDirectory
 FileManager.findFile
+FileManager.getCachedPsiFile
 FileManager.setViewProvider
 FileTypeManager.getFileTypeByExtension
 FileTypeManager.getFileTypeByFile
 FileTypeManager.getRegisteredFileTypes
 FileTypeManager.isFileIgnored
+FormattingProgressCallbackFactory.createProgressCallback
 GroupedCompletion.isEnabled
 InferredAnnotationsManager.findInferredAnnotation
+InjectedLanguageManager.getCachedInjectedDocumentsInRange
 InjectedLanguageManager.getTopLevelFile
 InjectedLanguageManager.isInjectedViewProvider
 JavaPsiImplementationHelper.getEffectiveLanguageLevel
@@ -118,6 +132,7 @@ Project.service com.intellij.psi.PsiManager
 Project.service com.intellij.psi.PsiNameHelper
 Project.service com.intellij.psi.PsiResolveHelper
 Project.service com.intellij.psi.SmartPointerManager
+Project.service com.intellij.psi.codeStyle.CodeStyleManager
 Project.service com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager
 Project.service com.intellij.psi.impl.JavaPsiImplementationHelper
 Project.service com.intellij.psi.impl.ResolveScopeManager
@@ -151,7 +166,9 @@ PsiManager.areElementsEquivalent
 PsiManager.beforeChange
 PsiManager.findDirectory
 PsiManager.findFile
+PsiManager.findFile(context)
 PsiManager.getFileManager
+PsiManager.getFileManagerEx
 PsiManager.getModificationTracker
 PsiManager.getProject
 PsiManager.isAssertOnFileLoading
@@ -160,5 +177,9 @@ PsiManager.isDisposed
 PsiShortNamesCache.getAllClassNames
 PsiShortNamesCache.getClassesByName
 ResolveScopeManager.getResolveScope
+ScalaCodeStyleProvider.getDefaultCommonSettings
+ScalaCodeStyleProvider.getDocCommentSettings
+ScalaCodeStyleProvider.getLanguage
+ScalaCodeStyleProvider.useBaseLanguageCommonSettings (default)
 StubIndex.getAllKeys
 StubIndex.processElements

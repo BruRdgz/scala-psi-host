@@ -37,3 +37,39 @@ final class HostDocumentCommitProcessor extends DocumentCommitProcessor {
   override def commitSynchronouslyLightweight(document: Document, project: Project): Unit =
     CallLog.unsupported("DocumentCommitProcessor.commitSynchronouslyLightweight")
 }
+
+/** Mirrors the platform's postponed-formatting unblock without installing its editor event multicaster. */
+private[scalapsihost] final class HostPsiDocumentManager(project: Project) extends PsiDocumentManagerBase(project) {
+  /** The priority collector records event ranges before the manager decides whether a commit is needed. */
+  def listenTo(document: Document): AutoCloseable = {
+    val collector = new PriorityEventCollector
+    document.addDocumentListener(collector)
+    document.addDocumentListener(this)
+    () => {
+      document.removeDocumentListener(this)
+      document.removeDocumentListener(collector)
+    }
+  }
+
+  override def isDocumentBlockedByPsi(document: Document): Boolean = {
+    val aspect = com.intellij.psi.impl.source.PostprocessReformattingAspect.getInstance(project)
+    getCachedViewProviders(document).asScala.exists(aspect.isViewProviderLocked)
+  }
+
+  override def doPostponedOperationsAndUnblockDocument(document: Document): Unit = {
+    val aspect = com.intellij.psi.impl.source.PostprocessReformattingAspect.getInstance(project)
+    val providers = document match {
+      case window: com.intellij.injected.editor.DocumentWindow =>
+        val top = getCachedViewProviders(window.getDelegate)
+        if (top.asScala.exists(com.intellij.util.InjectionUtils.shouldFormatOnlyInjectedCode)) getCachedViewProviders(document)
+        else top
+      case _ => getCachedViewProviders(document)
+    }
+    providers.asScala.foreach(aspect.doPostponedFormatting)
+  }
+
+  override protected def beforeDocumentChangeOnUnlockedDocument(provider: com.intellij.psi.FileViewProvider): Unit = {
+    com.intellij.psi.impl.source.PostprocessReformattingAspect.getInstance(project).assertDocumentChangeIsAllowed(provider)
+    super.beforeDocumentChangeOnUnlockedDocument(provider)
+  }
+}

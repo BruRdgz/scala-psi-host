@@ -159,6 +159,8 @@ final class ScalaLanguageServer(
     capabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental)
     capabilities.setHoverProvider(true)
     capabilities.setCompletionProvider(new CompletionOptions(false, java.util.List.of(".")))
+    capabilities.setDocumentFormattingProvider(true)
+    capabilities.setDocumentRangeFormattingProvider(true)
     capabilities.setDefinitionProvider(true)
     capabilities.setTypeDefinitionProvider(true)
     capabilities.setDocumentHighlightProvider(true)
@@ -270,9 +272,17 @@ final class ScalaLanguageServer(
     CompletableFuture.supplyAsync(() =>
       try timed(kind, submitted)(request(session.join()))
       catch {
+        case e: com.intellij.diff.comparison.DiffTooBigException =>
+          HostLog.warn(s"$kind diff is too large", e)
+          throw new org.eclipse.lsp4j.jsonrpc.ResponseErrorException(new org.eclipse.lsp4j.jsonrpc.messages.ResponseError(
+            org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestFailed, "change diff is too large", null))
         case e: ProcessCanceledException => throw new org.eclipse.lsp4j.jsonrpc.ResponseErrorException(
           new org.eclipse.lsp4j.jsonrpc.messages.ResponseError(org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestCancelled,
             "request cancelled by a newer edit", null))
+        case e: scalapsihost.ChangeEngine.UnsupportedFormatter =>
+          client.showMessage(new MessageParams(MessageType.Error, e.getMessage))
+          throw new org.eclipse.lsp4j.jsonrpc.ResponseErrorException(new org.eclipse.lsp4j.jsonrpc.messages.ResponseError(
+            org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestFailed, e.getMessage, null))
         case NonFatal(e) =>
           HostLog.error(s"$kind failed", e)
           throw e
@@ -299,6 +309,22 @@ final class ScalaLanguageServer(
   private def onSource[T](kind: String, document: TextDocumentIdentifier, outside: => T)(request: (ProjectSession, Path) => T): CompletableFuture[T] =
     onDocuments(kind)(s => sourcePath(s, document.getUri).fold(outside)(request(s, _)))
 
+  /** Receipt-time versions guard copy requests both before execution and before publishing their edits. */
+  private def onCopyRequest[T](kind: String, document: TextDocumentIdentifier, outside: => T)
+                              (request: (ProjectSession, Path) => T): CompletableFuture[T] = {
+    val version = completionVersion(document.getUri)
+    val submittedVersion = version.get()
+    onSource(kind, document, outside) { (s, path) =>
+      completionGate.synchronized { completing = true }
+      try {
+        if (version.get() != submittedVersion) throw new ProcessCanceledException
+        val result = request(s, path)
+        if (version.get() != submittedVersion) throw new ProcessCanceledException
+        result
+      } finally completionGate.synchronized { completing = false }
+    }
+  }
+
   private object TextDocuments extends LspServices.TextDocuments {
     // Documents that are not project sources are not tracked. A Scala or Java file that is not one yet may have just
     // been created (the editor may open it before reporting its creation): the build is imported again first.
@@ -319,7 +345,7 @@ final class ScalaLanguageServer(
 
     override def didChange(params: DidChangeTextDocumentParams): Unit = {
       completionVersion(params.getTextDocument.getUri).incrementAndGet()
-      // Cancel only while the documents thread is completing; offset reads used by another edit must finish.
+      // Cancel only during a copy request; offset reads used by another edit must finish.
       completionGate.synchronized { if (completing) host.cancelReads() }
       onDocuments("didChange") { s =>
         sourcePath(s, params.getTextDocument.getUri).foreach { path =>
@@ -348,19 +374,22 @@ final class ScalaLanguageServer(
 
     override def completion(params: CompletionParams)
         : CompletableFuture[LspEither[java.util.List[CompletionItem], CompletionList]] = {
-      val version = completionVersion(params.getTextDocument.getUri)
-      val submittedVersion = version.get()
-      onSource("completion", params.getTextDocument,
+      onCopyRequest("completion", params.getTextDocument,
         LspEither.forRight[java.util.List[CompletionItem], CompletionList](new CompletionList(false, java.util.List.of()))) { (s, path) =>
-        completionGate.synchronized { completing = true }
-        try {
-          if (version.get() != submittedVersion) throw new ProcessCanceledException
-          val result = s.completion(path, lineColumn(params.getPosition))
-          if (version.get() != submittedVersion) throw new ProcessCanceledException
-          LspEither.forRight(result)
-        } finally completionGate.synchronized { completing = false }
+        LspEither.forRight(s.completion(path, lineColumn(params.getPosition)))
       }
     }
+
+    override def formatting(params: DocumentFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
+      onCopyRequest("formatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
+        s.formatting(path, None, params.getOptions).asJava
+      }
+
+    override def rangeFormatting(params: DocumentRangeFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
+      onCopyRequest("rangeFormatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
+        val range = params.getRange
+        s.formatting(path, Some(lineColumn(range.getStart) -> lineColumn(range.getEnd)), params.getOptions).asJava
+      }
 
     override def definition(params: DefinitionParams)
         : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =

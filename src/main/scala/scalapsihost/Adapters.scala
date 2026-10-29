@@ -47,18 +47,79 @@ private[scalapsihost] object HostLock {
   private val queries = java.util.concurrent.ConcurrentHashMap.newKeySet[com.intellij.openapi.progress.ProgressIndicator]()
 
   def isReading: Boolean = lock.getReadHoldCount > 0
+  private val intent = new java.util.concurrent.locks.ReentrantLock(true)
+  private val writeListeners = new java.util.concurrent.CopyOnWriteArrayList[com.intellij.openapi.application.WriteActionListener]()
+  private val readListeners = new java.util.concurrent.CopyOnWriteArrayList[com.intellij.openapi.application.ReadActionListener]()
+  private val intentListeners = new java.util.concurrent.CopyOnWriteArrayList[com.intellij.openapi.application.WriteIntentReadActionListener]()
+
   def isWriting: Boolean = lock.isWriteLockedByCurrentThread
+  def hasWriteIntent: Boolean = intent.isHeldByCurrentThread
+
+  def addWriteListener(listener: com.intellij.openapi.application.WriteActionListener,
+                       parent: com.intellij.openapi.Disposable): Unit = {
+    writeListeners.add(listener)
+    com.intellij.openapi.util.Disposer.register(parent, (() => { writeListeners.remove(listener); () }): com.intellij.openapi.Disposable)
+  }
+
+  def addReadListener(listener: com.intellij.openapi.application.ReadActionListener,
+                      parent: com.intellij.openapi.Disposable): Unit = {
+    readListeners.add(listener)
+    com.intellij.openapi.util.Disposer.register(parent, (() => { readListeners.remove(listener); () }): com.intellij.openapi.Disposable)
+  }
+
+  def addIntentListener(listener: com.intellij.openapi.application.WriteIntentReadActionListener,
+                        parent: com.intellij.openapi.Disposable): Unit = {
+    intentListeners.add(listener)
+    com.intellij.openapi.util.Disposer.register(parent, (() => { intentListeners.remove(listener); () }): com.intellij.openapi.Disposable)
+  }
+
+  /** Write intent serializes potential writers while still allowing other threads to read. */
+  def writeIntent[T](body: => T): T = {
+    if (isReading && !hasWriteIntent) throw new IllegalStateException("write intent cannot start inside a read")
+    if (hasWriteIntent) body
+    else {
+      val listeners = intentListeners.asScala.toVector
+      val action = HostLock.getClass
+      listeners.foreach(_.beforeWriteIntentReadActionStart(action))
+      intent.lock()
+      try {
+        listeners.foreach(_.writeIntentReadActionStarted(action))
+        try body
+        finally listeners.foreach(_.writeIntentReadActionFinished(action))
+      } finally {
+        intent.unlock()
+        listeners.foreach(_.afterWriteIntentReadActionFinished(action))
+      }
+    }
+  }
+
+  /** A copy modification is cancelled by an editor write just like a semantic read. */
+  def modification[T](body: => T): T = write {
+    val indicator = new com.intellij.openapi.progress.EmptyProgressIndicator
+    queries.add(indicator)
+    try com.intellij.openapi.progress.ProgressManager.getInstance.runProcess((() => body): com.intellij.openapi.util.Computable[T], indicator)
+    finally queries.remove(indicator)
+  }
 
   /** An editor notification can cancel reads before its queued write acquires the documents thread. */
   def cancelQueries(): Unit = queries.forEach(_.cancel())
 
   /** A read without its own cancellation (the platform's `runReadAction`): the lock only. */
   def readLocked[T](body: => T): T =
-    if (isReading || isWriting) body
+    if (isReading || hasWriteIntent) body
     else {
+      val listeners = readListeners.asScala.toVector
+      val action = HostLock.getClass
+      listeners.foreach(_.beforeReadActionStart(action))
       lock.readLock.lock()
-      try body
-      finally lock.readLock.unlock()
+      try {
+        listeners.foreach(_.readActionStarted(action))
+        try body
+        finally listeners.foreach(_.readActionFinished(action))
+      } finally {
+        lock.readLock.unlock()
+        listeners.foreach(_.afterReadActionFinished(action))
+      }
     }
 
   /** [[readLocked]] for Java callers. */
@@ -69,12 +130,10 @@ private[scalapsihost] object HostLock {
     if (isReading || isWriting) body
     else {
       val indicator = new com.intellij.openapi.progress.EmptyProgressIndicator
-      lock.readLock.lock()
-      queries.add(indicator)
-      try com.intellij.openapi.progress.ProgressManager.getInstance.runProcess((() => body): com.intellij.openapi.util.Computable[T], indicator)
-      finally {
-        queries.remove(indicator)
-        lock.readLock.unlock()
+      readLocked {
+        queries.add(indicator)
+        try com.intellij.openapi.progress.ProgressManager.getInstance.runProcess((() => body): com.intellij.openapi.util.Computable[T], indicator)
+        finally queries.remove(indicator)
       }
     }
 
@@ -82,9 +141,23 @@ private[scalapsihost] object HostLock {
     // A read lock cannot become a write lock: waiting for it here would wait for this thread's own read forever.
     if (isReading && !isWriting) throw new IllegalStateException("an edit cannot start inside a read")
     if (!isWriting) cancelQueries()
-    lock.writeLock.lock()
-    try body
-    finally lock.writeLock.unlock()
+    writeIntent {
+      if (isWriting) body
+      else {
+        val listeners = writeListeners.asScala.toVector
+        val action = HostLock.getClass
+        listeners.foreach(_.beforeWriteActionStart(action))
+        lock.writeLock.lock()
+        try {
+          listeners.foreach(_.writeActionStarted(action))
+          try body
+          finally listeners.foreach(_.writeActionFinished(action))
+        } finally {
+          lock.writeLock.unlock()
+          listeners.foreach(_.afterWriteActionFinished(action))
+        }
+      }
+    }
   }
 }
 

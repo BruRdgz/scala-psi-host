@@ -144,6 +144,8 @@ class LanguageServerTest extends munit.FunSuite {
     assert(capabilities.getHoverProvider.getLeft)
     assertEquals(capabilities.getCompletionProvider.getTriggerCharacters.asScala.toSeq, Seq("."))
     assertEquals(capabilities.getCompletionProvider.getResolveProvider, java.lang.Boolean.FALSE)
+    assert(capabilities.getDocumentFormattingProvider.getLeft)
+    assert(capabilities.getDocumentRangeFormattingProvider.getLeft)
     assert(capabilities.getDefinitionProvider.getLeft)
     assert(capabilities.getTypeDefinitionProvider.getLeft)
     assert(capabilities.getDocumentHighlightProvider.getLeft)
@@ -345,6 +347,72 @@ class LanguageServerTest extends munit.FunSuite {
     val current = implementation.getTextDocumentService.completion(new CompletionParams(document(main), new Position(6, 50)))
       .get(1, TimeUnit.MINUTES)
     assert(current.getRight.getItems.asScala.exists(_.getFilterText == "text"), current.toString)
+  }
+
+  test("formats the fixture buffer and a selected range using the request's tab options") {
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    val text = "package app\nobject FormatFixture {\nval emoji=\"😀\"\nval n=1+2\n}\n"
+    def change(value: String, version: Int): Unit =
+      server.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
+        new VersionedTextDocumentIdentifier(main.toUri.toString, version),
+        java.util.List.of(new TextDocumentContentChangeEvent(value))))
+    def applyEdits(edits: Seq[TextEdit]): String = {
+      val snapshot = new com.intellij.openapi.editor.impl.DocumentImpl(text, true)
+      def offset(p: Position) = snapshot.getLineStartOffset(p.getLine) + p.getCharacter
+      edits.reverse.foldLeft(text)((current, edit) =>
+        current.substring(0, offset(edit.getRange.getStart)) + edit.getNewText + current.substring(offset(edit.getRange.getEnd)))
+    }
+    change(text, 30)
+    try {
+      val options = new FormattingOptions(4, false)
+      val params = new DocumentFormattingParams(document(main), options)
+      val edits = server.getTextDocumentService.formatting(params).get(1, TimeUnit.MINUTES).asScala.toSeq
+      assertEquals(applyEdits(edits), "package app\n\nobject FormatFixture {\n\tval emoji = \"😀\"\n\tval n = 1 + 2\n}\n")
+      assertEquals(server.getTextDocumentService.formatting(params).get(1, TimeUnit.MINUTES).asScala.toSeq, edits)
+      val selected = server.getTextDocumentService.rangeFormatting(new DocumentRangeFormattingParams(
+        document(main), new FormattingOptions(2, true), new Range(new Position(3, 0), new Position(3, 9))))
+        .get(1, TimeUnit.MINUTES).asScala.toSeq
+      assertEquals(applyEdits(selected), "package app\nobject FormatFixture {\nval emoji=\"😀\"\n  val n = 1 + 2\n}\n")
+    } finally change(original, 31)
+  }
+
+  test("a newer edit cancels a queued formatting request") {
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    val pending = scalapsihost.HostLock.write {
+      val request = implementation.getTextDocumentService.formatting(new DocumentFormattingParams(document(main), new FormattingOptions(2, true)))
+      implementation.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
+        new VersionedTextDocumentIdentifier(main.toUri.toString, 32), java.util.List.of(new TextDocumentContentChangeEvent(original))))
+      request
+    }
+    val error = intercept[java.util.concurrent.ExecutionException](pending.get(1, TimeUnit.MINUTES))
+    error.getCause match {
+      case cancelled: org.eclipse.lsp4j.jsonrpc.ResponseErrorException =>
+        assertEquals(cancelled.getResponseError.getCode, org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestCancelled.getValue)
+      case other => fail(s"formatting was not cancelled: $other")
+    }
+  }
+
+  test("an explicitly selected scalafmt reports an LSP error and a visible message") {
+    val settings = scalapsihost.HostLock.write {
+      val settings = com.intellij.psi.codeStyle.CodeStyleSettingsManager.getInstance(TestHost.host.project).getCurrentSettings
+        .getCustomSettings(classOf[org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings])
+      settings.FORMATTER = org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings.SCALAFMT_FORMATTER
+      settings
+    }
+    try {
+      val request = implementation.getTextDocumentService.formatting(new DocumentFormattingParams(document(main), new FormattingOptions(2, true)))
+      val error = intercept[java.util.concurrent.ExecutionException](request.get(1, TimeUnit.MINUTES))
+      error.getCause match {
+        case unsupported: org.eclipse.lsp4j.jsonrpc.ResponseErrorException =>
+          assertEquals(unsupported.getResponseError.getCode, org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestFailed.getValue)
+          assert(unsupported.getMessage.contains("scalafmt"))
+        case other => fail(s"scalafmt did not report an LSP error: $other")
+      }
+      val shown = Client.shown.poll(10, TimeUnit.SECONDS)
+      assert(shown != null && shown.getMessage.contains("scalafmt"), String.valueOf(shown))
+    } finally scalapsihost.HostLock.write {
+      settings.FORMATTER = org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings.INTELLIJ_FORMATTER
+    }
   }
 
   private def filesChanged(changes: (Path, FileChangeType)*): Unit = {
