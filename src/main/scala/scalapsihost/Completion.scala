@@ -22,6 +22,7 @@ import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.{ScEnum, ScObje
 import org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.ScSyntheticFunction
 import org.jetbrains.plugins.scala.project.ScalaFeatures
 
+import scala.annotation.tailrec
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal
@@ -293,15 +294,42 @@ object Completion {
     results.map(sorterOf).distinct.flatMap { sorter =>
       // Sorters are compared by value: contributors make equal ones for each result.
       val group = results.filter(sorterOf(_) == sorter)
-      val classifier = sorter.buildClassifier(Classifier.empty[LookupElement]())
       // Equal weights are ordered by source position, never by hash iteration, so the order is the same every time.
-      val elements = group.map(_.getLookupElement).sortBy(sourceOrder)
-      elements.foreach { element =>
-        ProgressManager.checkCanceled()
-        classifier.addElement(element, context)
-      }
-      classifier.classify(elements.asJava, context).asScala.map(byElement).toVector
+      classified(sorter, group.map(_.getLookupElement).sortBy(sourceOrder), context).map(byElement)
     }
+  }
+
+  /**
+   * `elements` in the order of `sorter`'s weighers. One a weigher fails on is logged and left out, and the others are
+   * weighed again by a new classifier (the failed one may have weighed it in part): the rest still make a list.
+   */
+  @tailrec
+  private def classified(sorter: CompletionSorterImpl, elements: Vector[LookupElement], context: ProcessingContext): Vector[LookupElement] = {
+    val classifier = sorter.buildClassifier(Classifier.empty[LookupElement]())
+    val failed = elements.find { element =>
+      ProgressManager.checkCanceled()
+      try {
+        classifier.addElement(element, context)
+        false
+      } catch {
+        case e: ProcessCanceledException => throw e
+        case NonFatal(e) =>
+          HostLog.error(s"weighing the suggestion ${describe(element)} failed", e)
+          CallLog.hit("Completion.weighingFailed")
+          true
+      }
+    }
+    failed match {
+      case Some(element) => classified(sorter, elements.filterNot(_ eq element), context)
+      case None => classifier.classify(elements.asJava, context).asScala.toVector
+    }
+  }
+
+  /** What a failure report needs to find the element: its kind, and where its PSI is (or is not). */
+  private def describe(element: LookupElement): String = {
+    val psi = Option(element.getPsiElement)
+    val file = psi.flatMap(e => Option(e.getContainingFile)).fold("no file")(f => s"in ${f.getName} (${f.getClass.getSimpleName})")
+    s"${element.getLookupString} (${element.getClass.getSimpleName}; ${psi.fold("no PSI")(e => s"${e.getClass.getSimpleName}, valid ${e.isValid}, $file")})"
   }
 
   private def sorterOf(result: CompletionResult): CompletionSorterImpl = result.getSorter match {
