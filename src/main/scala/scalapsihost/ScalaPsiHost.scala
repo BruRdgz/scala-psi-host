@@ -893,8 +893,11 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.pom.tree.TreeAspect])(new com.intellij.pom.tree.TreeAspect)
     projectServices.register(classOf[com.intellij.psi.SmartPointerManager])(new com.intellij.psi.impl.smartPointers.SmartPointerManagerImpl(project))
     projectServices.register(classOf[com.intellij.psi.PsiElementFactory])(new com.intellij.psi.impl.PsiElementFactoryImpl(project))
+    // One scope for everything, as one scope per module: the plugin keys its caches by scope, so a new object per
+    // request would add entries on every lookup that are never found again.
+    val everythingScope = new com.intellij.psi.search.EverythingGlobalScope(project)
     projectServices.register(classOf[com.intellij.psi.search.ProjectScopeBuilder])(new Host_ProjectScopeBuilder(dispatch {
-      case (m, _) if m.startsWith("ProjectScopeBuilder.build") => new com.intellij.psi.search.EverythingGlobalScope(project)
+      case (m, _) if m.startsWith("ProjectScopeBuilder.build") => everythingScope
     }))
     // Class and package lookup: the platform's JavaPsiFacadeImpl over element finders, as in the IDE. The plugin's
     // finders come with the host's LibraryClassFinder, which takes the place of the IDE's PsiElementFinderImpl.
@@ -995,9 +998,9 @@ object ScalaPsiHost {
       // everything.
       case ("ResolveScopeManager.getResolveScope" | "ResolveScopeManager.getUseScope", Array(e: com.intellij.psi.PsiElement)) =>
         val file = Option(e.getContainingFile).map(_.getOriginalFile.getViewProvider.getVirtualFile)
-        file.flatMap(moduleModel.ofFile).map(moduleModel.resolveScope).getOrElse(new com.intellij.psi.search.EverythingGlobalScope(project))
+        file.flatMap(moduleModel.ofFile).map(moduleModel.resolveScope).getOrElse(everythingScope)
       case ("ResolveScopeManager.getDefaultResolveScope", Array(f: VirtualFile)) =>
-        moduleModel.ofFile(f).map(moduleModel.resolveScope).getOrElse(new com.intellij.psi.search.EverythingGlobalScope(project))
+        moduleModel.ofFile(f).map(moduleModel.resolveScope).getOrElse(everythingScope)
     }))
     // Index-backed Scala symbol lookup: the real class, answered by the host's StubIndex.
     projectServices.register(classOf[org.jetbrains.plugins.scala.caches.ScalaShortNamesCacheManager])(
