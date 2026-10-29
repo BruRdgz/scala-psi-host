@@ -11,7 +11,16 @@ import scala.jdk.CollectionConverters.*
  */
 object CallLog {
   private val counts = new ConcurrentHashMap[String, AtomicInteger]()
+  /**
+   * Whether the calls the host answers are counted too, not only unsupported calls and logged errors: the adapter
+   * surface test needs them. A server does not, and counting each of the platform's calls cost a tenth of its CPU.
+   */
+  @volatile var countsAnswered = false
+
   def hit(name: String): Unit = counts.computeIfAbsent(name, _ => new AtomicInteger()).incrementAndGet()
+
+  /** A call the host answered from its tables; its name is only made when such calls are counted. */
+  def answered(name: => String): Unit = if (countsAnswered) hit(name)
   def unsupported[T](name: String): T = {
     hit("UNSUPPORTED " + name)
     throw new UnsupportedOperationException("host adapter does not support: " + name)
@@ -186,6 +195,11 @@ private[scalapsihost] object HostDispatchThread {
 }
 
 /** A fixed-table adapter: a Proxy that answers only what `answer` handles; default methods run as written. */
+// What an answer table gives for a call it has no case for. One lookup (applyOrElse) instead of two (isDefinedAt,
+// then apply): tables answer the platform's most frequent calls.
+private val NotAnswered = new AnyRef
+private val Unanswered: Any => AnyRef = _ => NotAnswered
+
 def tableProxy[T](iface: Class[T], label: String)(answer: PartialFunction[(String, Array[AnyRef]), AnyRef]): T = {
   val handler: InvocationHandler = (proxy: AnyRef, m: Method, args0: Array[AnyRef]) => {
     val args = if (args0 == null) Array.empty[AnyRef] else args0
@@ -194,9 +208,9 @@ def tableProxy[T](iface: Class[T], label: String)(answer: PartialFunction[(Strin
       case "equals" if args.length == 1 => java.lang.Boolean.valueOf(proxy eq args(0))
       case "toString" if args.isEmpty => s"Host$label"
       case name =>
-        val key = (name, args)
-        if (answer.isDefinedAt(key)) { CallLog.hit(s"$label.$name"); answer(key) }
-        else if (m.isDefault) { CallLog.hit(s"$label.$name (default)"); InvocationHandler.invokeDefault(proxy, m, args*) }
+        val answered = answer.applyOrElse((name, args), Unanswered)
+        if (answered ne NotAnswered) { CallLog.answered(s"$label.$name"); answered }
+        else if (m.isDefault) { CallLog.answered(s"$label.$name (default)"); InvocationHandler.invokeDefault(proxy, m, args*) }
         else CallLog.unsupported(s"$label.$name")
     }
   }
@@ -207,7 +221,8 @@ def tableProxy[T](iface: Class[T], label: String)(answer: PartialFunction[(Strin
 def dispatch(answer: PartialFunction[(String, Array[AnyRef]), AnyRef]): Dispatch =
   (method: String, args0: Array[AnyRef]) => {
     val args = if (args0 == null) Array.empty[AnyRef] else args0
-    if (answer.isDefinedAt((method, args))) { CallLog.hit(method); answer((method, args)) }
+    val answered = answer.applyOrElse((method, args), Unanswered)
+    if (answered ne NotAnswered) { CallLog.answered(method); answered }
     else CallLog.unsupported(method)
   }
 
@@ -312,12 +327,12 @@ final class ServiceTable(label: String) {
   def registerNull(cls: Class[?]): Unit = nulls.add(cls)
 
   def get(cls: Class[?]): AnyRef =
-    if (nulls.contains(cls)) { CallLog.hit(s"$label.service(null) ${cls.getName}"); null }
+    if (nulls.contains(cls)) { CallLog.answered(s"$label.service(null) ${cls.getName}"); null }
     else {
       val make = factories.get(cls)
       if (make == null) CallLog.unsupported(s"$label.getService ${cls.getName}")
       else {
-        CallLog.hit(s"$label.service ${cls.getName}")
+        CallLog.answered(s"$label.service ${cls.getName}")
         // Not computeIfAbsent: service constructors fetch other services, and ConcurrentHashMap forbids
         // nested updates. Concurrent first requests may build twice; one instance wins. Threading is phase F3.
         val existing = instances.get(cls)

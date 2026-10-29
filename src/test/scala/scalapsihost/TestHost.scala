@@ -14,10 +14,14 @@ object TestHost {
   private def property(name: String): String =
     sys.props.getOrElse(name, throw new IllegalStateException(s"system property $name is not set; run the tests through sbt"))
 
-  lazy val host: ScalaPsiHost = ScalaPsiHost.start(HostConfig(
-    stateDir = Path.of(property("scalapsihost.stateDir")),
-    scalaPluginJars = property("scalapsihost.scalaPluginJars").split(File.pathSeparator).toSeq.map(Path.of(_)),
-  ))
+  lazy val host: ScalaPsiHost = {
+    // The adapter surface test lists every call the host answers.
+    CallLog.countsAnswered = true
+    ScalaPsiHost.start(HostConfig(
+      stateDir = Path.of(property("scalapsihost.stateDir")),
+      scalaPluginJars = property("scalapsihost.scalaPluginJars").split(File.pathSeparator).toSeq.map(Path.of(_)),
+    ))
+  }
 
   /** scala-library 2.13 and the test JVM's JDK, the classpath of a plain Scala 2.13 project. */
   lazy val libraryReport: LibraryIndexReport = {

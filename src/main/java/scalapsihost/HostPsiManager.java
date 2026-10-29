@@ -47,7 +47,7 @@ public final class HostPsiManager extends PsiManagerEx {
   }
 
   private static <T> T no(String name) { return CallLog.unsupported("PsiManager." + name); }
-  private static void hit(String name) { CallLog.hit("PsiManager." + name); }
+  private static void hit(String name) { if (CallLog.countsAnswered()) CallLog.hit("PsiManager." + name); }
 
   // Supported: identity, lifecycle and tree-change notifications.
   @Override public Project getProject() { hit("getProject"); return project; }
