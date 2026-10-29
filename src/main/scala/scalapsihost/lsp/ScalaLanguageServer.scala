@@ -10,7 +10,7 @@ import scalapsihost.{CallLog, HostLog, LineColumn, ScalaPsiHost}
 import java.net.URI
 import java.nio.file.Path
 import java.util.concurrent.*
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
@@ -26,8 +26,8 @@ import scala.util.control.NonFatal
  * project are reported as progress, and its state (see [[HostProtocol]]) as it changes. Requests are timed: slow ones
  * are logged, and every one at debug level.
  *
- * @param exitProcess ends the server's process with the given code on the `exit` notification (0 after a `shutdown`
- *                    request, 1 otherwise, as LSP defines); nothing for a server embedded in another process
+ * @param exitProcess ends the server's process with the given code when the client exits or disappears (0 after a
+ *                    `shutdown` request, 1 otherwise, as LSP defines); nothing for a server embedded in another process
  * @param logFile     where the log is written, for messages that point to it
  * @param startupLog  what was logged before the client connected (the host's startup), sent to it when it connects
  */
@@ -41,6 +41,8 @@ final class ScalaLanguageServer(
   private val DiagnosticsDelayMs = 200L
   // A request that takes longer is logged as slow: an editor waiting this long looks stuck.
   private val SlowRequestMs = 1000L
+  // Allows a short BSP shutdown handshake, but never waits for a full build import when the client has gone.
+  private val EndingDeadlineSeconds = 5L
 
   @volatile private var client: LanguageClient = scala.compiletime.uninitialized
   private var clientLog: Option[AutoCloseable] = None
@@ -51,6 +53,8 @@ final class ScalaLanguageServer(
   private val progressTokens = new AtomicInteger()
   private val requests = new RequestStats
   @volatile private var shutdownRequested = false
+  @volatile private var projectRequested = false
+  private val ending = new AtomicBoolean()
   private val documents = Executors.newSingleThreadExecutor(daemon("scala-psi-host-documents"))
   private val diagnostics = Executors.newSingleThreadScheduledExecutor(daemon("scala-psi-host-diagnostics"))
   private val session = new CompletableFuture[ProjectSession]
@@ -124,6 +128,7 @@ final class ScalaLanguageServer(
       .getOrElse(throw new IllegalArgumentException("the client sent no workspace folder or root URI"))
     val clientName = Option(params.getClientInfo).map(i => s"${i.getName} ${Option(i.getVersion).getOrElse("")}".trim).getOrElse("an unnamed client")
     HostLog.info(s"initialized by $clientName for $rootUri")
+    projectRequested = true
     documents.execute { () =>
       val root = Path.of(URI.create(rootUri))
       setState("importing", s"opening $root")
@@ -153,6 +158,13 @@ final class ScalaLanguageServer(
     capabilities.setDocumentSymbolProvider(true)
     capabilities.setFoldingRangeProvider(true)
     capabilities.setSemanticTokensProvider(new SemanticTokensWithRegistrationOptions(SemanticColoring.legend, /* full = */ true))
+    Option(params.getProcessId).foreach { pid =>
+      try {
+        val process = ProcessHandle.of(pid.longValue())
+        if (process.isPresent) process.get().onExit().thenRun(() => exit())
+        else exit()
+      } catch { case NonFatal(e) => HostLog.warn(s"could not watch client process $pid", e) }
+    }
     CompletableFuture.completedFuture(new InitializeResult(capabilities, new ServerInfo("scala-psi-host", "0.1")))
   }
 
@@ -173,15 +185,30 @@ final class ScalaLanguageServer(
 
   override def shutdown(): CompletableFuture[AnyRef] = {
     shutdownRequested = true
-    CompletableFuture.supplyAsync(() => { if (session.isDone && !session.isCompletedExceptionally) session.join().close(); null }, documents)
+    closing
   }
 
-  override def exit(): Unit = {
-    HostLog.info(s"exiting (${if (shutdownRequested) "after a shutdown request" else "without a shutdown request"})")
-    clientLog.foreach(_.close())
+  private lazy val closing: CompletableFuture[AnyRef] = {
     documents.shutdownNow()
     diagnostics.shutdownNow()
-    exitProcess(if (shutdownRequested) 0 else 1)
+    val closed = if (!projectRequested) CompletableFuture.completedFuture[AnyRef](null)
+    else session.handleAsync[AnyRef]((opened, error) => {
+      if (error == null) opened.close()
+      null
+    }, runnable => daemon("scala-psi-host-ending").newThread(runnable).start())
+    closed.orTimeout(EndingDeadlineSeconds, TimeUnit.SECONDS)
+  }
+
+  override def exit(): Unit = if (ending.compareAndSet(false, true)) {
+    clientLog.foreach(_.close())
+    HostLog.info(s"exiting (${if (shutdownRequested) "after a shutdown request" else "without a shutdown request"})")
+    try closing.get(EndingDeadlineSeconds, TimeUnit.SECONDS)
+    catch {
+      case e: InterruptedException =>
+        HostLog.warn("interrupted while closing the project", e)
+        Thread.currentThread().interrupt()
+      case NonFatal(e) => HostLog.warn("could not close the project before exiting", e)
+    } finally exitProcess(if (shutdownRequested) 0 else 1)
   }
 
   /**

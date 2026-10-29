@@ -1,15 +1,18 @@
 package scalapsihost
 
 import ch.epfl.scala.bsp4j.*
-import com.google.gson.{Gson, JsonElement}
+import com.google.gson.{Gson, JsonElement, JsonObject}
 import com.intellij.lang.annotation.HighlightSeverity
 import org.eclipse.lsp4j.jsonrpc.Launcher
 
-import java.net.URI
-import java.nio.file.{Files, Path}
+import java.net.{ConnectException, SocketException, StandardProtocolFamily, URI, UnixDomainSocketAddress}
+import java.nio.channels.SocketChannel
+import java.nio.file.{Files, NoSuchFileException, Path}
 import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
+import scala.util.control.NonFatal
 
 /**
  * What compiling a file of a module needs, as the build describes it: the module's own compiler (its jars), the
@@ -56,8 +59,13 @@ final class BuildConnection private[scalapsihost] (
   capabilities: BuildServerCapabilities,
   client: BspImport.DiagnosticsClient,
   timeoutMinutes: Long,
+  sbtServer: Option[BspImport.OwnedSbtServer],
 ) extends AutoCloseable {
   import BspImport.gson
+
+  // A local shutdown handshake needs seconds, not the minutes allowed for importing and compiling a build.
+  private val ShutdownDeadlineSeconds = 2L
+  private val closed = new AtomicBoolean()
 
   private def await[T](f: java.util.concurrent.CompletableFuture[T]): T = f.get(timeoutMinutes, TimeUnit.MINUTES)
 
@@ -145,13 +153,25 @@ final class BuildConnection private[scalapsihost] (
     CompileResult(succeeded, client.snapshot())
   }
 
-  override def close(): Unit =
+  override def close(): Unit = if (closed.compareAndSet(false, true)) {
+    var descendants = Seq.empty[ProcessHandle]
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(ShutdownDeadlineSeconds)
     try {
-      await(server.buildShutdown())
+      // Capture children before the handshake: they may be reparented when the launcher exits normally.
+      descendants = Using.resource(process.descendants())(_.iterator().asScala.toVector)
+      server.buildShutdown().get(ShutdownDeadlineSeconds, TimeUnit.SECONDS)
       server.onBuildExit()
+      process.waitFor(math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)
+    } catch {
+      case e: InterruptedException =>
+        HostLog.warn("interrupted while shutting down the build server", e)
+        Thread.currentThread().interrupt()
+      case NonFatal(e) => HostLog.warn("build server shutdown failed", e)
     } finally {
-      if (!process.waitFor(30, TimeUnit.SECONDS)) process.destroyForcibly()
+      BspImport.destroyProcess(process, descendants)
+      sbtServer.foreach(_.stop())
     }
+  }
 }
 
 object BspImport {
@@ -162,6 +182,85 @@ object BspImport {
   /** The build server's interfaces the host calls. */
   trait HostBuildServer extends BuildServer with ScalaBuildServer
 
+  private[scalapsihost] enum SbtServerState {
+    case Missing
+    case Inactive(socket: Path)
+    case Live(socket: Path)
+    case Unknown(reason: String)
+  }
+
+  /** A leftover socket is normal after sbt exits; a nonblocking connection checks liveness without delaying exit. */
+  private[scalapsihost] def sbtServerState(projectDir: Path): SbtServerState = {
+    import SbtServerState.*
+    val active = projectDir.resolve("project/target/active.json")
+    try {
+      val json = gson.fromJson(Files.readString(active), classOf[JsonObject])
+      val uri = Option(json).flatMap(j => Option(j.get("uri")))
+        .filter(j => j.isJsonPrimitive && j.getAsJsonPrimitive.isString)
+        .map(j => URI.create(j.getAsString))
+        .getOrElse(throw new IllegalArgumentException(s"no server URI in $active"))
+      if (uri.getScheme != "local" || uri.getAuthority != null || Option(uri.getPath).forall(!_.startsWith("/")))
+        Unknown(s"cannot check server URI $uri")
+      else {
+        val socket = Path.of(uri.getPath)
+        try {
+          Using.resource(SocketChannel.open(StandardProtocolFamily.UNIX)) { channel =>
+            channel.configureBlocking(false)
+            if (channel.connect(UnixDomainSocketAddress.of(socket))) Live(socket)
+            else Unknown(s"connection to $socket is pending")
+          }
+        } catch {
+          case _: ConnectException | _: NoSuchFileException => Inactive(socket)
+          // The JDK also reports a missing Unix socket as SocketException; other socket errors remain uncertain.
+          case _: SocketException if Files.notExists(socket) => Inactive(socket)
+        }
+      }
+    } catch {
+      case _: NoSuchFileException => Missing
+      case NonFatal(e) =>
+        HostLog.warn(s"could not check sbt server in $active", e)
+        Unknown(e.toString)
+    }
+  }
+
+  /** The shutdown client can start a server itself, so it is only safe while our server is still live. */
+  private[scalapsihost] final class OwnedSbtServer(projectDir: Path, argv: Seq[String], log: Path) {
+    // With the two-second BSP handshake this leaves half a second of the LSP's five seconds for local cleanup.
+    private val ServerShutdownDeadlineMillis = 2500L
+    private val stopped = new AtomicBoolean()
+
+    def stop(): Unit = if (stopped.compareAndSet(false, true)) {
+      val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ServerShutdownDeadlineMillis)
+      // An interrupted BSP handshake must still allow this bounded cleanup to reach the daemon.
+      val interrupted = Thread.interrupted()
+      try sbtServerState(projectDir) match {
+        case SbtServerState.Live(_) =>
+          HostLog.info(s"stopping sbt server started by this host in $projectDir")
+          try {
+            val shutdown = new ProcessBuilder((argv.dropRight(1) ++ Seq("--client", "shutdown")).asJava)
+              .directory(projectDir.toFile)
+              .redirectErrorStream(true)
+              .redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile))
+              .start()
+            try {
+              shutdown.getOutputStream.close()
+              if (!shutdown.waitFor(math.max(0L, deadline - System.nanoTime()), TimeUnit.NANOSECONDS))
+                HostLog.warn(s"sbt server shutdown exceeded $ServerShutdownDeadlineMillis ms (output: $log)")
+              else if (shutdown.exitValue() != 0)
+                HostLog.warn(s"sbt server shutdown exited with ${shutdown.exitValue()} (output: $log)")
+            } finally destroyProcess(shutdown)
+          } catch {
+            case e: InterruptedException =>
+              HostLog.warn("interrupted while stopping the owned sbt server", e)
+              Thread.currentThread().interrupt()
+            case NonFatal(e) => HostLog.warn(s"could not stop the owned sbt server (output: $log)", e)
+          }
+        case state @ SbtServerState.Unknown(_) => HostLog.warn(s"cannot safely stop the owned sbt server in $projectDir: $state")
+        case state => HostLog.info(s"skipping owned sbt server shutdown in $projectDir: $state")
+      } finally if (interrupted) Thread.currentThread().interrupt()
+    }
+  }
+
   /**
    * Starts the build server named by a connection file in `<project>/.bsp` and initializes it.
    *
@@ -170,28 +269,67 @@ object BspImport {
   def connect(projectDir: Path, connection: Option[String] = None, timeoutMinutes: Long = 10): BuildConnection = {
     val details = connectionDetails(projectDir, connection)
     val log = Files.createTempFile("scala-psi-host-bsp", ".log")
+    val argv = details.getArgv.asScala.toSeq
+    val sbtServer = if (details.getName == "sbt" && argv.lastOption.contains("-bsp")) {
+      val state = sbtServerState(projectDir)
+      val owns = state match {
+        case SbtServerState.Missing | SbtServerState.Inactive(_) => true
+        case _ => false
+      }
+      HostLog.info(s"sbt server before connecting in $projectDir: $state; host owns server: $owns")
+      Option.when(owns)(new OwnedSbtServer(projectDir, argv, log))
+    } else None
     HostLog.info(s"starting build server ${details.getName} ${details.getVersion}: ${details.getArgv.asScala.mkString(" ")} (its output: $log)")
     val process = new ProcessBuilder(details.getArgv)
       .directory(projectDir.toFile)
       .redirectError(ProcessBuilder.Redirect.to(log.toFile))
       .start()
-    val client = new DiagnosticsClient
-    val launcher = new Launcher.Builder[HostBuildServer]()
-      .setRemoteInterface(classOf[HostBuildServer])
-      .setInput(process.getInputStream)
-      .setOutput(process.getOutputStream)
-      .setLocalService(client)
-      .create()
-    launcher.startListening()
-    val server = launcher.getRemoteProxy
-    val initialized = server.buildInitialize(new InitializeBuildParams(
-      "scala-psi-host", "0.1", BspVersion, projectDir.toUri.toString,
-      new BuildClientCapabilities(java.util.List.of("scala")))).get(timeoutMinutes, TimeUnit.MINUTES)
-    server.onBuildInitialized()
-    // A build server that was already running (sbt keeps its server between clients) may hold an older build
-    // definition: reload it, as IDEs do on import.
-    server.workspaceReload().get(timeoutMinutes, TimeUnit.MINUTES)
-    new BuildConnection(process, server, initialized.getCapabilities, client, timeoutMinutes)
+    // SIGTERM can arrive during initialization, before a ProjectSession owns this process.
+    val shutdownHook = new Thread(() => destroyProcess(process), s"scala-psi-host-bsp-${process.pid()}")
+    try {
+      Runtime.getRuntime.addShutdownHook(shutdownHook)
+      process.onExit().thenRun(() => {
+        try Runtime.getRuntime.removeShutdownHook(shutdownHook)
+        catch { case e: IllegalStateException => HostLog.debug(s"build server exited during JVM shutdown: $e") }
+      })
+      val client = new DiagnosticsClient
+      val launcher = new Launcher.Builder[HostBuildServer]()
+        .setRemoteInterface(classOf[HostBuildServer])
+        .setInput(process.getInputStream)
+        .setOutput(process.getOutputStream)
+        .setLocalService(client)
+        .create()
+      launcher.startListening()
+      val server = launcher.getRemoteProxy
+      val initialized = server.buildInitialize(new InitializeBuildParams(
+        "scala-psi-host", "0.1", BspVersion, projectDir.toUri.toString,
+        new BuildClientCapabilities(java.util.List.of("scala")))).get(timeoutMinutes, TimeUnit.MINUTES)
+      server.onBuildInitialized()
+      // A build server that was already running (sbt keeps its server between clients) may hold an older build
+      // definition: reload it, as IDEs do on import.
+      server.workspaceReload().get(timeoutMinutes, TimeUnit.MINUTES)
+      new BuildConnection(process, server, initialized.getCapabilities, client, timeoutMinutes, sbtServer)
+    } catch {
+      case e: Throwable =>
+        destroyProcess(process)
+        sbtServer.foreach(_.stop())
+        throw e
+    }
+  }
+
+  /** Kills children before their parent so a BSP launcher cannot leave an orphaned build process behind. */
+  private[scalapsihost] def destroyProcess(process: Process, descendants: Seq[ProcessHandle] = Seq.empty): Unit = {
+    try {
+      val current = Using.resource(process.descendants())(_.iterator().asScala.toVector)
+      for (child <- (descendants ++ current).distinct.reverse) {
+        try { if (child.isAlive) child.destroyForcibly() }
+        catch { case NonFatal(e) => HostLog.warn(s"could not kill build server descendant ${child.pid()}", e) }
+      }
+    } catch { case NonFatal(e) => HostLog.warn(s"could not enumerate build server descendants of ${process.pid()}", e) }
+    finally {
+      try { if (process.isAlive) process.destroyForcibly() }
+      catch { case NonFatal(e) => HostLog.warn(s"could not kill build server ${process.pid()}", e) }
+    }
   }
 
   /** Imports the build's Scala modules, each after the modules it depends on, and disconnects. */

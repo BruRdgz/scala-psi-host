@@ -2,9 +2,9 @@ package scalapsihost.lsp
 
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.launch.LSPLauncher
-import scalapsihost.TestHost
+import scalapsihost.{BspImport, TestHost}
 
-import java.io.{PipedInputStream, PipedOutputStream}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, PipedInputStream, PipedOutputStream}
 import java.nio.file.{Files, Path}
 import java.util.concurrent.{CompletableFuture, LinkedBlockingQueue, TimeUnit}
 import scala.concurrent.duration.*
@@ -55,6 +55,14 @@ class LanguageServerTest extends munit.FunSuite {
 
   private val Client = new RecordingClient
   private lazy val server = connect(Client)
+  private var ownsFixtureServer = false
+
+  override def afterAll(): Unit = {
+    server.shutdown().get(5, TimeUnit.SECONDS)
+    server.exit()
+    if (ownsFixtureServer)
+      assert(!Files.exists(fixture.resolve("project/target/active.json")), "the language server left its sbt server running")
+  }
 
   private def initialize(server: HostProtocol.LanguageServerWithStatus, root: Path): InitializeResult = {
     val params = new InitializeParams
@@ -91,7 +99,45 @@ class LanguageServerTest extends munit.FunSuite {
 
   private def document(path: Path) = new TextDocumentIdentifier(path.toUri.toString)
 
+  test("ends once when the client's input ends, with the shutdown status") {
+    for (shutdown <- Seq(false, true)) {
+      val exited = new LinkedBlockingQueue[Int]()
+      val implementation = new ScalaLanguageServer(TestHost.host, code => { exited.add(code); () })
+      if (shutdown) implementation.shutdown().get(10, TimeUnit.SECONDS)
+      Main.listen(implementation, new ByteArrayInputStream(Array.emptyByteArray), new ByteArrayOutputStream)
+      assertEquals(Option(exited.poll(10, TimeUnit.SECONDS)), Some(if (shutdown) 0 else 1))
+      implementation.exit()
+      assert(exited.isEmpty, "exit was called more than once")
+    }
+  }
+
+  test("ends when the watched client process exits without an exit notification") {
+    val exited = new LinkedBlockingQueue[Int]()
+    val implementation = new ScalaLanguageServer(TestHost.host, code => { exited.add(code); () })
+    implementation.connect(new RecordingClient)
+    val root = Files.createTempDirectory("scala-psi-host-client-exit")
+    val process = new ProcessBuilder("sleep", "1").start()
+    try {
+      val params = new InitializeParams
+      params.setRootUri(root.toUri.toString)
+      params.setProcessId(Math.toIntExact(process.pid()))
+      implementation.initialize(params).get(10, TimeUnit.SECONDS)
+      assert(process.waitFor(10, TimeUnit.SECONDS), "the client process did not exit")
+      assertEquals(Option(exited.poll(10, TimeUnit.SECONDS)), Some(1))
+      implementation.exit()
+      assert(exited.isEmpty, "exit was called more than once")
+    } finally {
+      process.destroyForcibly()
+      implementation.exit()
+      Files.delete(root)
+    }
+  }
+
   test("initializes on the workspace's build and announces its features") {
+    ownsFixtureServer = BspImport.sbtServerState(fixture) match {
+      case BspImport.SbtServerState.Missing | BspImport.SbtServerState.Inactive(_) => true
+      case _ => false
+    }
     val capabilities = initialize(server, fixture).getCapabilities
     assertEquals(capabilities.getTextDocumentSync.getLeft, TextDocumentSyncKind.Incremental)
     assert(capabilities.getHoverProvider.getLeft)

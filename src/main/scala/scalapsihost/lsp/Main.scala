@@ -3,11 +3,12 @@ package scalapsihost.lsp
 import org.eclipse.lsp4j.launch.LSPLauncher
 import scalapsihost.{HostConfig, HostLog, ScalaPsiHost}
 
-import java.io.File
+import java.io.{File, InputStream, OutputStream}
 import java.nio.file.{Files, Path, StandardOpenOption}
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import scala.jdk.CollectionConverters.*
+import scala.util.control.NonFatal
 
 /**
  * Runs the language server over stdin and stdout.
@@ -22,6 +23,8 @@ import scala.jdk.CollectionConverters.*
 object Main {
   // Logs of earlier runs kept next to the current one.
   private val KeptLogs = 10
+  // Child-process hooks only send kill signals; a stuck platform hook must not keep the JVM alive after cleanup.
+  private val HaltDelayMs = 1000L
 
   def main(args: Array[String]): Unit = {
     // Stdout carries the protocol: anything else printed there would corrupt it, so it goes to stderr.
@@ -42,16 +45,30 @@ object Main {
       scalaPluginJars = property("scalapsihost.scalaPluginJars").split(File.pathSeparator).toSeq.map(Path.of(_)),
     )))
     buffering.close()
-    // The platform keeps threads of its own running: the process ends when the client says so.
-    val server = new ScalaLanguageServer(host, code => sys.exit(code), Some(logFile), startup.asScala.toSeq)
+    val server = new ScalaLanguageServer(host, code => {
+      val watchdog = new Thread(() => {
+        Thread.sleep(HaltDelayMs)
+        Runtime.getRuntime.halt(code)
+      }, "scala-psi-host-halt")
+      watchdog.setDaemon(true)
+      watchdog.start()
+      sys.exit(code)
+    }, Some(logFile), startup.asScala.toSeq)
+    listen(server, System.in, protocolOut)
+  }
+
+  /** A disconnected transport has the same lifetime as an explicit `exit`, including failed reads. */
+  private[lsp] def listen(server: ScalaLanguageServer, input: InputStream, output: OutputStream): Unit = {
     val launcher = new LSPLauncher.Builder[HostProtocol.Client]()
       .setLocalService(server)
       .setRemoteInterface(classOf[HostProtocol.Client])
-      .setInput(System.in)
-      .setOutput(protocolOut)
+      .setInput(input)
+      .setOutput(output)
       .create()
     server.connect(launcher.getRemoteProxy)
-    launcher.startListening().get()
+    try launcher.startListening().get()
+    catch { case NonFatal(e) => HostLog.warn("client transport failed", e) }
+    finally server.exit()
   }
 
   /** A new log file in `directory`, written as entries are logged; the oldest logs beyond [[KeptLogs]] are deleted. */

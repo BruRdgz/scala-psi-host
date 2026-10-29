@@ -2,6 +2,8 @@ package scalapsihost
 
 import com.intellij.lang.annotation.HighlightSeverity
 
+import java.net.UnixDomainSocketAddress
+import java.nio.channels.ServerSocketChannel
 import java.nio.file.{Files, Path}
 import scala.concurrent.duration.*
 import scala.util.Using
@@ -19,6 +21,63 @@ class BspImportTest extends munit.FunSuite {
   private lazy val imported = BspImport.importBuild(fixture)
   private def module(name: String) = imported.find(_.spec.name == name).getOrElse(fail(s"no module $name in ${imported.map(_.spec.name)}"))
 
+  test("sbt server liveness distinguishes missing, stale and uncertain metadata") {
+    import BspImport.SbtServerState.*
+    val root = Files.createTempDirectory(Path.of("target"), "sbt-")
+    val active = Files.createDirectories(root.resolve("project/target")).resolve("active.json")
+    val socket = root.toAbsolutePath.resolve("sock")
+    try {
+      assertEquals(BspImport.sbtServerState(root), Missing)
+      for (text <- Seq("{", "{}", """{"uri":"tcp://127.0.0.1:1234"}""")) {
+        Files.writeString(active, text)
+        assert(BspImport.sbtServerState(root) match {
+          case Unknown(_) => true
+          case _ => false
+        }, text)
+      }
+      Files.writeString(active, s"""{"uri":"local://$socket"}""")
+      Using.resource(ServerSocketChannel.open(java.net.StandardProtocolFamily.UNIX)) { listener =>
+        listener.bind(UnixDomainSocketAddress.of(socket))
+        assertEquals(BspImport.sbtServerState(root), Live(socket))
+      }
+      assert(Files.exists(socket), "a leftover socket must not establish liveness")
+      assertEquals(BspImport.sbtServerState(root), Inactive(socket))
+      Files.delete(socket)
+      assertEquals(BspImport.sbtServerState(root), Inactive(socket))
+    } finally {
+      Files.deleteIfExists(socket)
+      Files.deleteIfExists(active)
+      Files.delete(root.resolve("project/target"))
+      Files.delete(root.resolve("project"))
+      Files.delete(root)
+    }
+  }
+
+  test("only the connection that started sbt stops it, including after a reload") {
+    import BspImport.SbtServerState.*
+    assert(BspImport.sbtServerState(fixture) match {
+      case Missing | Inactive(_) => true
+      case _ => false
+    }, "the ownership test needs an idle fixture; an existing external server is left untouched")
+    val owner = BspImport.connect(fixture)
+    try {
+      val live = BspImport.sbtServerState(fixture)
+      assert(live match {
+        case Live(_) => true
+        case _ => false
+      }, live.toString)
+      Using.resource(BspImport.connect(fixture)) { borrowed =>
+        assert(borrowed.modules().nonEmpty)
+      }
+      assertEquals(BspImport.sbtServerState(fixture), live, "closing a borrowed connection stopped sbt")
+      owner.reload()
+      assertEquals(BspImport.sbtServerState(fixture), live, "reimport restarted sbt")
+    } finally owner.close()
+    assert(!Files.exists(fixture.resolve("project/target/active.json")), "the owned sbt server survived close")
+    owner.close()
+    assert(!Files.exists(fixture.resolve("project/target/active.json")), "a repeated close started sbt again")
+  }
+
   test("imports the build's Scala targets with their settings") {
     val app = module("app")
     assertEquals(app.spec.scalaVersion, "2.13.18")
@@ -30,8 +89,7 @@ class BspImportTest extends munit.FunSuite {
     assert(module("core").sources.map(fixture.relativize(_).toString).contains("core/src/main/java/core/Shout.java"))
   }
 
-  // In the fixture itself, with a broken file for the duration of the test: a copy elsewhere would start another
-  // build server (sbt keeps one per build directory running after its clients leave).
+  // In the fixture itself, with a broken file for the duration of the test, so its build outputs remain reusable.
   test("compiling through the build server reports the compiler's errors by file and position") {
     val broken = fixture.resolve("core/src/main/scala/core/Broken.scala")
     Files.writeString(broken, "package core\n\nobject Broken {\n  val n: Int = \"one\"\n}\n")
