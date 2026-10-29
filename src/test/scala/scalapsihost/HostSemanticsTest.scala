@@ -11,6 +11,9 @@ import org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.ScSyntheticF
 class HostSemanticsTest extends munit.FunSuite {
   private lazy val file = TestHost.scenarioFile()
 
+  // Building the scenario writes to the host: before the tests, which run inside reads.
+  override def beforeAll(): Unit = file
+
   // Every test reads PSI: each runs as a read of the host.
   override def munitTestTransforms: List[TestTransform] = super.munitTestTransforms :+
     new TestTransform("host read", test => test.withBody(() => TestHost.host.read(test.body())))

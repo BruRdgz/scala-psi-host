@@ -169,7 +169,8 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   compares with `ScalaLibraryHighlightingTest_2_13`'s known errors. 469 of 546 files agree; most of the rest are
   references to private members of a source's own companion object, which resolve to the compiled companion.
 - `oracle.ProjectHighlighting <project> <report.md> [--plugin-errors]` — highlights a whole BSP project and reports
-  errors, timings, heap and a class histogram. On a 522-file Scala 3 project: no errors with compiler errors (the
+  errors, timings, heap and a class histogram; a file whose highlighting logged errors (a failed annotator) is not
+  counted as clean. On a 522-file Scala 3 project: no errors with compiler errors (the
   default), 81 with the plugin's type-aware checks (the same the IDE shows in its built-in mode).
 
 - `oracle.CompletionOracle <intellij-scala> <report.md>` — the plugin's completion tests: file fixtures, keyword

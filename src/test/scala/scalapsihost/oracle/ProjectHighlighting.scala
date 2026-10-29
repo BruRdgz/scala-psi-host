@@ -2,7 +2,7 @@ package scalapsihost.oracle
 
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
-import scalapsihost.{BspImport, Diagnostic, HostConfig, LineColumn, ScalaPsiHost}
+import scalapsihost.{BspImport, Diagnostic, HostConfig, HostLog, LineColumn, ScalaPsiHost}
 
 import java.io.File
 import java.nio.file.{Files, Path}
@@ -57,6 +57,7 @@ object ProjectHighlighting {
     val t3 = System.nanoTime()
     val results = files.map { (path, file) =>
       val start = System.nanoTime()
+      val errorsBefore = HostLog.count(HostLog.Level.Error)
       val outcome =
         try {
           val fromPlugin = host.diagnostics(file).map(d => ("plugin", d))
@@ -69,7 +70,7 @@ object ProjectHighlighting {
           Right((fromPlugin ++ fromCompiler).filter(_._2.severity == HighlightSeverity.ERROR))
         }
         catch { case NonFatal(e) => println(s"crash in $path: $e"); Left(e.toString) }
-      FileResult(path, outcome, millisSince(start))
+      FileResult(path, outcome, HostLog.count(HostLog.Level.Error) - errorsBefore, millisSince(start))
     }
     val highlightMs = millisSince(t3)
     val heapAfterMb = usedHeapMb()
@@ -85,7 +86,8 @@ object ProjectHighlighting {
     lines += s"JDK ${System.getProperty("java.version")}, production mode."
     lines += ""
     lines += s"- modules: ${imported.size}; jars: ${imported.flatMap(_.spec.classpath).distinct.size}; Scala files: ${files.size}; Java files: ${opened.size - files.size}"
-    lines += s"- files without errors: ${results.count(r => r.outcome.exists(_.isEmpty))} / ${results.size}; crashed: ${results.count(_.outcome.isLeft)}"
+    lines += s"- files without errors: ${results.count(_.isClean)} / ${results.size}; crashed: ${results.count(_.outcome.isLeft)}"
+    lines += s"- files whose highlighting logged errors (incomplete highlights): ${results.count(_.loggedErrors > 0)}"
     lines += s"- errors: ${results.map(_.outcome.fold(_ => 0, _.size)).sum}"
     lines += s"- errors from: ${if (compilerErrors) "the compiler for Scala 3 files (build compile status: " + compiled.map(c => if (c.succeeded) "OK" else "failed").getOrElse("-") + ")" else "the plugin's type-aware checks"}"
     lines += s"- BSP import${if (compilerErrors) " + compile" else ""}: $importMs ms; adding modules (mount + index jars): $modulesMs ms, heap after: $heapAfterModulesMb MB"
@@ -117,20 +119,26 @@ object ProjectHighlighting {
     lines += ""
     lines += "| File | Errors |"
     lines += "|---|---|"
-    for (r <- results if !r.outcome.exists(_.isEmpty)) {
+    for (r <- results if !r.isClean) {
       val text = r.outcome match {
         case Left(crash) => s"crash: $crash"
         case Right(ds) => ds.map((origin, d) => s"${d.range} [$origin] ${d.message}").mkString("<br>")
       }
-      lines += s"| ${r.path} | ${cell(text)} |"
+      val logged = if (r.loggedErrors > 0) s" (${r.loggedErrors} logged errors)" else ""
+      lines += s"| ${r.path} | ${cell(text + logged)} |"
     }
     Files.createDirectories(Path.of(reportPath).toAbsolutePath.getParent)
     Files.write(Path.of(reportPath), lines.result().asJava)
-    println(s"project highlighting: ${results.count(r => r.outcome.exists(_.isEmpty))} / ${results.size} files without errors; report at $reportPath")
+    println(s"project highlighting: ${results.count(_.isClean)} / ${results.size} files without errors; report at $reportPath")
   }
 
-  /** Each error with where it came from: `plugin` or `compiler`. */
-  private final case class FileResult(path: String, outcome: Either[String, Seq[(String, Diagnostic)]], ms: Long)
+  /**
+   * Each error with where it came from: `plugin` or `compiler`. Errors the platform logged while highlighting the
+   * file (an annotator that failed, caught by the platform) mean its highlights are incomplete: it is not clean.
+   */
+  private final case class FileResult(path: String, outcome: Either[String, Seq[(String, Diagnostic)]], loggedErrors: Long, ms: Long) {
+    def isClean: Boolean = outcome.exists(_.isEmpty) && loggedErrors == 0
+  }
 
   private def offset(text: String, position: LineColumn): Int = {
     val lineStart = Iterator.iterate(0)(i => text.indexOf('\n', i) + 1).drop(position.line).next()

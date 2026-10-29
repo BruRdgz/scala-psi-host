@@ -34,6 +34,8 @@ import com.intellij.psi.stubs.{LanguageStubDefinition, StubElementRegistryServic
 import com.intellij.psi.util.PsiModificationTracker
 import com.intellij.util.messages.impl.MessageBusFactoryImpl
 import org.jetbrains.plugins.scala.codeInsight.ScalaCodeInsightSettings
+import org.jetbrains.plugins.scala.externalLibraries.bm4.BetterMonadicForSupport
+import org.jetbrains.plugins.scala.externalLibraries.kindProjector.KindProjectorUtil
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiElementFactory
 import org.jetbrains.plugins.scala.project.{ProjectContext, ScalaFeatures}
@@ -1129,6 +1131,10 @@ object ScalaPsiHost {
     // Compiler settings per module, configured from the build's scalac options as the plugin's importers do.
     projectServices.register(classOf[org.jetbrains.plugins.scala.project.settings.ScalaCompilerConfiguration])(
       new org.jetbrains.plugins.scala.project.settings.ScalaCompilerConfiguration(project))
+    // The compiler plugins the plugin supports, where a module's scalac options enable them: kind-projector's syntax
+    // (`λ`, `*`, `?`) and better-monadic-for's desugaring of for-comprehensions.
+    projectServices.register(classOf[KindProjectorUtil])(new KindProjectorUtil(project))
+    projectServices.register(classOf[BetterMonadicForSupport])(new BetterMonadicForSupport(project))
     // PSI write path: the plugin edits non-physical copies (e.g. for-comprehension desugaring).
     projectServices.register(classOf[com.intellij.pom.PomModel])(
       classOf[com.intellij.pom.PomModel].cast(newPrivate(
