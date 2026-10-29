@@ -227,7 +227,7 @@ def dispatch(answer: PartialFunction[(String, Array[AnyRef]), AnyRef]): Dispatch
   }
 
 /** A request-local editor tracks positions through document and PSI changes, including imports before the caret. */
-private[scalapsihost] final class CompletionEditor(document: com.intellij.openapi.editor.Document,
+private[scalapsihost] final class RequestEditor(document: com.intellij.openapi.editor.Document,
                                                   project: com.intellij.openapi.project.Project, offset: Int) extends AutoCloseable {
   import com.intellij.openapi.editor.{Caret, CaretModel, Editor, SelectionModel}
   import com.intellij.openapi.editor.event.{DocumentEvent, DocumentListener}
@@ -264,7 +264,7 @@ private[scalapsihost] final class CompletionEditor(document: com.intellij.openap
     selectionEnd = end
   }
 
-  lazy val editor: Editor = tableProxy(classOf[Editor], "CompletionEditor") {
+  lazy val editor: Editor = tableProxy(classOf[Editor], "RequestEditor") {
     case ("getDocument", _) => document
     case ("getProject", _) => project
     case ("getCaretModel", _) => model

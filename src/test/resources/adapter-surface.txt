@@ -75,8 +75,6 @@ CompletionCaret.hasSelection
 CompletionCaretModel.getCurrentCaret
 CompletionCaretModel.getOffset
 CompletionCaretModel.moveToOffset
-CompletionEditor.getCaretModel
-CompletionEditor.getDocument
 DumbService.isAlternativeResolveEnabled
 DumbService.isDumb
 DumbService.queueTask
@@ -212,6 +210,8 @@ PsiManager.isBatchFilesProcessingMode
 PsiManager.isDisposed
 PsiShortNamesCache.getAllClassNames
 PsiShortNamesCache.getClassesByName
+RequestEditor.getCaretModel
+RequestEditor.getDocument
 ResolveScopeManager.getResolveScope
 ResolveScopeManager.getUseScope
 ScalaCodeStyleProvider.getDefaultCommonSettings

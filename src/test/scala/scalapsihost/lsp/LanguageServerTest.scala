@@ -313,6 +313,22 @@ class LanguageServerTest extends munit.FunSuite {
     assertEquals(tokens.get((20, 12)).map(_._1), Some(SemanticTokenTypes.Class))
   }
 
+  test("signature help shows a call's signatures with the current parameter, as the IDE's parameter info") {
+    val text = "package app\nobject Signatures { def greet(name: String, times: Int): String = name; greet(\"x\", ) }"
+    def change(value: String, version: Int): Unit = server.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
+      new VersionedTextDocumentIdentifier(main.toUri.toString, version), java.util.List.of(new TextDocumentContentChangeEvent(value))))
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    try {
+      change(text, 40)
+      val help = server.getTextDocumentService.signatureHelp(new SignatureHelpParams(document(main),
+        new Position(1, text.split("\n")(1).indexOf("\", )") + 3))).get(1, TimeUnit.MINUTES)
+      val signature = help.getSignatures.get(help.getActiveSignature)
+      assertEquals(signature.getLabel, "name: String, times: Int")
+      val current = signature.getParameters.get(signature.getActiveParameter).getLabel.getRight
+      assertEquals(signature.getLabel.substring(current.getFirst, current.getSecond), "times: Int")
+    } finally change(original, 41)
+  }
+
   test("folds imports, doc comments and bodies, leaving closing braces visible") {
     val folds = server.getTextDocumentService.foldingRange(new FoldingRangeRequestParams(document(counter)))
       .get(1, TimeUnit.MINUTES).asScala.toSeq

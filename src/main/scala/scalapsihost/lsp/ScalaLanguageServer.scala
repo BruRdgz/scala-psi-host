@@ -6,9 +6,9 @@ import com.intellij.openapi.progress.ProcessCanceledException
 import com.google.gson.JsonPrimitive
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException
-import org.eclipse.lsp4j.jsonrpc.messages.{Either as LspEither, ResponseError, ResponseErrorCode}
+import org.eclipse.lsp4j.jsonrpc.messages.{Either as LspEither, ResponseError, ResponseErrorCode, Tuple}
 import org.eclipse.lsp4j.services.*
-import scalapsihost.{CallLog, ChangeEngine, HostLog, LineColumn, ScalaPsiHost}
+import scalapsihost.{CallLog, ChangeEngine, HostLog, LineColumn, ParameterInfo, ScalaPsiHost}
 
 import java.net.URI
 import java.nio.file.Path
@@ -147,6 +147,8 @@ final class ScalaLanguageServer(
     capabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental)
     capabilities.setHoverProvider(true)
     capabilities.setCompletionProvider(new CompletionOptions(/* resolveProvider = */ false, java.util.List.of(".")))
+    // A call's opening parenthesis or bracket shows the signatures; a comma moves to the next parameter.
+    capabilities.setSignatureHelpProvider(new SignatureHelpOptions(java.util.List.of("(", "[", ","), java.util.List.of(",")))
     capabilities.setExecuteCommandProvider(new ExecuteCommandOptions(java.util.List.of(CompleteInsertion)))
     capabilities.setDocumentFormattingProvider(true)
     capabilities.setDocumentRangeFormattingProvider(true)
@@ -297,7 +299,8 @@ final class ScalaLanguageServer(
         case e: ChangeEngine.UnsupportedFormatter =>
           client.showMessage(new MessageParams(MessageType.Error, e.getMessage))
           throw requestError(ResponseErrorCode.RequestFailed, e.getMessage)
-        case NonFatal(e) =>
+        // A class the plugin needs and the host does not have is a LinkageError, not a NonFatal one: logged too.
+        case e @ (NonFatal(_) | _: LinkageError) =>
           HostLog.error(s"$kind failed", e)
           throw e
       }, documents)
@@ -394,6 +397,11 @@ final class ScalaLanguageServer(
         val choices = s.completion(path, lineColumn(params.getPosition))
         val items = choices.items.zipWithIndex.map((choice, rank) => completionItem(params.getTextDocument.getUri, choice, rank))
         LspEither.forRight(new CompletionList(choices.incomplete, items.asJava))
+      }
+
+    override def signatureHelp(params: SignatureHelpParams): CompletableFuture[SignatureHelp] =
+      onSource("signatureHelp", params.getTextDocument, null) { (s, path) =>
+        s.signatures(path, lineColumn(params.getPosition)).filter(_.items.nonEmpty).map(signatureHelpOf).orNull
       }
 
     override def formatting(params: DocumentFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
@@ -529,6 +537,21 @@ final class ScalaLanguageServer(
       item.setCommand(new Command(suggestion.label, CompleteInsertion, arguments.asJava))
     }
     item
+  }
+
+  private def signatureHelpOf(found: ParameterInfo.Signatures): SignatureHelp = {
+    val signatures = found.items.map { signature =>
+      val information = new SignatureInformation(signature.text)
+      // The plugin renders the current parameter only, by its range in the text: it is the signature's one parameter.
+      signature.current.foreach { range =>
+        val parameter = new ParameterInformation()
+        parameter.setLabel(LspEither.forRight(new Tuple.Two[Integer, Integer](range.getStartOffset, range.getEndOffset)))
+        information.setParameters(java.util.List.of(parameter))
+        information.setActiveParameter(0)
+      }
+      information
+    }
+    new SignatureHelp(signatures.asJava, found.active.map(Integer.valueOf).getOrElse(Integer.valueOf(0)), null)
   }
 
   /**

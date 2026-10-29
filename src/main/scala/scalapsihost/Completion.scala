@@ -123,7 +123,7 @@ object Completion {
     val (changed, editor) = ChangeEngine.run(file) { copy =>
       val document = copy.getViewProvider.getDocument
       document.replaceString(prefix.getStartOffset, prefix.getEndOffset, element.getLookupString)
-      val editor = new CompletionEditor(document, copy.getProject, prefix.getStartOffset + element.getLookupString.length)
+      val editor = new RequestEditor(document, copy.getProject, prefix.getStartOffset + element.getLookupString.length)
       runHandler(copy, editor, element, results.map(_.getLookupElement).toArray, prefix.getStartOffset, completionChar)
       editor
     }
@@ -136,7 +136,7 @@ object Completion {
    * lookup gives it: the offsets of the inserted string and of the identifier it ends in, the suggestions, and the
    * character that chose it.
    */
-  private def runHandler(copy: ScalaFile, editor: CompletionEditor, element: LookupElement, elements: Array[LookupElement],
+  private def runHandler(copy: ScalaFile, editor: RequestEditor, element: LookupElement, elements: Array[LookupElement],
                          start: Int, completionChar: Char): Unit = {
     val document = copy.getViewProvider.getDocument
     val tail = editor.editor.getCaretModel.getOffset
@@ -230,7 +230,7 @@ object Completion {
       // Other text than the file's, or a file of the plugin's PSI factory (which has no document), is completed on a copy.
       val asIs = file.isPhysical && text == file.getText
       val document = if (asIs) file.getViewProvider.getDocument else new DocumentImpl(text)
-      val editor = resources(new CompletionEditor(document, file.getProject, offset))
+      val editor = resources(new RequestEditor(document, file.getProject, offset))
       val initializationFile = if (asIs) file else resources(new TemporaryCopy(file, text)).file
       val init = new CompletionInitializationContext(editor.editor, editor.editor.getCaretModel.getCurrentCaret,
         file.getLanguage, initializationFile, CompletionType.BASIC, 1)

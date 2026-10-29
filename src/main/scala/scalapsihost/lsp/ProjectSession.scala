@@ -139,6 +139,12 @@ final class ProjectSession private (
     case _ => CompletionChoices(Seq.empty, incomplete = false)
   }
 
+  /** The signatures of the call around `at`. Only Scala files have them. */
+  def signatures(path: Path, at: LineColumn): Option[ParameterInfo.Signatures] = file(path) match {
+    case f: ScalaFile => host.read(host.parameterInfo(f, offset(document(f), at)))
+    case _ => None
+  }
+
   /**
    * Runs the insert handler of the suggestion `identity`, whose lookup string `lookup` the editor has put at `start`
    * in place of `prefixText` (see [[Completion.insert]]). None when the file no longer has it there.

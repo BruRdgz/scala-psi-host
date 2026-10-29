@@ -21,6 +21,8 @@ import com.intellij.openapi.project.{DumbModeTask, DumbService, Project}
 import com.intellij.openapi.util.{Disposer, Key, UserDataHolderBase}
 import com.intellij.openapi.util.registry.Registry
 import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.featureStatistics.FeatureUsageTracker
+import com.intellij.lang.parameterInfo.{LanguageParameterInfo, ParameterInfoHandler}
 import com.intellij.navigation.ItemPresentationProviders
 import com.intellij.psi.{FileViewProvider, LanguageFileViewProviders, PsiClass, PsiField, PsiManager}
 import com.intellij.psi.presentation.java.{ClassPresentationProvider, FieldPresentationProvider}
@@ -82,6 +84,9 @@ final class ScalaPsiHost private (
 
   /** The completion suggestions at `offset`. */
   def completion(file: ScalaFile, offset: Int): Completion.Suggestions = Completion.complete(file, offset)
+
+  /** The signatures of the call around `offset`, as the IDE's parameter info shows them. */
+  def parameterInfo(file: ScalaFile, offset: Int): Option[ParameterInfo.Signatures] = ParameterInfo.at(file, offset)
 
   /** What the insert handler of a chosen suggestion changes (see [[Completion.insert]]). */
   def insertCompletion(file: ScalaFile, start: Int, prefixText: String, lookup: String, identity: String)
@@ -541,6 +546,15 @@ object ScalaPsiHost {
     })
     appServices.register(classOf[com.intellij.codeInsight.completion.CompletionService])(new Completion.Service)
     appServices.register(classOf[com.intellij.codeInsight.CodeInsightSettings])(new com.intellij.codeInsight.CodeInsightSettings)
+    // Usage statistics behind the IDE's tips ("did you know..."): the host records no use and advertises nothing.
+    appServices.register(classOf[FeatureUsageTracker])(new FeatureUsageTracker {
+      override def triggerFeatureUsed(featureId: String): Unit = ()
+      override def triggerFeatureUsedByAction(actionId: String): Unit = ()
+      override def triggerFeatureUsedByIntention(intentionClass: Class[?]): Unit = ()
+      override def triggerFeatureShown(featureId: String): Unit = ()
+      override def isToBeShown(featureId: String, project: Project): Boolean = false
+      override def isToBeAdvertisedInLookup(featureId: String, project: Project): Boolean = false
+    })
     // Lookup presentation checks test-class icons; no test-framework integrations are installed in the host.
     CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.testIntegration.TestFramework.EXTENSION_NAME,
       classOf[com.intellij.testIntegration.TestFramework])
@@ -787,6 +801,12 @@ object ScalaPsiHost {
       new org.jetbrains.plugins.scala.lang.scaladoc.reflinks.ScalaDocRefLinkParserDefinition,
     )
     parserDefinitions.foreach(pd => LanguageParserDefinitions.INSTANCE.addExplicitExtension(pd.getFileNodeType.getLanguage, pd))
+    // Parameter info for arguments, type arguments and patterns: the plugin's handlers, as its descriptors register them.
+    for (bean <- Descriptors.scalaExtensionBeans(config.scalaPluginJars, "com.intellij.codeInsight.parameterInfo")
+         if bean.attributes.get("language").contains("Scala")) {
+      val handler = newPrivate(Class.forName(bean.implementation)).asInstanceOf[ParameterInfoHandler[?, ?]]
+      LanguageParameterInfo.INSTANCE.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE, handler)
+    }
     // beforeCompletion and lookup escaping must use Scala's operators and keywords, rather than the Java fallback.
     com.intellij.lang.LanguageNamesValidation.INSTANCE.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE,
       new org.jetbrains.plugins.scala.lang.refactoring.ScalaNamesValidator)
