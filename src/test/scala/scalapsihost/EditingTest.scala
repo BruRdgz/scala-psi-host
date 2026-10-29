@@ -4,7 +4,7 @@ import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
 import org.eclipse.lsp4j.CompletionItemKind
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
-import scalapsihost.TestHost.applyEdits
+import scalapsihost.TestHost.{applyEdits, choose}
 
 import java.nio.file.Path
 
@@ -76,56 +76,55 @@ class EditingTest extends munit.FunSuite {
     }
   }
 
-  test("completion renders member signatures and replaces only the UTF-16 prefix") {
+  private def scalaFile(name: String, text: String): ScalaFile =
+    host.openFile(Path.of(s"/editing/$name.scala"), text, module) match {
+      case f: ScalaFile => f
+      case other => fail(s"not Scala: $other")
+    }
+
+  test("completion renders member signatures, and its handler adds the parentheses once chosen") {
     val text = "object Complete { val emoji = \"😀\"; def message(n: Int): String = \"hi\"; Complete.mes }"
-    val file = host.openFile(Path.of("/editing/Complete.scala"), text, module).asInstanceOf[ScalaFile]
+    val file = scalaFile("Complete", text)
     try {
       val offset = text.indexOf("Complete.mes") + "Complete.mes".length
       val result = host.completion(file, offset)
-      val item = result.items.find(_.filterText == "message").getOrElse(fail(result.toString))
+      val item = result.items.find(_.lookup == "message").getOrElse(fail(result.toString))
       assertEquals(item.kind, CompletionItemKind.Method)
       assert(item.tail.exists(_.contains("Int")) && item.typeText.contains("String"), item.toString)
-      val edit = item.insertion.edit
-      assertEquals(edit.text, "message()")
-      assertEquals(edit.range.getStartOffset, offset - 3)
-      assertEquals(edit.range.getEndOffset, offset)
+      assertEquals(item.prefix, new TextRange(offset - 3, offset))
+      assert(item.hasHandler, item.toString)
       assertEquals(host.read(file.getText), text)
+      assert(choose(file, offset, "message").contains("Complete.message(<caret>)"))
     } finally host.closeSource(file)
   }
 
   test("completion after `new` presents library Java classes") {
     val text = "object AfterNew { val t = new Threa; val l = new java.util.ArrayLi }"
-    val file = host.openFile(Path.of("/editing/AfterNew.scala"), text, module).asInstanceOf[ScalaFile]
+    val file = scalaFile("AfterNew", text)
     try {
       for ((prefix, name) <- Seq("new Threa" -> "Thread", "new java.util.ArrayLi" -> "ArrayList")) {
         val result = host.completion(file, text.indexOf(prefix) + prefix.length)
-        assert(result.items.exists(_.filterText == name), s"$prefix: $result")
+        assert(result.items.exists(_.lookup == name), s"$prefix: $result")
       }
     } finally host.closeSource(file)
   }
 
-  test("completion preserves overloads and deprecation, and inserts classes through import and constructor handlers") {
+  test("completion preserves overloads and deprecation, and imports a chosen class") {
     val hidden = host.openFile(Path.of("/editing/Hidden.scala"), "package hidden\nclass ZebraUnimported", module)
     val text = "package visible\nobject Lookup { @deprecated(\"old\", \"1\") def message(n: Int): String = \"\"; " +
       "def message(n: String): Int = 0; Lookup.mes }"
-    val file = host.openFile(Path.of("/editing/Lookup.scala"), text, module).asInstanceOf[ScalaFile]
+    val file = scalaFile("Lookup", text)
     try {
-      val items = host.completion(file, text.indexOf("Lookup.mes") + "Lookup.mes".length).items
-        .filter(_.filterText == "message")
+      val items = host.completion(file, text.indexOf("Lookup.mes") + "Lookup.mes".length).items.filter(_.lookup == "message")
       assertEquals(items.size, 2)
-      assertEquals(items.map(item => (item.tail, item.typeText)).distinct.size, 2)
+      assertEquals(items.map(_.identity).distinct.size, 2)
       assertEquals(items.count(_.deprecated), 1)
       for (expression <- Seq("val value: ZebraUn = ???", "val value: Any = new ZebraUn")) {
         val changed = s"package visible\nobject Lookup { $expression }"
         host.edit(file, 0, host.read(file.getTextLength), changed)
-        val completed = host.completion(file, changed.indexOf("ZebraUn") + "ZebraUn".length)
-        val selected = completed.items.find(_.filterText == "ZebraUnimported").getOrElse(fail(completed.toString))
-        assertEquals(selected.insertion.edit.text, "ZebraUnimported")
-        val imports = selected.insertion.additional
-        assert(imports.exists(_.text.contains("import hidden.ZebraUnimported")), imports)
-        val edits = imports :+ selected.insertion.edit
-        assert(applyEdits(changed, edits).contains(expression.replace("ZebraUn", "ZebraUnimported")))
-        assertEquals(host.read(file.getText), changed)
+        val chosen = choose(file, changed.indexOf("ZebraUn") + "ZebraUn".length, "ZebraUnimported")
+        assert(chosen.contains("import hidden.ZebraUnimported"), chosen)
+        assert(chosen.replace("<caret>", "").contains(expression.replace("ZebraUn", "ZebraUnimported")), chosen)
       }
     } finally {
       host.closeSource(file)
@@ -133,33 +132,27 @@ class EditingTest extends munit.FunSuite {
     }
   }
 
-  test("completion ranks a local before a named argument and emits its trivial assignment edit") {
+  test("completion ranks a local before a named argument, whose handler adds the assignment") {
     val text = "object Named { def use = { val namelocal = \"s\"; " +
       "def printName(nameParam: String = \"Unknown\"): Unit = (); printName(name) } }"
-    val file = host.openFile(Path.of("/editing/Named.scala"), text, module).asInstanceOf[ScalaFile]
+    val file = scalaFile("Named", text)
     try {
-      val items = host.completion(file, text.indexOf("printName(name)") + "printName(name".length).items
-      val names = items.map(_.filterText)
+      val offset = text.indexOf("printName(name)") + "printName(name".length
+      val names = host.completion(file, offset).items.map(_.lookup)
       assert(names.contains("namelocal") && names.contains("nameParam"), names)
       assert(names.indexOf("namelocal") < names.indexOf("nameParam"), names)
-      assertEquals(items.find(_.filterText == "nameParam").get.insertion.edit.text, "nameParam = ")
+      assert(choose(file, offset, "nameParam").contains("printName(nameParam = <caret>)"))
     } finally host.closeSource(file)
   }
-  test("constructor suggestions carry their import and handler caret in the list") {
+
+  test("a chosen constructor gets its import and the caret between its parentheses") {
     val target = host.openFile(Path.of("/editing/ConstructorTarget.scala"), "package imported\nclass ConstructorTarget(n: Int)\n", module)
     val text = "object ConstructorUser { val x = new ConstructorT }"
-    val file = host.openFile(Path.of("/editing/ConstructorUser.scala"), text, module) match {
-      case f: ScalaFile => f
-      case other => fail(s"not Scala: $other")
-    }
+    val file = scalaFile("ConstructorUser", text)
     try {
-      val offset = text.indexOf("ConstructorT }") + "ConstructorT".length
-      val list = host.completion(file, offset)
-      val item = list.items.find(_.filterText == "ConstructorTarget").getOrElse(fail(list.toString))
-      assertEquals(item.insertion.edit.text, "ConstructorTarget()")
-      assertEquals(item.insertion.caret, "ConstructorTarget(".length)
-      assert(item.insertion.additional.exists(_.text.contains("import imported.ConstructorTarget")), item.toString)
-      assertEquals(host.read(file.getText), text)
+      val chosen = choose(file, text.indexOf("ConstructorT }") + "ConstructorT".length, "ConstructorTarget")
+      assert(chosen.contains("new ConstructorTarget(<caret>)"), chosen)
+      assert(chosen.contains("import imported.ConstructorTarget"), chosen)
     } finally {
       host.closeSource(file)
       host.closeSource(target)
@@ -175,57 +168,34 @@ class EditingTest extends munit.FunSuite {
       ("object Keywords {\n  val n = 1\n  n mat<caret>\n}", "match", "object Keywords {\n  val n = 1\n  n match {\n    case <caret>\n  }\n}")
     )
     for ((marked, lookup, expected) <- cases) {
-      val offset = marked.indexOf("<caret>")
-      val text = marked.replace("<caret>", "")
-      val file = host.openFile(Path.of("/editing/Handler.scala"), text, module) match {
-        case f: ScalaFile => f
-        case other => fail(s"not Scala: $other")
-      }
-      try {
-        val items = host.completion(file, offset).items
-        val item = items.find(_.filterText == lookup).getOrElse(fail(items.toString))
-        val insertion = item.insertion
-        val primary = insertion.edit
-        val replacement = primary.text.patch(insertion.caret, "<caret>", 0)
-        val edits = insertion.additional :+ primary.copy(text = replacement)
-        assertEquals(applyEdits(text, edits), expected)
-        assertEquals(host.read(file.getText), text)
-      } finally host.closeSource(file)
+      val file = scalaFile("Handler", marked.replace("<caret>", ""))
+      try assertEquals(choose(file, marked.indexOf("<caret>"), lookup), expected)
+      finally host.closeSource(file)
     }
   }
 
-  test("prefix binding and constructor adjustment carry their final edits in the list") {
+  test("a chosen class is imported by its package prefix when the code style asks for it") {
     val manager = com.intellij.psi.codeStyle.CodeStyleSettingsManager.getInstance(host.project)
     val settings = host.read(manager.getCurrentSettings.clone())
     settings.getCustomSettings(classOf[org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings])
       .setImportsWithPrefix(Array("scala.collection.mutable._"))
     for (expression <- Seq("val value: ArrayBuff = ???", "val value = new ArrayBuff")) {
       val text = s"object PrefixUser { $expression }"
-      val file = host.openFile(Path.of("/editing/PrefixUser.scala"), text, module) match {
-        case f: ScalaFile => f
-        case other => fail(s"not Scala: $other")
-      }
+      val file = scalaFile("PrefixUser", text)
       try manager.computeWithLocalSettings(settings, _ => {
-        val items = host.completion(file, text.indexOf("ArrayBuff") + "ArrayBuff".length).items
-        val item = items.find(_.filterText == "ArrayBuffer").getOrElse(fail(items.toString))
-        assert(item.insertion.edit.text.startsWith("mutable.ArrayBuffer"), item.toString)
-        assert(item.insertion.additional.exists(_.text.contains("import scala.collection.mutable")), item.toString)
+        val chosen = choose(file, text.indexOf("ArrayBuff") + "ArrayBuff".length, "ArrayBuffer")
+        assert(chosen.contains("mutable.ArrayBuffer"), chosen)
+        assert(chosen.contains("import scala.collection.mutable"), chosen)
       }) finally host.closeSource(file)
     }
   }
 
-  test("constructors requiring implementation UI are filtered explicitly") {
+  test("completion offers an abstract class after `new`, though its handler's dialog cannot run") {
     val text = "trait NeedsImplementation { def run(): Unit }; object User { new NeedsImpl }"
-    val file = host.openFile(Path.of("/editing/NeedsImplementation.scala"), text, module) match {
-      case f: ScalaFile => f
-      case other => fail(s"not Scala: $other")
-    }
+    val file = scalaFile("NeedsImplementation", text)
     try {
-      val key = "Completion.skipped.implementationDialog"
-      val before = CallLog.snapshot.toMap.getOrElse(key, 0)
-      val items = host.completion(file, text.lastIndexOf("NeedsImpl") + "NeedsImpl".length).items
-      assert(!items.exists(_.filterText == "NeedsImplementation"), items)
-      assert(CallLog.snapshot.toMap.getOrElse(key, 0) > before)
+      val chosen = choose(file, text.lastIndexOf("NeedsImpl") + "NeedsImpl".length, "NeedsImplementation")
+      assert(chosen.contains("new NeedsImplementation"), chosen)
     } finally host.closeSource(file)
   }
 

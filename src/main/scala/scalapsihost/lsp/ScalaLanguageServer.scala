@@ -3,6 +3,7 @@ package scalapsihost.lsp
 import com.intellij.diff.comparison.DiffTooBigException
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.progress.ProcessCanceledException
+import com.google.gson.JsonPrimitive
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException
 import org.eclipse.lsp4j.jsonrpc.messages.{Either as LspEither, ResponseError, ResponseErrorCode}
@@ -48,7 +49,10 @@ final class ScalaLanguageServer(
 
   @volatile private var client: LanguageClient = scala.compiletime.uninitialized
   private var clientLog: Option[AutoCloseable] = None
-  @volatile private var completionSnippets = false
+  // Whether the client applies the server's edits and moves the caret on its request: a chosen suggestion's insert
+  // handler needs both (see CompleteInsertion).
+  @volatile private var appliesEdits = false
+  @volatile private var showsDocuments = false
   // The project to open once the client says it is ready (`initialized`).
   @volatile private var workspace = Option.empty[Path]
   @volatile private var watchesFiles = false
@@ -130,8 +134,9 @@ final class ScalaLanguageServer(
     watchesFiles = offered.flatMap(c => Option(c.getWorkspace)).flatMap(w => Option(w.getDidChangeWatchedFiles))
       .flatMap(w => Option(w.getDynamicRegistration)).exists(_.booleanValue)
     reportsProgress = offered.flatMap(c => Option(c.getWindow)).flatMap(w => Option(w.getWorkDoneProgress)).exists(_.booleanValue)
-    completionSnippets = offered.flatMap(c => Option(c.getTextDocument)).flatMap(t => Option(t.getCompletion))
-      .flatMap(c => Option(c.getCompletionItem)).flatMap(i => Option(i.getSnippetSupport)).exists(_.booleanValue)
+    appliesEdits = offered.flatMap(c => Option(c.getWorkspace)).flatMap(w => Option(w.getApplyEdit)).exists(_.booleanValue)
+    showsDocuments = offered.flatMap(c => Option(c.getWindow)).flatMap(w => Option(w.getShowDocument))
+      .exists(_.isSupport)
     val folders = Option(params.getWorkspaceFolders).map(_.asScala.toSeq).getOrElse(Seq.empty)
     val rootUri = folders.headOption.map(_.getUri).orElse(Option(params.getRootUri))
       .getOrElse(throw new IllegalArgumentException("the client sent no workspace folder or root URI"))
@@ -142,6 +147,7 @@ final class ScalaLanguageServer(
     capabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental)
     capabilities.setHoverProvider(true)
     capabilities.setCompletionProvider(new CompletionOptions(/* resolveProvider = */ false, java.util.List.of(".")))
+    capabilities.setExecuteCommandProvider(new ExecuteCommandOptions(java.util.List.of(CompleteInsertion)))
     capabilities.setDocumentFormattingProvider(true)
     capabilities.setDocumentRangeFormattingProvider(true)
     capabilities.setDefinitionProvider(true)
@@ -386,7 +392,8 @@ final class ScalaLanguageServer(
     override def completion(params: CompletionParams): CompletableFuture[LspEither[java.util.List[CompletionItem], CompletionList]] =
       onSource("completion", params.getTextDocument, LspEither.forRight(new CompletionList())) { (s, path) =>
         val choices = s.completion(path, lineColumn(params.getPosition))
-        LspEither.forRight(new CompletionList(choices.incomplete, choices.items.zipWithIndex.map(completionItem).asJava))
+        val items = choices.items.zipWithIndex.map((choice, rank) => completionItem(params.getTextDocument.getUri, choice, rank))
+        LspEither.forRight(new CompletionList(choices.incomplete, items.asJava))
       }
 
     override def formatting(params: DocumentFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
@@ -498,7 +505,11 @@ final class ScalaLanguageServer(
   private def textEdit(change: TextChange): TextEdit = new TextEdit(range(change.start -> change.end), change.text)
   private def textEdits(changes: Seq[TextChange]): java.util.List[TextEdit] = changes.map(textEdit).asJava
 
-  private def completionItem(choice: CompletionChoice, rank: Int): CompletionItem = {
+  /**
+   * A suggestion as a completion item: its lookup string replaces the prefix. When the suggestion has an insert
+   * handler, the item's command runs it once the user has chosen it, as the IDE does (see CompleteInsertion).
+   */
+  private def completionItem(uri: String, choice: CompletionChoice, rank: Int): CompletionItem = {
     val suggestion = choice.suggestion
     val item = new CompletionItem(suggestion.label)
     val details = new CompletionItemLabelDetails
@@ -510,29 +521,55 @@ final class ScalaLanguageServer(
     if (suggestion.deprecated) item.setTags(java.util.List.of(CompletionItemTag.Deprecated))
     // The suggestions come ordered: by rank, the editor keeps that order instead of sorting them by label.
     item.setSortText(f"$rank%06d")
-    item.setFilterText(suggestion.filterText)
-    val change = choice.change
-    if (completionSnippets) {
-      item.setInsertTextFormat(InsertTextFormat.Snippet)
-      item.setTextEdit(LspEither.forLeft(textEdit(change.copy(text = snippet(change.text, choice.caret)))))
-    } else item.setTextEdit(LspEither.forLeft(textEdit(change)))
-    if (choice.additional.nonEmpty) item.setAdditionalTextEdits(textEdits(choice.additional))
+    item.setFilterText(suggestion.lookup)
+    item.setTextEdit(LspEither.forLeft(new TextEdit(range(choice.start -> choice.end), suggestion.lookup)))
+    if (suggestion.hasHandler && appliesEdits) {
+      val arguments: Seq[AnyRef] = Seq(uri, Integer.valueOf(choice.start.line), Integer.valueOf(choice.start.column),
+        suggestion.prefixText, suggestion.lookup, suggestion.identity)
+      item.setCommand(new Command(suggestion.label, CompleteInsertion, arguments.asJava))
+    }
     item
   }
 
-  /** `text` as a snippet whose final tab stop, where the editor leaves the caret, is `caret` characters in. */
-  private def snippet(text: String, caret: Int): String = {
-    def escape(part: String) = part.flatMap {
-      case c @ ('\\' | '$' | '}') => s"\\$c"
-      case c => c.toString
+  /**
+   * Applies what a chosen suggestion's insert handler changes, to the document version it was computed for (the
+   * editor refuses it if the user has typed on meanwhile), then moves the caret where the handler left it.
+   */
+  private def applyFollowUp(uri: String, version: Integer, followUp: CompletionFollowUp): Unit =
+    if (followUp.changes.nonEmpty) {
+      val edit = new TextDocumentEdit(new VersionedTextDocumentIdentifier(uri, version), textEdits(followUp.changes))
+      val workspaceEdit = new WorkspaceEdit(java.util.List.of(LspEither.forLeft[TextDocumentEdit, ResourceOperation](edit)))
+      client.applyEdit(new ApplyWorkspaceEditParams(workspaceEdit, "completion")).thenAccept { response =>
+        if (response.isApplied && showsDocuments) {
+          val show = new ShowDocumentParams(uri)
+          show.setSelection(range(followUp.caret -> followUp.caret))
+          show.setTakeFocus(true)
+          client.showDocument(show)
+        }
+      }
     }
-    escape(text.take(caret)) + "$0" + escape(text.drop(caret))
-  }
 
   // ---- Workspace -------------------------------------------------------------------------------------------------
 
   private object Workspace extends LspServices.Workspace {
     override def didChangeConfiguration(params: DidChangeConfigurationParams): Unit = ()
+
+    override def executeCommand(params: ExecuteCommandParams): CompletableFuture[AnyRef] = params.getCommand match {
+      case CompleteInsertion =>
+        // lsp4j hands the arguments over as JSON: the ones completionItem gave.
+        val arguments = params.getArguments.asScala.toSeq.collect { case json: JsonPrimitive => json }
+        if (arguments.size != 6) CompletableFuture.failedFuture(requestError(ResponseErrorCode.InvalidParams, s"$CompleteInsertion: $arguments"))
+        else {
+          val uri = arguments(0).getAsString
+          val start = LineColumn(arguments(1).getAsInt, arguments(2).getAsInt)
+          onSource("completion insertion", new TextDocumentIdentifier(uri), null) { (s, path) =>
+            s.insertCompletion(path, start, arguments(3).getAsString, arguments(4).getAsString, arguments(5).getAsString)
+              .foreach(applyFollowUp(uri, versions.get(path), _))
+            null
+          }
+        }
+      case other => CompletableFuture.failedFuture(requestError(ResponseErrorCode.InvalidParams, s"unknown command: $other"))
+    }
 
     // The build's definition changed (reload it), or source files were created or deleted: import the build again.
     // Every open document's problems may change with it.
@@ -545,6 +582,13 @@ final class ScalaLanguageServer(
     }
   }
 }
+
+/**
+ * The command of a completion item whose suggestion has an insert handler: the editor runs it once the user has
+ * chosen the item and its lookup string is in the document. Arguments: the document's URI, the line and column where
+ * the lookup string starts, the prefix it replaced, the lookup string, and the suggestion's identity.
+ */
+private val CompleteInsertion = "scalaPsiHost.completeInsertion"
 
 /** Which files define an sbt build: the client watches them, and a change to one reloads the build. */
 private object BuildDefinition {

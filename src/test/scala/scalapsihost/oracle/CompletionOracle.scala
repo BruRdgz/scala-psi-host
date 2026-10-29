@@ -263,13 +263,8 @@ object CompletionOracle {
       case other => throw new IllegalStateException(s"not a Scala fixture: $other")
     }
     try {
-      val insertion = Completion.insertion(file, offset, contract.lookup, contract.char)
-      val primary = insertion.edit
-      val original = before.replace("<caret>", "")
-      require(!primary.range.substring(original).contains('\n'), "primary edit spans source lines")
-      val replacement = primary.text.patch(insertion.caret, "<caret>", 0)
-      val edits = insertion.additional :+ primary.copy(text = replacement)
-      val inserted = TestHost.applyEdits(original, edits).trim
+      val chosen = Completion.choose(file, offset, contract.lookup, contract.char)
+      val inserted = chosen.result.text.patch(chosen.caret, "<caret>", 0).trim
       val actual = if (after.contains("<caret>")) inserted else inserted.replace("<caret>", "")
       require(host.read(file.getText) == before.replace("<caret>", ""), "completion changed original")
       if (actual == after) Result("agree", "")
@@ -348,10 +343,10 @@ object CompletionOracle {
           case None => Result("skip", "no last-comment expectation")
           case Some(comment) =>
             val expected = Expected.forVersion(comment, LatestScalaVersions.Scala_2_13).trim.linesIterator.filter(_.nonEmpty).toVector.sorted
-            val completed = Completion.complete(file, offset, limit = Int.MaxValue, previews = Int.MaxValue)
+            val completed = Completion.complete(file, offset, limit = Int.MaxValue)
             val items = completed.items.filter(i => c.suite != "keywordCompletion" || i.kind == CompletionItemKind.Keyword)
             val actual = items.map { i =>
-              i.filterText + (if (i.deprecated && c.suite == "completion") " (strikeout)" else "")
+              i.lookup + (if (i.deprecated && c.suite == "completion") " (strikeout)" else "")
             }.toVector.sorted
             if (expected == actual) Result("agree", "")
             else Result("disagree", s"missing: ${expected.diff(actual).mkString(", ")}; extra: ${actual.diff(expected).mkString(", ")}")

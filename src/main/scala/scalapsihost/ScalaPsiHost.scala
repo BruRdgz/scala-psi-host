@@ -80,8 +80,13 @@ final class ScalaPsiHost private (
    */
   def read[T](query: => T): T = HostLock.query(query)
 
-  /** The completion suggestions at `offset`. Not inside a read: inserting a suggestion changes a copy of the file. */
+  /** The completion suggestions at `offset`. */
   def completion(file: ScalaFile, offset: Int): Completion.Suggestions = Completion.complete(file, offset)
+
+  /** What the insert handler of a chosen suggestion changes (see [[Completion.insert]]). */
+  def insertCompletion(file: ScalaFile, start: Int, prefixText: String, lookup: String, identity: String)
+      : Option[Completion.Inserted] =
+    Completion.insert(file, start, prefixText, lookup, identity)
 
   /** The edits that format `range` of `file` (all of it without one); the file itself is left as it is. */
   def formatting(file: ScalaFile, range: Option[TextRange], indentSize: Int, useTabs: Boolean): Seq[ChangeEngine.Edit] =

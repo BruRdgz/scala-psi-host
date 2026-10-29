@@ -34,11 +34,14 @@ final case class Occurrence(range: (LineColumn, LineColumn), write: Boolean)
 /** The text between `start` and `end` becomes `text`. */
 final case class TextChange(start: LineColumn, end: LineColumn, text: String)
 
+/** A completion suggestion, whose lookup string the editor puts between `start` and `end`. */
+final case class CompletionChoice(suggestion: Completion.Suggestion, start: LineColumn, end: LineColumn)
+
 /**
- * A completion suggestion as the editor applies it (see [[Completion.Insertion]]): `change` at the completed prefix,
- * the caret `caret` characters into its text, and `additional` changes elsewhere (imports).
+ * What a chosen suggestion's insert handler does once its lookup string is in the file: `changes` to the file, and
+ * where the caret goes in the text they make.
  */
-final case class CompletionChoice(suggestion: Completion.Suggestion, change: TextChange, caret: Int, additional: Seq[TextChange])
+final case class CompletionFollowUp(changes: Seq[TextChange], caret: LineColumn)
 
 /** The suggestions, best first; `incomplete` when some were left out, so the editor asks again as the user types. */
 final case class CompletionChoices(items: Seq[CompletionChoice], incomplete: Boolean)
@@ -125,18 +128,34 @@ final class ProjectSession private (
   /** The completion suggestions at `at`, best first. Only Scala files complete. */
   def completion(path: Path, at: LineColumn): CompletionChoices = file(path) match {
     case f: ScalaFile =>
-      // The position is read before completion takes the write lock of its copies.
-      val suggestions = host.completion(f, host.read(offset(document(f), at)))
-      val choices = host.read {
+      host.read {
         val text = document(f)
-        suggestions.items.map { suggestion =>
-          val insertion = suggestion.insertion
-          CompletionChoice(suggestion, textChange(text, insertion.edit), insertion.caret, insertion.additional.map(textChange(text, _)))
+        val suggestions = host.completion(f, offset(text, at))
+        val choices = suggestions.items.map { suggestion =>
+          CompletionChoice(suggestion, position(text, suggestion.prefix.getStartOffset), position(text, suggestion.prefix.getEndOffset))
         }
+        CompletionChoices(choices, suggestions.incomplete)
       }
-      CompletionChoices(choices, suggestions.incomplete)
     case _ => CompletionChoices(Seq.empty, incomplete = false)
   }
+
+  /**
+   * Runs the insert handler of the suggestion `identity`, whose lookup string `lookup` the editor has put at `start`
+   * in place of `prefixText` (see [[Completion.insert]]). None when the file no longer has it there.
+   */
+  def insertCompletion(path: Path, start: LineColumn, prefixText: String, lookup: String, identity: String)
+      : Option[CompletionFollowUp] =
+    file(path) match {
+      case f: ScalaFile =>
+        // The position is read before the insertion takes the write lock of its copy.
+        val startOffset = host.read(offset(document(f), start))
+        host.insertCompletion(f, startOffset, prefixText, lookup, identity).map { inserted =>
+          val changes = host.read(inserted.result.edits.map(textChange(document(f), _)))
+          val caret = StringUtil.offsetToLineColumn(inserted.result.text, inserted.caret)
+          CompletionFollowUp(changes, LineColumn(caret.line, caret.column))
+        }
+      case _ => None
+    }
 
   /** The changes that format `range` of the file (all of it without one). Only Scala files are formatted. */
   def formatting(path: Path, range: Option[(LineColumn, LineColumn)], indentSize: Int, useTabs: Boolean): Seq[TextChange] =

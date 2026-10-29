@@ -37,6 +37,16 @@ class LanguageServerTest extends munit.FunSuite {
     override def showMessageRequest(params: ShowMessageRequestParams): CompletableFuture[MessageActionItem] =
       CompletableFuture.completedFuture(null)
     override def logMessage(params: MessageParams): Unit = logged.add(params)
+    val applied = new LinkedBlockingQueue[ApplyWorkspaceEditParams]()
+    val showed = new LinkedBlockingQueue[ShowDocumentParams]()
+    override def applyEdit(params: ApplyWorkspaceEditParams): CompletableFuture[ApplyWorkspaceEditResponse] = {
+      applied.add(params)
+      CompletableFuture.completedFuture(new ApplyWorkspaceEditResponse(true))
+    }
+    override def showDocument(params: ShowDocumentParams): CompletableFuture[ShowDocumentResult] = {
+      showed.add(params)
+      CompletableFuture.completedFuture(new ShowDocumentResult(true))
+    }
   }
 
   /** A server for `client`, connected to it as an editor connects (the server's own messages included). */
@@ -70,17 +80,17 @@ class LanguageServerTest extends munit.FunSuite {
       assert(!Files.exists(fixture.resolve("project/target/active.json")), "the language server left its sbt server running")
   }
 
-  private def initialize(server: HostProtocol.LanguageServerWithStatus, root: Path, snippets: Boolean = true): InitializeResult = {
+  /** Initializes `server` as an editor that, when `appliesEdits`, applies the server's edits and shows its documents. */
+  private def initialize(server: HostProtocol.LanguageServerWithStatus, root: Path, appliesEdits: Boolean = true): InitializeResult = {
     val params = new InitializeParams
     params.setWorkspaceFolders(java.util.List.of(new WorkspaceFolder(root.toUri.toString, root.getFileName.toString)))
-    val item = new CompletionItemCapabilities
-    item.setSnippetSupport(snippets)
-    val completion = new CompletionCapabilities
-    completion.setCompletionItem(item)
-    val text = new TextDocumentClientCapabilities
-    text.setCompletion(completion)
+    val workspace = new WorkspaceClientCapabilities
+    workspace.setApplyEdit(appliesEdits)
+    val window = new WindowClientCapabilities
+    window.setShowDocument(new ShowDocumentCapabilities(appliesEdits))
     val capabilities = new ClientCapabilities
-    capabilities.setTextDocument(text)
+    capabilities.setWorkspace(workspace)
+    capabilities.setWindow(window)
     params.setCapabilities(capabilities)
     val result = server.initialize(params).get(1, TimeUnit.MINUTES)
     server.initialized(new InitializedParams)
@@ -336,7 +346,7 @@ class LanguageServerTest extends munit.FunSuite {
       val text = members.find(_.getFilterText == "text").getOrElse(fail(members.toString))
       assert(text.getDetail.contains("String"), text.toString)
       assertEquals(text.getKind, CompletionItemKind.Method)
-      assertEquals(text.getTextEdit.getLeft.getNewText, "text$0")
+      assertEquals(text.getTextEdit.getLeft.getNewText, "text")
       val locals = complete(original.replace("println(text)", "println(tex)"), "println(tex", 21)
       assert(locals.exists(_.getFilterText == "text"), locals.toString)
       val keywords = complete(original.replace("println(text)", "val next = tr"), "val next = tr", 22)
@@ -344,7 +354,7 @@ class LanguageServerTest extends munit.FunSuite {
     } finally change(original, 23)
   }
 
-  test("completion lists carry import edits and the handler caret over JSON-RPC") {
+  test("a chosen suggestion's command runs its insert handler: the editor gets the import, parentheses and caret") {
     val original = Files.readString(main).replace("val text: String", "val text: Int")
     val text = "package app\nobject ConstructorClient { val c = new Coun }"
     def change(value: String, version: Int): Unit = server.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
@@ -354,9 +364,18 @@ class LanguageServerTest extends munit.FunSuite {
       val list = server.getTextDocumentService.completion(new CompletionParams(document(main),
         new Position(1, text.split("\n")(1).indexOf("Coun }") + 4))).get(1, TimeUnit.MINUTES).getRight
       val item = list.getItems.asScala.find(_.getFilterText == "Counter").getOrElse(fail(list.toString))
-      assertEquals(item.getTextEdit.getLeft.getNewText, "Counter($0)")
-      assertEquals(item.getInsertTextFormat, InsertTextFormat.Snippet)
-      assert(item.getAdditionalTextEdits.asScala.exists(_.getNewText.contains("import core.Counter")), item.toString)
+      assertEquals(item.getTextEdit.getLeft.getNewText, "Counter")
+      // As the editor does on Enter: the item's edit, then its command.
+      change(text.replace("new Coun }", "new Counter }"), 25)
+      val command = Option(item.getCommand).getOrElse(fail(s"no command: $item"))
+      server.getWorkspaceService.executeCommand(new ExecuteCommandParams(command.getCommand, command.getArguments)).get(1, TimeUnit.MINUTES)
+      val applied = Option(Client.applied.poll(1, TimeUnit.MINUTES)).getOrElse(fail("no edit applied"))
+      val edit = applied.getEdit.getDocumentChanges.get(0).getLeft
+      assertEquals(edit.getTextDocument.getVersion, Integer.valueOf(25))
+      val inserted = edit.getEdits.asScala.map(_.getNewText)
+      assert(inserted.exists(_.contains("import core.Counter")) && inserted.exists(_.contains("(")), inserted)
+      val caret = Option(Client.showed.poll(1, TimeUnit.MINUTES)).getOrElse(fail("caret not moved")).getSelection.getStart
+      assertEquals(text.replace("new Coun }", "new Counter() }").split("\n").last.charAt(caret.getCharacter - 1), '(')
     } finally change(original, 26)
   }
 
@@ -491,21 +510,20 @@ class LanguageServerTest extends munit.FunSuite {
     assertEquals(problemsAfterImport(4), typeMismatch)
   }
 
-  test("a client without snippet support receives plain insertion text") {
+  test("a client that does not apply the server's edits gets suggestions without commands") {
     closedServer
     releaseModules()
     val plain = connect(new RecordingClient)
     try {
-      initialize(plain, fixture, snippets = false)
+      initialize(plain, fixture, appliesEdits = false)
       val text = "package app\nobject PlainClient { val c = new Coun }"
       plain.getTextDocumentService.didOpen(new DidOpenTextDocumentParams(
         new TextDocumentItem(main.toUri.toString, "scala", 1, text)))
       val list = plain.getTextDocumentService.completion(new CompletionParams(document(main),
         new Position(1, text.split("\n")(1).indexOf("Coun }") + 4))).get(1, TimeUnit.MINUTES).getRight
       val item = list.getItems.asScala.find(_.getFilterText == "Counter").getOrElse(fail(list.toString))
-      assertEquals(item.getTextEdit.getLeft.getNewText, "Counter()")
-      assert(Option(item.getInsertTextFormat).forall(_ == InsertTextFormat.PlainText), item.toString)
-      assert(item.getAdditionalTextEdits.asScala.exists(_.getNewText.contains("import core.Counter")), item.toString)
+      assertEquals(item.getTextEdit.getLeft.getNewText, "Counter")
+      assertEquals(item.getCommand, null)
     } finally {
       plain.shutdown().get(30, TimeUnit.SECONDS)
       plain.exit()

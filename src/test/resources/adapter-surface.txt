@@ -68,8 +68,8 @@ AsyncExecutionService.buildNonBlockingReadAction
 CodeStyleSettingsService.addListener
 CodeStyleSettingsService.getCustomCodeStyleSettingsFactories
 CodeStyleSettingsService.getLanguageCodeStyleProviders
+Completion.laterRunnableSkipped
 Completion.popup.parameterInfo
-Completion.skipped.implementationDialog
 CompletionCaret.getOffset
 CompletionCaret.hasSelection
 CompletionCaretModel.getCurrentCaret

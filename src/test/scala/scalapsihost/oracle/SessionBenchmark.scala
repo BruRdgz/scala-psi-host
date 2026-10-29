@@ -78,8 +78,8 @@ object SessionBenchmark {
         // Forty requests expose warm p95 while keeping the fixture benchmark inexpensive.
         for (_ <- 0 until 40) {
           val list = measure("completion import list")(session.completion(importPath, at))
-          require(list.items.exists(i => i.suggestion.filterText == "ArrayBuffer" && i.additional.nonEmpty),
-            "benchmark import completion supplied no additional edits")
+          require(list.items.exists(i => i.suggestion.lookup == "ArrayBuffer" && i.suggestion.hasHandler),
+            "benchmark import completion did not suggest ArrayBuffer with its import handler")
         }
       } finally session.change(importPath, None, baseline)
       val heapAfterRequestsMb = usedHeapMb()

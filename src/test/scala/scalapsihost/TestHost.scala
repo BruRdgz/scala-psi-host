@@ -73,6 +73,20 @@ object TestHost {
   def patternDefinitions(file: ScalaFile): Seq[ScPatternDefinition] =
     PsiTreeUtil.findChildrenOfType(file, classOf[ScPatternDefinition]).asScala.toSeq
 
+  /**
+   * Chooses the suggestion `lookup` at `offset` as an editor does: its lookup string replaces the prefix, then its
+   * insert handler runs. The file's text after both, with `<caret>` where the handler left the caret.
+   */
+  def choose(file: ScalaFile, offset: Int, lookup: String): String = {
+    val suggestions = host.completion(file, offset).items
+    val chosen = suggestions.find(_.lookup == lookup)
+      .getOrElse(throw new IllegalStateException(s"no suggestion $lookup in $suggestions"))
+    host.edit(file, chosen.prefix.getStartOffset, chosen.prefix.getEndOffset, lookup)
+    val inserted = host.insertCompletion(file, chosen.prefix.getStartOffset, chosen.prefixText, lookup, chosen.identity)
+      .getOrElse(throw new IllegalStateException(s"the insert handler of $lookup did not run"))
+    inserted.result.text.patch(inserted.caret, "<caret>", 0)
+  }
+
   /** Runs every query the semantic tests make; the adapter surface test measures this. */
   def runScenario(): Unit = {
     val file = scenarioFile()
@@ -91,19 +105,23 @@ object TestHost {
       case other => throw new IllegalStateException(s"not a Scala scenario: $other")
     }
     try {
-      host.completion(completionFile, completionSource.indexOf("ArrayBuff") + "ArrayBuff".length)
-      host.completion(completionFile, completionSource.indexOf("; inv") + "; inv".length)
-      host.edit(completionFile, 0, completionSource.length, completionSource.replace("ArrayBuff", "ArrayBuffer"))
+      choose(completionFile, completionSource.indexOf("ArrayBuff") + "ArrayBuff".length, "ArrayBuffer")
+      host.edit(completionFile, 0, host.read(completionFile.getTextLength), completionSource)
+      choose(completionFile, completionSource.indexOf("; inv") + "; inv".length, "invoke")
       host.edit(completionFile, 0, host.read(completionFile.getTextLength), completionSource)
       host.diagnostics(completionFile)
     } finally host.closeSource(completionFile)
-    for ((text, prefix) <- Seq(
-      ("object StringScenario { val member = 1; val s = \"$mem\" }", "$mem"),
-      ("object KeywordScenario {\n  val n = 1\n  n mat\n}", "mat"),
-      ("trait ImplementScenario { def run(): Unit }; object Use { new ImplementScen }", "ImplementScen"),
-      ("object ConstructorScenario { val value = new ArrayBuff }", "ArrayBuff"))) {
-      val source = host.openSource(text)
-      try host.completion(source, text.lastIndexOf(prefix) + prefix.length)
+    for ((text, prefix, lookup) <- Seq(
+      ("object StringScenario { val member = 1; val s = \"$mem\" }", "$mem", "member"),
+      ("object KeywordScenario {\n  val n = 1\n  n mat\n}", "mat", "match"),
+      ("trait ImplementScenario { def run(): Unit }; object Use { new ImplementScen }", "ImplementScen", "ImplementScenario"),
+      ("object ConstructorScenario { val value = new ArrayBuff }", "ArrayBuff", "ArrayBuffer"))) {
+      // A file with a document: the editor puts the lookup string in it before its handler runs.
+      val source = host.openFile(Path.of(s"/surface/$lookup.scala"), text, completionModule) match {
+        case f: ScalaFile => f
+        case other => throw new IllegalStateException(s"not a Scala scenario: $other")
+      }
+      try choose(source, text.lastIndexOf(prefix) + prefix.length, lookup)
       finally host.closeSource(source)
     }
     val settingsManager = com.intellij.psi.codeStyle.CodeStyleSettingsManager.getInstance(host.project)
@@ -116,7 +134,7 @@ object TestHost {
       case other => throw new IllegalStateException(s"not a Scala scenario: $other")
     }
     try settingsManager.computeWithLocalSettings(settings, _ =>
-      host.completion(prefixed, prefixedText.indexOf("ArrayBuff") + "ArrayBuff".length))
+      choose(prefixed, prefixedText.indexOf("ArrayBuff") + "ArrayBuff".length, "ArrayBuffer"))
     finally host.closeSource(prefixed)
     host.formatting(file, None, 2, useTabs = false)
     val importFile = host.parse("object ImportUser { val x: scala.collection.mutable.HashSet[Int] = ??? }")
