@@ -224,6 +224,7 @@ private[scalapsihost] final class RequestEditor(document: com.intellij.openapi.e
                                                   project: com.intellij.openapi.project.Project, offset: Int) extends AutoCloseable {
   import com.intellij.openapi.editor.{Caret, CaretModel, Editor, SelectionModel}
   import com.intellij.openapi.editor.event.{DocumentEvent, DocumentListener}
+  import com.intellij.openapi.editor.colors.EditorColorsManager
   import com.intellij.openapi.util.{Key, UserDataHolderBase}
 
   private val data = new UserDataHolderBase
@@ -262,6 +263,10 @@ private[scalapsihost] final class RequestEditor(document: com.intellij.openapi.e
     case ("getProject", _) => project
     case ("getCaretModel", _) => model
     case ("getSelectionModel", _) => selection
+    // A source editor, rather than a one-line input field.
+    case ("isOneLineMode", _) => java.lang.Boolean.FALSE
+    // The host has no editor-specific color scheme.
+    case ("getColorsScheme", _) => EditorColorsManager.getInstance.getGlobalScheme
     case ("getUserData", Array(k: Key[?])) => data.getUserData(k).asInstanceOf[AnyRef]
     case ("putUserData", Array(k: Key[?], value)) => putData(k, value); null
   }

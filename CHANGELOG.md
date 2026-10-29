@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Inlay hints from the plugin's hints pass: definition types, parameter names, implicit and `using` arguments,
+  conversions, method chains and type arguments, within the requested range. Uses the plugin's settings; range
+  hints require the IDE's concrete editor and are disabled. The distribution includes a small platform slice rather
+  than the full `ide-impl` jar.
 - Go to definition and type definition into libraries: their attached sources (the build's source jars, the JDK's
   `src.zip`), or their decompiled class files.
 - Go to type definition, as the IDE's "go to type declaration".

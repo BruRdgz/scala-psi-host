@@ -13,6 +13,9 @@ val scalaPluginLib = settingKey[File]("Directory with the Scala plugin's jars (S
 val Fixtures = config("fixtures").hide
 // A second configuration: two versions of one module in a single configuration would evict each other.
 val Fixtures212 = config("fixtures212").hide
+// Downloaded only as input to the slice task, never a compile or runtime dependency.
+val InlayPlatform = config("inlay-platform").hide
+val inlayPlatformJar = taskKey[File]("The platform classes used by the Scala hints pass")
 
 val scalaPluginJars = taskKey[Seq[File]]("The Scala plugin's jars that go on the classpath")
 
@@ -24,7 +27,7 @@ ThisBuild / scalaVersion := "3.9.0"
 ThisBuild / scalacOptions += "-Ximport-suggestion-timeout:0"
 
 lazy val root = (project in file("."))
-  .configs(Fixtures, Fixtures212)
+  .configs(Fixtures, Fixtures212, InlayPlatform)
   .settings(
     name := "scala-psi-host",
     initialize := {
@@ -59,6 +62,7 @@ lazy val root = (project in file("."))
       "intellij-dependencies" at "https://cache-redirector.jetbrains.com/intellij-dependencies",
     ),
     libraryDependencies ++= Seq(
+      "com.jetbrains.intellij.platform" % "ide-impl" % platformVersion % InlayPlatform intransitive(),
       "com.jetbrains.intellij.platform" % "core-impl" % platformVersion,
       "com.jetbrains.intellij.platform" % "analysis-impl" % platformVersion,
       "com.jetbrains.intellij.java" % "java-psi-impl" % platformVersion,
@@ -105,7 +109,34 @@ lazy val root = (project in file("."))
       // The plugin's type-inference tests run on Scala 2.12 by default (ScalaSdkOwner.defaultSdkVersion).
       "org.scala-lang" % "scala-library" % "2.12.21" % Fixtures212 intransitive(),
     ),
-    Compile / unmanagedJars ++= scalaPluginJars.value.classpath,
+    inlayPlatformJar := {
+      val sources = update.value.select(configurationFilter(InlayPlatform.name), moduleFilter(name = "ide-impl"), artifactFilter(`type` = "jar"))
+      val source = sources match {
+        case Seq(jar) => jar
+        case other => sys.error(s"expected one ide-impl jar for the hints slice, got: $other")
+      }
+      // Measured by replaying InlayHintsOracle with class-load logging against the full jar.
+      val included = Seq(
+        "com/intellij/codeInsight/hints/filtering/", // ScalaInlayParameterHintsPass: MethodInfoExcludeListFilter, the whole filtering package.
+        "com/intellij/codeInsight/hint/TooltipGroup.class", // ImplicitHintsPass: ErrorTooltip initialization.
+        "com/intellij/codeInsight/daemon/impl/HintRenderer.class", // TextPartsHintRenderer: expanded implicit labels in the oracle.
+        "com/intellij/codeInsight/daemon/impl/HintRenderer$Companion.class", // TextPartsHintRenderer: its renderer base's companion.
+      )
+      val directory = target.value / "inlay-platform"
+      val out = directory / s"scala-inlay-platform-$platformVersion.jar"
+      val slice = FileFunction.cached(streams.value.cacheDirectory / "inlay-platform", FilesInfo.hash, FilesInfo.exists) { _ =>
+        val extracted = directory / "classes"
+        IO.delete(extracted)
+        val entries = IO.unzip(source, extracted, new NameFilter {
+          def accept(name: String): Boolean = included.exists(entry => name == entry || entry.endsWith("/") && name.startsWith(entry))
+        })
+        IO.zip(entries.toSeq.filter(_.isFile).pair(Path.relativeTo(extracted)), out)
+        Set(out)
+      }
+      slice(Set(source, baseDirectory.value / "build.sbt"))
+      out
+    },
+    Compile / unmanagedJars ++= (scalaPluginJars.value :+ inlayPlatformJar.value).classpath,
     // One JVM per test run: the host installs process-wide platform singletons (Application, root area).
     Test / fork := true,
     dist := {

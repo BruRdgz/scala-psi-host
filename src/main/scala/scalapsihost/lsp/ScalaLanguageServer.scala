@@ -12,6 +12,7 @@ import scalapsihost.{CallLog, ChangeEngine, HostLog, LineColumn, ParameterInfo, 
 
 import java.net.URI
 import java.nio.file.Path
+import java.util.{List as JavaList}
 import java.util.concurrent.*
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
 import scala.jdk.CollectionConverters.*
@@ -146,6 +147,7 @@ final class ScalaLanguageServer(
     val capabilities = new ServerCapabilities
     capabilities.setTextDocumentSync(TextDocumentSyncKind.Incremental)
     capabilities.setHoverProvider(true)
+    capabilities.setInlayHintProvider(true)
     capabilities.setCompletionProvider(new CompletionOptions(/* resolveProvider = */ false, java.util.List.of(".")))
     // A call's opening parenthesis or bracket shows the signatures; a comma moves to the next parameter.
     capabilities.setSignatureHelpProvider(new SignatureHelpOptions(java.util.List.of("(", "[", ","), java.util.List.of(",")))
@@ -406,6 +408,14 @@ final class ScalaLanguageServer(
         val choices = s.completion(path, lineColumn(params.getPosition))
         val items = choices.items.zipWithIndex.map((choice, rank) => completionItem(params.getTextDocument.getUri, choice, rank))
         LspEither.forRight(new CompletionList(choices.incomplete, items.asJava))
+      }
+
+    override def inlayHint(params: InlayHintParams): CompletableFuture[JavaList[InlayHint]] =
+      onSource("inlayHint", params.getTextDocument, JavaList.of[InlayHint]()) { (s, path) =>
+        val range = params.getRange
+        s.inlayHints(path, lineColumn(range.getStart), lineColumn(range.getEnd)).map { hint =>
+          new InlayHint(position(hint.at), LspEither.forLeft[String, JavaList[InlayHintLabelPart]](hint.text))
+        }.asJava
       }
 
     override def signatureHelp(params: SignatureHelpParams): CompletableFuture[SignatureHelp] =

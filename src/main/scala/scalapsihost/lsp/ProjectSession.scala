@@ -43,6 +43,9 @@ final case class CompletionChoice(suggestion: Completion.Suggestion, start: Line
  */
 final case class CompletionFollowUp(changes: Seq[TextChange], caret: LineColumn)
 
+/** An inline hint at a document position. */
+final case class InlineHint(at: LineColumn, text: String)
+
 /** The suggestions, best first; `incomplete` when some were left out, so the editor asks again as the user types. */
 final case class CompletionChoices(items: Seq[CompletionChoice], incomplete: Boolean)
 
@@ -137,6 +140,16 @@ final class ProjectSession private (
         CompletionChoices(choices, suggestions.incomplete)
       }
     case _ => CompletionChoices(Seq.empty, incomplete = false)
+  }
+
+  /** The plugin's inline hints within the requested range. Only Scala files have them. */
+  def inlayHints(path: Path, start: LineColumn, end: LineColumn): Seq[InlineHint] = file(path) match {
+    case f: ScalaFile => host.read {
+      val d = document(f)
+      val range = new TextRange(offset(d, start), offset(d, end))
+      host.inlayHints(f).filter(hint => range.contains(hint.offset)).map(hint => InlineHint(position(d, hint.offset), hint.text))
+    }
+    case _ => Seq.empty
   }
 
   /** The signatures of the call around `at`. Only Scala files have them. */

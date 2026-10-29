@@ -7,6 +7,7 @@ import scalapsihost.TestHost
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, PipedInputStream, PipedOutputStream}
 import java.nio.file.{Files, Path}
+import java.util.{List as JavaList}
 import java.util.concurrent.{CompletableFuture, LinkedBlockingQueue, TimeUnit}
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
@@ -177,6 +178,7 @@ class LanguageServerTest extends munit.FunSuite {
     val capabilities = initialize(server, fixture).getCapabilities
     assertEquals(capabilities.getTextDocumentSync.getLeft, TextDocumentSyncKind.Incremental)
     assert(capabilities.getHoverProvider.getLeft)
+    assert(capabilities.getInlayHintProvider.getLeft)
     assertEquals(capabilities.getCompletionProvider.getTriggerCharacters.asScala.toSeq, Seq("."))
     assertEquals(capabilities.getCompletionProvider.getResolveProvider, java.lang.Boolean.FALSE)
     assert(capabilities.getDocumentFormattingProvider.getLeft)
@@ -320,6 +322,39 @@ class LanguageServerTest extends munit.FunSuite {
     assertEquals(tokens.get((13, 12)).map(_._1), Some(SemanticTokenTypes.Variable))
     assertEquals(tokens.get((20, 6)), Some(SemanticTokenTypes.Method -> Set(SemanticTokenModifiers.Declaration)))
     assertEquals(tokens.get((20, 12)).map(_._1), Some(SemanticTokenTypes.Class))
+  }
+
+  test("inlay hints show inferred method types within the requested range") {
+    val text = """package app
+                 |object Hints {
+                 |  def names = Option(1).toList
+                 |  class A { def next: B = ??? }
+                 |  class B { def next: C = ??? }
+                 |  class C { def next: D = ??? }
+                 |  class D { def next: E = ??? }
+                 |  class E
+                 |  def start: A = ???
+                 |  start
+                 |    .next
+                 |    .next
+                 |    .next
+                 |    .next
+                 |  val range = 1 to 3
+                 |}
+                 |""".stripMargin
+    def change(value: String, version: Int): Unit = server.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
+      new VersionedTextDocumentIdentifier(main.toUri.toString, version), JavaList.of(new TextDocumentContentChangeEvent(value))))
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    try {
+      change(text, 38)
+      val hints = server.getTextDocumentService.inlayHint(new InlayHintParams(document(main),
+        new Range(new Position(0, 0), new Position(16, 0)))).get(1, TimeUnit.MINUTES).asScala.toSeq
+      assert(hints.exists(h => h.getPosition == new Position(2, 11) && h.getLabel.getLeft == ": List[Int]"), hints)
+      assert(hints.exists(h => h.getPosition == new Position(10, 9) && h.getLabel.getLeft == ": B"), hints)
+      val selected = server.getTextDocumentService.inlayHint(new InlayHintParams(document(main),
+        new Range(new Position(2, 0), new Position(2, 11)))).get(1, TimeUnit.MINUTES)
+      assert(selected.isEmpty, selected)
+    } finally change(original, 39)
   }
 
   test("signature help shows a call's signatures with the current parameter, as the IDE's parameter info") {

@@ -99,7 +99,7 @@ object TestHost {
     }
     host.completion(file, scenarioSource.indexOf("inc(b)") + "inc".length)
     host.completion(file, scenarioSource.indexOf("x + 1") + "x +".length)
-    val completionSource = "object InsertScenario { val x: ArrayBuff = ???; def invoke(n: Int): Unit = (); inv }"
+    val completionSource = "object InsertScenario { val x: ArrayBuff = ???; def invoke(n: Int): Unit = (); inv; def values = Option(1).toList }"
     val completionFile = host.openFile(Path.of("/surface/Insert.scala"), completionSource, completionModule) match {
       case f: ScalaFile => f
       case other => throw new IllegalStateException(s"not a Scala scenario: $other")
@@ -110,6 +110,7 @@ object TestHost {
       choose(completionFile, completionSource.indexOf("; inv") + "; inv".length, "invoke")
       host.edit(completionFile, 0, host.read(completionFile.getTextLength), completionSource)
       host.diagnostics(completionFile)
+      host.inlayHints(completionFile)
     } finally host.closeSource(completionFile)
     for ((text, prefix, lookup) <- Seq(
       ("object StringScenario { val member = 1; val s = \"$mem\" }", "$mem", "member"),

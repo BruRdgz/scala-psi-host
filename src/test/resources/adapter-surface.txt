@@ -26,6 +26,7 @@ Application.runReadAction
 Application.service com.intellij.codeInsight.CodeInsightSettings
 Application.service com.intellij.codeInsight.completion.CompletionService
 Application.service com.intellij.codeInsight.completion.group.GroupedCompletion
+Application.service com.intellij.codeInsight.hints.settings.ParameterNameHintsSettings
 Application.service com.intellij.formatting.Formatter
 Application.service com.intellij.formatting.FormattingProgressCallbackFactory
 Application.service com.intellij.internal.statistic.eventLog.StatisticsEventLogProvidersHolder
@@ -34,6 +35,7 @@ Application.service com.intellij.lang.PsiBuilderFactory
 Application.service com.intellij.openapi.application.AsyncExecutionService
 Application.service com.intellij.openapi.application.TransactionGuard
 Application.service com.intellij.openapi.command.CommandProcessor
+Application.service com.intellij.openapi.editor.colors.EditorColorsManager
 Application.service com.intellij.openapi.editor.elf.Elf
 Application.service com.intellij.openapi.fileEditor.FileDocumentManager
 Application.service com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers
@@ -58,6 +60,7 @@ Application.service com.intellij.psi.stubs.StubTreeLoader
 Application.service com.intellij.psi.util.PsiVersioningService
 Application.service com.intellij.util.concurrency.TransferredWriteActionService
 Application.service com.intellij.util.indexing.FileBasedIndex
+Application.service org.jetbrains.plugins.scala.codeInsight.ScalaCodeInsightSettings
 Application.service org.jetbrains.plugins.scala.lang.psi.api.expr.ExpectedTypes
 Application.service org.jetbrains.plugins.scala.scalaMeta.ScalaMetaApi
 Application.service org.jetbrains.plugins.scala.settings.ScalaApplicationSettings
@@ -78,6 +81,7 @@ CompletionCaretModel.moveToOffset
 DumbService.isAlternativeResolveEnabled
 DumbService.isDumb
 DumbService.queueTask
+EditorColorsManager.getGlobalScheme
 Elf.isInElfScope
 Elf.runReadAction
 EncodingManager.getDefaultCharset
@@ -211,7 +215,10 @@ PsiManager.isDisposed
 PsiShortNamesCache.getAllClassNames
 PsiShortNamesCache.getClassesByName
 RequestEditor.getCaretModel
+RequestEditor.getColorsScheme
 RequestEditor.getDocument
+RequestEditor.getProject
+RequestEditor.isOneLineMode
 ResolveScopeManager.getResolveScope
 ResolveScopeManager.getUseScope
 ScalaCodeStyleProvider.getDefaultCommonSettings

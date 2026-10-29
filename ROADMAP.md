@@ -22,11 +22,9 @@ agrees with the host, and the cases that do not agree are explained in the READM
 
 ## Done ahead of order (2026-10-29)
 
-The change engine and the formatter (beta 1), and completion, signature help and the request-local `Editor`
-(beta 2) exist; their gaps are in the README's known limitations. Next, from the review of that work:
+The change engine and the formatter (beta 1), completion, signature help and the request-local `Editor`
+(beta 2), and inlay hints exist; their gaps are in the README's known limitations. Next, from the review of that work:
 
-- Inlay hints (parameter names, types, implicit and `using` arguments): the plugin's hints pass needs a platform
-  module (hints filtering) that is not among the host's dependencies.
 - Scala 3 fixtures in the completion and parameter info oracles; file templates (override completion); live
   templates as snippets.
 
@@ -67,7 +65,6 @@ The change engine and the formatter (beta 1), and completion, signature help and
 ## Later
 
 - A persistent index, for fast startup.
-- Inlay hints: inferred types, implicit arguments and conversions.
 - `.sbt` files (sbt's meta-build is a build target over BSP).
 - Call and type hierarchy.
 - Test discovery and code lenses over BSP.

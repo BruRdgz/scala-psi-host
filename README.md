@@ -1,7 +1,7 @@
 # scala-psi-host
 
-> **Alpha.** Diagnostics, hover, go-to-definition, completion, signature help and formatting work on real projects;
-> references, rename, code actions and inlay hints do not exist yet. See [ROADMAP.md](ROADMAP.md) and
+> **Alpha.** Diagnostics, hover, go-to-definition, completion, signature help, inlay hints and formatting work;
+> references, rename and code actions do not exist yet. See [ROADMAP.md](ROADMAP.md) and
 > [Known limitations](#known-limitations).
 
 A Scala language server built on the IntelliJ Scala plugin's PSI and type checker, running **without an IntelliJ
@@ -9,14 +9,20 @@ application container**. The plugin source is not modified: the host builds the 
 answers, through fixed tables, what the plugin and the IntelliJ platform's PSI libraries ask of their environment.
 
 It serves LSP diagnostics, hover, go to definition and type definition, document highlights, document symbols,
-folding ranges, semantic tokens, completion, signature help and formatting for sbt (or any BSP) builds, Scala 2 and
-3, with Java sources in mixed projects.
+folding ranges, semantic tokens, completion, signature help, inlay hints and formatting for sbt (or any BSP) builds,
+Scala 2 and 3, with Java sources in mixed projects.
 
 Completion lists the suggestions of the plugin's completion contributors, ordered by its weighers; a suggestion's
 insert handler (parentheses, imports, generated code) runs once the user has chosen it, as in the IDE: the item's
 command asks the server, which applies the handler's edits (`workspace/applyEdit`) and moves the caret
 (`window/showDocument`). Formatting is the IntelliJ formatter; a change runs on a copy of the file and comes back as
 minimal edits.
+
+Inlay hints come from the plugin's `ImplicitHintsPass`: inferred definition types, parameter names, implicit and
+`using` arguments, conversions, method chains and type arguments. The plugin's settings and defaults apply (parameter
+names and local/member variable types are off by default); implicit hints are enabled. Only the two range-hint
+options are disabled, since their presentation requires the IDE's concrete editor.
+
 Symbols and folding are the plugin's structure view and folding builder; highlights and type definition, its access
 detector and type-declaration provider; semantic tokens, the colors its highlighting visitor and color-scheme
 annotator give identifiers (the editor's grammar colors keywords, literals and comments).
@@ -82,7 +88,10 @@ sbt --java-home <jdk25> test dist
 
 `SCALA_PLUGIN_LIB` points the build at another build of the plugin's jars (default
 `../intellij-scala/target/plugin/Scala/lib`); its revision is then not checked.
-Platform jars come from the IntelliJ snapshots repository at the version pinned in `build.sbt`.
+Platform jars come from the IntelliJ snapshots repository at the version pinned in `build.sbt`. The build resolves
+`ide-impl` only as input to `inlayPlatformJar`: it extracts the hints-filtering package, `TooltipGroup`, `HintRenderer`
+and its companion into a small jar. The full `ide-impl` jar is kept off the host's compile/runtime classpath and out
+of the distribution.
 
 The BSP tests use `fixtures/bsp-project`, an sbt build; create its connection file once with `sbt bspConfig` in that
 directory. sbt keeps a build server running per build directory after its clients leave (`sbt shutdown` there
@@ -171,6 +180,11 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   inline Scala test methods are not replayed).
 - `oracle.ParameterInfoOracle <intellij-scala> <report.md>` — the plugin's parameter info tests: 104 agree,
   3 disagree (library versions), 35 skip (Scala 3 fixtures).
+- `oracle.InlayHintsOracle <intellij-scala> <report.md> [--only=<name>,...]` — literal cases from the plugin's
+  definition-type, parameter-name, type-argument, implicit-argument and conversion hint tests, with their file wrapper
+  and settings: **152 agree, 0 disagree, 9 skip**. Types: 25 agree; parameters: 13; type arguments: 62; implicit
+  arguments: 38 (Scala 2 and 3); conversions: 14 (Scala 2 and 3). Eight source tests need Java setup, navigation or
+  tooltip assertions; the additional range probe is skipped because range hints require `EditorImpl`.
 - `oracle.SessionBenchmark <project> <report.md>` — latency and memory of a session as the language server runs it:
   requests at identifiers sampled over the project's files, then rounds of edits with heap samples.
 
@@ -206,6 +220,12 @@ after a full GC grows by about 0.3 MB per edit (see [Known limitations](#known-l
   contributor (it reads the IDE daemon's highlights) do not run; handlers that start live templates insert their
   code without tab stops; a weigher failing on a suggestion whose PSI has no containing file leaves it out (cause
   open). Choosing a suggestion with a handler is two edits (undo takes two steps).
+- Inlay hints: range hints are not shown (`RangeInlayHintsPass` builds drawn presentations over `EditorImpl`). Java
+  parameter-name exclusions are unavailable: the real Java provider requires the absent `JavaBundle`, so Java calls
+  can show names the IDE excludes. String labels have no tooltips, navigation, expansion controls or kind; method
+  chains use inline labels without the IDE's column alignment. The plugin suppresses definition-type and method-chain
+  hints in Scala 3 compiler-highlighting mode unless X-Ray mode is enabled, as in the IDE. The oracle uses unit-test
+  mode with compiler highlighting disabled, and reports inherited Scala 2 cases once.
 - Formatting uses the IntelliJ formatter with Scala's default code style: the project's code style and
   `.scalafmt.conf` are not read.
 - Scala 2 has no document compilation (its compiler has no stable interface to call); Scala 2 errors come from the
@@ -216,7 +236,8 @@ after a full GC grows by about 0.3 MB per edit (see [Known limitations](#known-l
 - The JDK is the one the server runs on.
 - Depends on platform `@Internal` APIs (`Extensions.setRootArea`, `ExtensionsAreaImpl`), constructs a few platform
   and plugin classes with non-public constructors, as the IDE container does, and sets one private field of the
-  platform's statistics holder (no event providers).
+  platform's statistics holder (no event providers). Inlay hints also read the pass's private collected buffer and
+  write `ImplicitHints._enabled`: its public setter requires the IDE's keymap API to rebind shortcuts.
 
 ## License
 

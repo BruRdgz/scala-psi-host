@@ -1,8 +1,11 @@
 package scalapsihost
 
 import com.intellij.codeInsight.daemon.impl.{AnnotationHolderImpl, AnnotationSessionImpl}
+import com.intellij.codeInsight.hints.settings.ParameterNameHintsSettings
+import com.intellij.codeInsight.hints.{InlayParameterHintsExtension, InlayParameterHintsProvider}
 import com.intellij.codeInsight.intention.preview.IntentionPreviewUtils
 import com.intellij.core.{CoreApplicationEnvironment, CoreFileTypeRegistry}
+import com.intellij.lang.java.JavaLanguage
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
 import com.intellij.psi.{PsiErrorElement, PsiFile, SyntaxTraverser}
@@ -30,12 +33,14 @@ import com.intellij.psi.presentation.java.{ClassPresentationProvider, FieldPrese
 import com.intellij.psi.stubs.{LanguageStubDefinition, StubElementRegistryService, StubRegistryExtension}
 import com.intellij.psi.util.PsiModificationTracker
 import com.intellij.util.messages.impl.MessageBusFactoryImpl
+import org.jetbrains.plugins.scala.codeInsight.ScalaCodeInsightSettings
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiElementFactory
 import org.jetbrains.plugins.scala.project.{ProjectContext, ScalaFeatures}
 
 import java.io.File
 import java.nio.file.{Files, Path}
+import java.util.{Set as JavaSet}
 import java.util.concurrent.ConcurrentHashMap
 import scala.jdk.CollectionConverters.*
 
@@ -85,6 +90,9 @@ final class ScalaPsiHost private (
 
   /** The completion suggestions at `offset`. */
   def completion(file: ScalaFile, offset: Int): Completion.Suggestions = Completion.complete(file, offset)
+
+  /** The inline hints collected by the plugin's hints pass. */
+  def inlayHints(file: ScalaFile): Seq[InlayHints.InlayHint] = InlayHints.in(file)
 
   /** The signatures of the call around `offset`, as the IDE's parameter info shows them. */
   def parameterInfo(file: ScalaFile, offset: Int): Option[ParameterInfo.Signatures] = ParameterInfo.at(file, offset)
@@ -551,6 +559,11 @@ object ScalaPsiHost {
     })
     appServices.register(classOf[com.intellij.codeInsight.completion.CompletionService])(new Completion.Service)
     appServices.register(classOf[com.intellij.codeInsight.CodeInsightSettings])(new com.intellij.codeInsight.CodeInsightSettings)
+    appServices.register(classOf[ScalaCodeInsightSettings])(new ScalaCodeInsightSettings)
+    // The IDE shows implicit arguments and conversions while the user toggles them on; an LSP client can only show
+    // or hide inlay hints as a whole, so they are on.
+    InlayHints.setImplicitHintsEnabled(true)
+    appServices.register(classOf[ParameterNameHintsSettings])(new ParameterNameHintsSettings)
     // Usage statistics behind the IDE's tips ("did you know..."): the host records no use and advertises nothing.
     appServices.register(classOf[FeatureUsageTracker])(new FeatureUsageTracker {
       override def triggerFeatureUsed(featureId: String): Unit = ()
@@ -819,6 +832,11 @@ object ScalaPsiHost {
     LanguageParserDefinitions.INSTANCE.addExplicitExtension(com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.lang.java.JavaParserDefinition)
     // Java's typed leaves (PsiIdentifier, PsiKeyword, ...): Java PSI casts its tokens to them.
     LanguageASTFactory.INSTANCE.addExplicitExtension(com.intellij.lang.java.JavaLanguage.INSTANCE, new com.intellij.psi.impl.source.tree.JavaASTFactory)
+    // The Scala filter requires a Java provider. Java's real provider fails to construct without JavaBundle;
+    // its default exclusions are unavailable, so Java calls can show names the IDE would exclude.
+    InlayParameterHintsExtension.INSTANCE.addExplicitExtension(JavaLanguage.INSTANCE, new InlayParameterHintsProvider {
+      override def getDefaultBlackList: JavaSet[String] = JavaSet.of()
+    })
     // Java classes and fields describe themselves through these (getPresentation): completion shows a library class
     // after `new` with its package.
     ItemPresentationProviders.INSTANCE.addExplicitExtension(classOf[PsiClass], new ClassPresentationProvider)
