@@ -52,9 +52,13 @@ object Descriptors {
     } yield name -> EpDecl(name, cls, kind, e.getAttribute("dynamic") == "true", fromScala)
   }
 
-  /** `<registryKey>` defaults declared by the Scala plugin's descriptors. */
+  /**
+   * `<registryKey>` defaults declared by the Scala plugin's descriptors, and by the Java PSI's (go to implementation
+   * reads `ide.goto.implementation.show.interfaces`).
+   */
   def scalaRegistryKeys(loader: ClassLoader): Map[String, RegistryKeyDescriptor] = {
-    val descriptors = Seq("META-INF/scala-plugin-common.xml", "META-INF/sbt.xml", "META-INF/codeInsight.xml", "META-INF/scala-meta-impl.xml")
+    val descriptors = Seq("META-INF/scala-plugin-common.xml", "META-INF/sbt.xml", "META-INF/codeInsight.xml",
+      "META-INF/scala-meta-impl.xml", "intellij.java.psi.impl.xml")
     descriptors.flatMap { path =>
       val in = loader.getResourceAsStream(path)
       if (in == null) throw new IllegalStateException(s"Scala plugin descriptor not on the classpath: $path")

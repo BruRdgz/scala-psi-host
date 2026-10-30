@@ -8,6 +8,7 @@ import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.util.text.StringUtil
 import com.intellij.psi.{PsiDocumentManager, PsiElement, PsiFile, PsiNameIdentifierOwner, PsiNamedElement, SyntaxTraverser}
 import org.eclipse.lsp4j.SymbolKind
+import org.jetbrains.plugins.scala.extensions.PsiNamedElementExt
 import org.jetbrains.plugins.scala.editor.documentationProvider.{ScalaDocQuickInfoGenerator, ScalaDocumentationProvider}
 import org.jetbrains.plugins.scala.lang.folding.ScalaFoldingBuilder
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
@@ -31,6 +32,12 @@ final case class FileProblem(severity: HighlightSeverity, start: LineColumn, end
 
 /** An occurrence of a symbol in a file: its range, and whether it writes the symbol (a declaration with a value, an assignment). */
 final case class Occurrence(range: (LineColumn, LineColumn), write: Boolean)
+
+/** A range in a project source file. */
+final case class SourceSpan(path: Path, range: (LineColumn, LineColumn))
+
+/** A project symbol found by name: its kind, the package or class it is in, and where its name is. */
+final case class WorkspaceSymbolMatch(name: String, kind: SymbolKind, container: Option[String], location: SourceSpan)
 
 /** The text between `start` and `end` becomes `text`. */
 final case class TextChange(start: LineColumn, end: LineColumn, text: String)
@@ -308,6 +315,23 @@ final class ProjectSession private (
     types.toSeq.flatten.flatMap(sourceLocation)
   }
 
+  /** Where a declaration's name is in its file; an empty range at its start for one without a name identifier. */
+  private def nameRange(declaration: PsiElement): TextRange = declaration match {
+    case named: PsiNameIdentifierOwner if named.getNameIdentifier != null => named.getNameIdentifier.getTextRange
+    case other => TextRange.from(other.getTextOffset, 0)
+  }
+
+  /** `range` of `file` as a span, if the file is a project source. */
+  private def sourceSpan(file: PsiFile, range: TextRange): Option[SourceSpan] = file.getViewProvider.getVirtualFile match {
+    case source: SourceFile =>
+      val d = document(file)
+      Some(SourceSpan(source.path, position(d, range.getStartOffset) -> position(d, range.getEndOffset)))
+    case _ => None
+  }
+
+  private def nameSpan(declaration: PsiElement): Option[SourceSpan] =
+    Option(declaration.getContainingFile).flatMap(sourceSpan(_, nameRange(declaration)))
+
   /**
    * A declaration's file and the position of its name. A library declaration is in a file of the host's state
    * directory (see [[libraryFileOnDisk]]): its library's attached source, found as the IDE finds it (the declaration's
@@ -315,10 +339,7 @@ final class ProjectSession private (
    */
   private def sourceLocation(declaration: PsiElement): Option[(Path, LineColumn)] = {
     val target = declaration.getNavigationElement
-    val nameOffset = target match {
-      case named: PsiNameIdentifierOwner if named.getNameIdentifier != null => named.getNameIdentifier.getTextOffset
-      case other => other.getTextOffset
-    }
+    val nameOffset = nameRange(target).getStartOffset
     for {
       targetFile <- Option(target.getContainingFile)
       location <- targetFile.getViewProvider.getVirtualFile match {
@@ -353,6 +374,32 @@ final class ProjectSession private (
       onDisk.toFile.setReadOnly()
     }
     onDisk
+  }
+
+  /**
+   * Where the symbol at `at` is used, in the project's sources: the usages the plugin's find-usages handler reports,
+   * and the declaration's name if `includeDeclaration`.
+   */
+  def references(path: Path, at: LineColumn, includeDeclaration: Boolean): Seq[SourceSpan] = host.read {
+    val f = file(path)
+    ProjectSearch.usageTarget(f, offset(document(f), at)).toSeq.flatMap { target =>
+      val usages = ProjectSearch.usages(target).flatMap(usage => sourceSpan(usage.getFile, TextRange.create(usage.getNavigationRange)))
+      val declaration = if (includeDeclaration) nameSpan(target.getNavigationElement) else None
+      (declaration.toSeq ++ usages).distinct
+    }
+  }
+
+  /** The names of the implementations and overriders of the symbol at `at` (project sources only). */
+  def implementations(path: Path, at: LineColumn): Seq[SourceSpan] = host.read {
+    val f = file(path)
+    ProjectSearch.implementations(f, offset(document(f), at)).flatMap(nameSpan).distinct
+  }
+
+  /** The project's symbols whose names match `query`, best match first. */
+  def workspaceSymbols(query: String): Seq[WorkspaceSymbolMatch] = host.read {
+    ProjectSearch.symbols(host.project, query).flatMap { found =>
+      nameSpan(found.element).map(WorkspaceSymbolMatch(found.element.name, OutlineSymbol.kind(found.element), found.container, _))
+    }
   }
 
   /**

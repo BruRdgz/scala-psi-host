@@ -64,6 +64,7 @@ final class ModuleModel(project: Project) {
     if (!removed.sources.isEmpty) throw new IllegalStateException(s"module $name still has sources")
     // Scopes of the modules that depend on it reach it.
     scopes.clear()
+    useScopes.clear()
     libraryScopes.clear()
   }
 
@@ -99,6 +100,49 @@ final class ModuleModel(project: Project) {
   def resolveScope(file: VirtualFile): Option[GlobalSearchScope] = file match {
     case library: LibraryFile => libraryScopes.computeIfAbsent(library.root, libraryScope)
     case source => ofFile(source).map(resolveScope)
+  }
+
+  /**
+   * The project's source files, the IDE's project and content scope: library files and the JDK are in none of it. One
+   * object, for the plugin's caches (see above); a file is in it from when its module has it.
+   */
+  val sourcesScope: GlobalSearchScope = new GlobalSearchScope(project) {
+    override def contains(file: VirtualFile): Boolean = ofFile(file).isDefined
+    override def isSearchInModuleContent(module: Module): Boolean = true
+    override def isSearchInLibraries: Boolean = false
+    override def toString: String = "ProjectSources"
+  }
+
+  /**
+   * The library files (classes, attached sources and the JDK): the IDE's libraries scope, and its library-classes
+   * scope, which nothing asks for apart.
+   */
+  val librariesScope: GlobalSearchScope = new GlobalSearchScope(project) {
+    override def contains(file: VirtualFile): Boolean = file.isInstanceOf[LibraryFile]
+    override def isSearchInModuleContent(module: Module): Boolean = false
+    override def isSearchInLibraries: Boolean = true
+    override def toString: String = "Libraries"
+  }
+
+  // One scope per module here too.
+  private val useScopes = new ConcurrentHashMap[HostModule, GlobalSearchScope]()
+
+  /**
+   * Where a source's declarations are used: its module and the modules that depend on it, transitively, as the IDE's
+   * module-with-dependents scope; a library class is used where it resolves.
+   */
+  def useScope(file: VirtualFile): Option[GlobalSearchScope] = file match {
+    case _: LibraryFile => resolveScope(file)
+    case source => ofFile(source).map(module => useScopes.computeIfAbsent(module, newUseScope))
+  }
+
+  private def newUseScope(used: HostModule): GlobalSearchScope = new GlobalSearchScope(project) {
+    private def usesModule(user: HostModule) = withDependencies(user).contains(used)
+
+    override def contains(file: VirtualFile): Boolean = ofFile(file).exists(usesModule)
+    override def isSearchInModuleContent(module: Module): Boolean = ofModule(module).exists(usesModule)
+    override def isSearchInLibraries: Boolean = false
+    override def toString: String = s"ModuleWithDependents(${used.spec.name})"
   }
 
   private def libraryScope(root: VirtualFile): Option[GlobalSearchScope] = {

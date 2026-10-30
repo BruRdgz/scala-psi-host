@@ -157,6 +157,9 @@ final class ScalaLanguageServer(
     capabilities.setDocumentRangeFormattingProvider(true)
     capabilities.setDefinitionProvider(true)
     capabilities.setTypeDefinitionProvider(true)
+    capabilities.setReferencesProvider(true)
+    capabilities.setImplementationProvider(true)
+    capabilities.setWorkspaceSymbolProvider(true)
     capabilities.setDocumentHighlightProvider(true)
     capabilities.setDocumentSymbolProvider(true)
     capabilities.setFoldingRangeProvider(true)
@@ -463,8 +466,22 @@ final class ScalaLanguageServer(
         locations(s.typeDefinition(path, lineColumn(params.getPosition)))
       }
 
+    override def references(params: ReferenceParams): CompletableFuture[java.util.List[? <: Location]] =
+      onSource("references", params.getTextDocument, java.util.List.of[Location]()) { (s, path) =>
+        s.references(path, lineColumn(params.getPosition), params.getContext.isIncludeDeclaration).map(location).asJava
+      }
+
+    override def implementation(params: ImplementationParams)
+        : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
+      onSource("implementation", params.getTextDocument, spanLocations(Seq.empty)) { (s, path) =>
+        spanLocations(s.implementations(path, lineColumn(params.getPosition)))
+      }
+
     private def locations(found: Seq[(Path, LineColumn)]): LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]] =
       LspEither.forLeft(found.map { case (path, at) => new Location(path.toUri.toString, new Range(position(at), position(at))) }.asJava)
+
+    private def spanLocations(found: Seq[SourceSpan]): LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]] =
+      LspEither.forLeft(found.map(location).asJava)
 
     override def documentHighlight(params: DocumentHighlightParams): CompletableFuture[java.util.List[? <: DocumentHighlight]] =
       onSource("documentHighlight", params.getTextDocument, java.util.List.of[DocumentHighlight]()) { (s, path) =>
@@ -544,6 +561,7 @@ final class ScalaLanguageServer(
   private def lineColumn(p: Position): LineColumn = LineColumn(p.getLine, p.getCharacter)
   private def position(at: LineColumn): Position = new Position(at.line, at.column)
   private def range(span: (LineColumn, LineColumn)): Range = new Range(position(span._1), position(span._2))
+  private def location(span: SourceSpan): Location = new Location(span.path.toUri.toString, range(span.range))
   private def textEdit(change: TextChange): TextEdit = new TextEdit(range(change.start -> change.end), change.text)
   private def textEdits(changes: Seq[TextChange]): java.util.List[TextEdit] = changes.map(textEdit).asJava
 
@@ -627,6 +645,16 @@ final class ScalaLanguageServer(
         }
       case other => CompletableFuture.failedFuture(requestError(ResponseErrorCode.InvalidParams, s"unknown command: $other"))
     }
+
+    override def symbol(params: WorkspaceSymbolParams): CompletableFuture[LspEither[java.util.List[? <: SymbolInformation], java.util.List[? <: WorkspaceSymbol]]] =
+      onDocuments("workspaceSymbol") { s =>
+        val symbols = s.workspaceSymbols(params.getQuery).map { found =>
+          val symbol = new WorkspaceSymbol(found.name, found.kind, LspEither.forLeft[Location, WorkspaceSymbolLocation](location(found.location)))
+          found.container.foreach(symbol.setContainerName)
+          symbol
+        }
+        LspEither.forRight[java.util.List[? <: SymbolInformation], java.util.List[? <: WorkspaceSymbol]](symbols.asJava)
+      }
 
     // The build's definition changed (reload it), or source files were created or deleted: import the build again.
     // Every open document's problems may change with it.

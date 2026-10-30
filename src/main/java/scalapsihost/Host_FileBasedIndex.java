@@ -27,4 +27,6 @@ public final class Host_FileBasedIndex extends com.intellij.util.indexing.FileBa
   @Override public void requestRebuild(com.intellij.util.indexing.ID a0, java.lang.Throwable a1) { d.call("FileBasedIndex.requestRebuild", new Object[]{a0, a1}); }
   @Override public void requestReindex(com.intellij.openapi.vfs.VirtualFile a0) { d.call("FileBasedIndex.requestReindex", new Object[]{a0}); }
   @Override public void scheduleRebuild(com.intellij.util.indexing.ID a0, java.lang.Throwable a1) { d.call("FileBasedIndex.scheduleRebuild", new Object[]{a0, a1}); }
+  // Throws in FileBasedIndex; the host is never in dumb mode, so the command runs as it is. Hand-written: keep when regenerating.
+  @Override public <T, E extends Throwable> T ignoreDumbMode(com.intellij.util.indexing.DumbModeAccessType a0, com.intellij.openapi.util.ThrowableComputable<T, E> a1) throws E { return a1.compute(); }
 }

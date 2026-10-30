@@ -1088,9 +1088,20 @@ object ScalaPsiHost {
     appServices.register(classOf[com.intellij.codeInsight.TargetElementUtil])(new com.intellij.codeInsight.TargetElementUtil)
     com.intellij.codeInsight.TargetElementUtilBase.TARGET_ELEMENT_EVALUATOR.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE,
       new org.jetbrains.plugins.scala.codeInsight.ScalaTargetElementEvaluator)
-    // Extension points the reference search reads, with no extensions in the host.
+    // Extension points the reference search and the go-to-class contributor read, with no extensions in the host.
     for (name <- Seq("com.intellij.useScopeOptimizer", "com.intellij.codeUsageScopeOptimizer", "com.intellij.searchCandidateBatcher",
-                     "com.intellij.pom.declarationSearcher", "com.intellij.codeInsight.containerProvider")) declare(name)
+                     "com.intellij.pom.declarationSearcher", "com.intellij.codeInsight.containerProvider",
+                     "com.intellij.gotoByName.defaultProvider.ignoreLanguage")) declare(name)
+    // Go to implementation: the platform's searches of a class's inheritors and a method's overriders, which also ask for
+    // functional expressions (lambdas, method references) of the Java plugin's search, with no searcher in the host.
+    declare("com.intellij.functionalExpressionSearch")
+    declare("com.intellij.definitionsScopedSearch")
+    locally {
+      val searchers = area.getExtensionPoint[com.intellij.util.QueryExecutor[com.intellij.psi.PsiElement, com.intellij.psi.search.searches.DefinitionsScopedSearch.SearchParameters]](
+        "com.intellij.definitionsScopedSearch")
+      searchers.registerExtension(new com.intellij.codeInsight.navigation.ClassImplementationsSearch, root)
+      searchers.registerExtension(new com.intellij.codeInsight.navigation.MethodImplementationsSearch, root)
+    }
     // The platform's reference searcher: it scans the files the word index names for an element's name. (The IDE's
     // SearcherQueryExecutor, for searches by symbol, is left out: no Scala element is one.)
     area.getExtensionPoint[com.intellij.util.QueryExecutor[com.intellij.psi.PsiReference, com.intellij.psi.search.searches.ReferencesSearch.SearchParameters]](
@@ -1314,7 +1325,9 @@ object ScalaPsiHost {
     // request would add entries on every lookup that are never found again.
     val everythingScope = new com.intellij.psi.search.EverythingGlobalScope(project)
     projectServices.register(classOf[com.intellij.psi.search.ProjectScopeBuilder])(new Host_ProjectScopeBuilder(dispatch {
-      case (m, _) if m.startsWith("ProjectScopeBuilder.build") => everythingScope
+      case ("ProjectScopeBuilder.buildProjectScope" | "ProjectScopeBuilder.buildContentScope", _) => moduleModel.sourcesScope
+      case ("ProjectScopeBuilder.buildLibrariesScope" | "ProjectScopeBuilder.buildLibraryClassesScope", _) => moduleModel.librariesScope
+      case ("ProjectScopeBuilder.buildAllScope" | "ProjectScopeBuilder.buildEverythingScope", _) => everythingScope
     }))
     // Class and package lookup: the platform's JavaPsiFacadeImpl over element finders, as in the IDE. The plugin's
     // finders come with the host's LibraryClassFinder, which takes the place of the IDE's PsiElementFinderImpl.
@@ -1418,12 +1431,16 @@ object ScalaPsiHost {
       m.setMainProjectCodeStyle(new com.intellij.psi.codeStyle.CodeStyleSettings)
       m
     }
+    def contextFile(e: com.intellij.psi.PsiElement) =
+      Option(FileContextUtil.getContextFile(e)).map(_.getOriginalFile.getViewProvider.getVirtualFile)
     projectServices.register(classOf[com.intellij.psi.impl.ResolveScopeManager])(new Host_ResolveScopeManager(dispatch {
-      // Sources resolve in their module, library classes in the modules that have the library, anything else everywhere.
-      case ("ResolveScopeManager.getResolveScope" | "ResolveScopeManager.getUseScope", Array(e: com.intellij.psi.PsiElement)) =>
-        // Stub types and other synthetic files carry their declaration's context, as ResolveScopeManagerImpl follows.
-        val file = Option(FileContextUtil.getContextFile(e)).map(_.getOriginalFile.getViewProvider.getVirtualFile)
-        file.flatMap(moduleModel.resolveScope).getOrElse(everythingScope)
+      // Sources resolve in their module, library classes in the modules that have the library, anything else everywhere;
+      // sources are used in their module and the modules that depend on it.
+      // Stub types and other synthetic files carry their declaration's context, as ResolveScopeManagerImpl follows.
+      case ("ResolveScopeManager.getResolveScope", Array(e: com.intellij.psi.PsiElement)) =>
+        contextFile(e).flatMap(moduleModel.resolveScope).getOrElse(everythingScope)
+      case ("ResolveScopeManager.getUseScope", Array(e: com.intellij.psi.PsiElement)) =>
+        contextFile(e).flatMap(moduleModel.useScope).getOrElse(everythingScope)
       case ("ResolveScopeManager.getDefaultResolveScope", Array(f: VirtualFile)) =>
         moduleModel.resolveScope(f).getOrElse(everythingScope)
     }))

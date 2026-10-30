@@ -1,17 +1,17 @@
 # scala-psi-host
 
-> **Alpha.** Diagnostics, hover, go-to-definition, completion, signature help, inlay hints, selection ranges and
-> formatting work;
-> references, rename and code actions do not exist yet. See [ROADMAP.md](ROADMAP.md) and
+> **Alpha.** Diagnostics, hover, go-to-definition, references, implementations, workspace symbols, completion,
+> signature help, inlay hints, selection ranges and formatting work;
+> rename and code actions do not exist yet. See [ROADMAP.md](ROADMAP.md) and
 > [Known limitations](#known-limitations).
 
 A Scala language server built on the IntelliJ Scala plugin's PSI and type checker, running **without an IntelliJ
 application container**. The plugin source is not modified: the host builds the plugin from intellij-scala and
 answers, through fixed tables, what the plugin and the IntelliJ platform's PSI libraries ask of their environment.
 
-It serves LSP diagnostics, hover, go to definition and type definition, document highlights, document symbols,
-folding ranges, semantic tokens, completion, signature help, inlay hints, selection ranges and formatting for sbt
-(or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
+It serves LSP diagnostics, hover, go to definition, type definition and implementation, references, document
+highlights, document and workspace symbols, folding ranges, semantic tokens, completion, signature help, inlay
+hints, selection ranges and formatting for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
 
 Completion lists the suggestions of the plugin's completion contributors, ordered by its weighers; a suggestion's
 insert handler (parentheses, imports, generated code) runs once the user has chosen it, as in the IDE: the item's
@@ -31,6 +31,16 @@ selection, the editor's default settings and the plugin's layered highlighting l
 Symbols and folding are the plugin's structure view and folding builder; highlights and type definition, its access
 detector and type-declaration provider; semantic tokens, the colors its highlighting visitor and color-scheme
 annotator give identifiers (the editor's grammar colors keywords, literals and comments).
+
+References and implementations search the whole project, not the open file: the host keeps a word index of the
+sources (the platform's `IdIndex`, updated on every edit), and the platform's reference search runs over it with the
+plugin's searchers. References are what the plugin's find-usages handler reports with its default options (a class
+with its companion, a member with its overriders as the handler decides), for the symbol referenced or declared at the
+position, and with `includeDeclaration` the declaration's name. Implementations are the subclasses, overriders and
+implementations of a class or member, and, as in the IDE, the member itself when asked from a use of one that has none.
+Workspace symbols match a query against the names of the project's classes and members with the IDE's go to symbol
+matching (camel humps and word starts anywhere in a name; `pkg.Name` matches the qualified name) and list the best 100.
+All three answer for the project's sources only, never the libraries'.
 
 ## How it works
 
@@ -136,7 +146,8 @@ editor would (initialize, open, diagnostics, hover, definition, shutdown).
 
 - `ScalaPsiHost` — bootstrap (the tables, service registrations, startup of synthetic classes) and the host's API:
   modules, libraries, source files, edits, reads, diagnostics.
-- `ModuleModel` — modules, which module each source belongs to, and their resolve scopes.
+- `ModuleModel` — modules, which module each source belongs to, and their resolve, use, project (sources) and libraries scopes.
+- `ProjectSearch`, `WordIndex` — usages, implementations and symbols by name over the sources; the word index they search by.
 - `LibraryFileSystem`, `SourceFile` — virtual files of libraries and of project sources.
 - `SymbolIndex` — the stub index; `LibraryClassFinder` — classes and packages of the library roots.
 - `BspImport` — the build connection: modules, sources, compile specs, compile with diagnostics.
@@ -198,6 +209,15 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   Scala 2 and Scala 3 (which also runs the Scala 2 methods): **74 agree, 0 disagree, 3 skip** (29/0/1 and 45/0/2). The
   skips: the Java base method test (several files, Java among them, and the find-usages action) in both, and the
   presentation test. The test of the find-usages dialog's type is not replayed.
+- `oracle.ImplementationsOracle <intellij-scala> <report.md> [--only=<name>,...]` — the literal `doTest` cases of the plugin's
+  go-to-implementation tests (`GoToImplementationTest` in Scala 2.13, `GoToImplementationTest_Scala3`): the elements
+  found for the symbol at the caret against the marked ranges: **16 agree, 0 disagree, 1 skip** (12/0/0 and 4/0/1). The
+  skip checks the targets' presentation. `ImplementationSearchTest` is not replayed: it calls the Java overrider
+  searches directly on a Java and a Scala file, not go to implementation.
+- `oracle.WorkspaceSymbolsOracle <intellij-scala> <report.md> [--only=<name>,...]` — the plugin's search-by-name tests
+  (`ChooseClassOrSymbolByNameTest`, for Scala 2.13 and Scala 3): the files each test adds, the symbols found for its
+  query and its expectations: **20 agree, 0 disagree, 2 skip** (10/0/1 each). The skip searches JDK classes, which the
+  host does not list.
 - `oracle.SelectionOracle <intellij-scala> <report.md>` — the plugin's selectioner tests, step by step: ScalaDoc
   2 agree, 1 disagree; interpolated strings 27 agree; ordinary strings 9 agree; no skips. The multiline/single-line
   helper runs both variants. See the trailing-newline disagreement below.
@@ -239,6 +259,12 @@ the last (measured with `-XX:SoftRefLRUPolicyMSPerMB=0`, so the plugin's soft-re
 - Requests are answered one at a time, in order: while a file's problems or semantic tokens are computed (seconds
   for the slowest files) or the build reloads, other requests wait.
 
+- References, implementations and workspace symbols use the plugin's text-based searches. Not found: usages the IDE
+  finds from the compiler's indices (implicit arguments and conversions, SAM conversions), since the host has no build
+  server index and the plugin then searches the text only, as the IDE does with compiler indices off. Java
+  declarations have no references, and Java subclasses of a Scala class are not among its implementations (the
+  platform's Java searcher for them reads the compiler indices). Workspace symbols list Scala classes and members;
+  Java declarations and the JDK's and libraries' are not listed.
 - Completion misses beta 2's p95 budget of 150 ms (261 ms on the first pass, 186 ms warm, on the project above):
   what the host added was removed (ordering no longer weighs every item again after a weigher fails; index lookups
   filter by file without navigating PSI), and the rest is the plugin's own code: its contributors (`ScalaBasicCompletionContributor`,

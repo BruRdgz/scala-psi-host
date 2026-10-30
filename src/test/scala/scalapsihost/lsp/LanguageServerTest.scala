@@ -25,6 +25,7 @@ class LanguageServerTest extends munit.FunSuite {
   private val greeting = fixture.resolve("core/src/main/scala/core/Greeting.scala")
   private val counter = fixture.resolve("core/src/main/scala/core/Counter.scala")
   private val greet3 = fixture.resolve("core3/src/main/scala/core3/Greet3.scala")
+  private val shape = fixture.resolve("core/src/main/scala/core/Shape.scala")
 
   /** Records what the server sends. */
   private final class RecordingClient extends ClientBase {
@@ -187,6 +188,9 @@ class LanguageServerTest extends munit.FunSuite {
     assert(capabilities.getDocumentRangeFormattingProvider.getLeft)
     assert(capabilities.getDefinitionProvider.getLeft)
     assert(capabilities.getTypeDefinitionProvider.getLeft)
+    assert(capabilities.getReferencesProvider.getLeft)
+    assert(capabilities.getImplementationProvider.getLeft)
+    assert(capabilities.getWorkspaceSymbolProvider.getLeft)
     assert(capabilities.getDocumentHighlightProvider.getLeft)
     assert(capabilities.getDocumentSymbolProvider.getLeft)
     assert(capabilities.getFoldingRangeProvider.getLeft)
@@ -294,6 +298,45 @@ class LanguageServerTest extends munit.FunSuite {
     val locations = server.getTextDocumentService.typeDefinition(new TypeDefinitionParams(document(counter), new Position(20, 6)))
       .get(1, TimeUnit.MINUTES).getLeft.asScala.toSeq
     assertEquals(locations.map(l => (l.getUri, l.getRange.getStart)), Seq((counter.toUri.toString, new Position(8, 6))))
+  }
+
+  // A one-line range of a file, as (URI, range); found and expected ranges compare in file and line order.
+  private def span(path: Path, line: Int, startColumn: Int, endColumn: Int) =
+    (path.toUri.toString, new Range(new Position(line, startColumn), new Position(line, endColumn)))
+
+  private def sorted(spans: Seq[(String, Range)]) = spans.sortBy((uri, range) => (uri, range.getStart.getLine))
+
+  private def spans(locations: Seq[Location]) = sorted(locations.map(l => (l.getUri, l.getRange)))
+
+  // `.text` in the app module (line 6, columns 49-53, after the change above) uses Greeting.text of the core module,
+  // declared on line 3 of Greeting.scala.
+  test("finds the references to a symbol across modules, with or without its declaration") {
+    def references(includeDeclaration: Boolean) = spans(server.getTextDocumentService
+      .references(new ReferenceParams(document(main), new Position(6, 50), new ReferenceContext(includeDeclaration)))
+      .get(1, TimeUnit.MINUTES).asScala.toSeq)
+    assertEquals(references(includeDeclaration = false), Seq(span(main, 6, 49, 53)))
+    assertEquals(references(includeDeclaration = true), sorted(Seq(span(greeting, 3, 6, 10), span(main, 6, 49, 53))))
+  }
+
+  test("finds the implementations of a trait and of its abstract member") {
+    def implementations(position: Position) = spans(server.getTextDocumentService
+      .implementation(new ImplementationParams(document(shape), position)).get(1, TimeUnit.MINUTES).getLeft.asScala.toSeq)
+    // `Shape` (line 2) and its `area` (line 3): Square on lines 6-7 and Circle on lines 10-11.
+    assertEquals(implementations(new Position(2, 8)), sorted(Seq(span(shape, 6, 12, 18), span(shape, 10, 12, 18))))
+    assertEquals(implementations(new Position(3, 7)), sorted(Seq(span(shape, 7, 6, 10), span(shape, 11, 6, 10))))
+  }
+
+  test("finds the project's symbols by name, and no library symbol") {
+    def symbols(query: String) = server.getWorkspaceService.symbol(new WorkspaceSymbolParams(query))
+      .get(1, TimeUnit.MINUTES).getRight.asScala.toSeq
+    val counters = symbols("Counter")
+    assertEquals(counters.map(c => (c.getName, c.getKind, c.getContainerName)).toSet,
+      Set(("Counter", SymbolKind.Class, "core"), ("Counter", SymbolKind.Module, "core")))
+    assert(counters.forall(_.getLocation.getLeft.getUri == counter.toUri.toString), counters)
+    // Anywhere in the name; `scala.collection.mutable.ListBuffer` and `scala.Option` are the library's.
+    assertEquals(symbols("quare").map(_.getName), Seq("Square"))
+    assertEquals(symbols("ListBuffer"), Seq.empty)
+    assertEquals(symbols("Option"), Seq.empty)
   }
 
   // `count`, declared on line 9: assigned on lines 12 and 13, read on lines 13 and 16.
