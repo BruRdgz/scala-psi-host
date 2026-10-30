@@ -2,7 +2,7 @@ package scalapsihost
 
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.api.expr.ScReferenceExpression
-import org.jetbrains.plugins.scala.lang.psi.api.statements.ScPatternDefinition
+import org.jetbrains.plugins.scala.lang.psi.api.statements.{ScFunction, ScPatternDefinition}
 import com.intellij.psi.util.PsiTreeUtil
 
 import java.io.File
@@ -96,6 +96,8 @@ object TestHost {
       val shortNames = com.intellij.psi.search.PsiShortNamesCache.getInstance(host.project)
       shortNames.getAllClassNames
       shortNames.getClassesByName("Box", com.intellij.psi.search.GlobalSearchScope.allScope(host.project))
+      val inc = PsiTreeUtil.findChildrenOfType(file, classOf[ScFunction]).asScala.find(_.name == "inc").get
+      com.intellij.psi.search.searches.ReferencesSearch.search(inc).findAll()
     }
     host.completion(file, scenarioSource.indexOf("inc(b)") + "inc".length)
     host.completion(file, scenarioSource.indexOf("x + 1") + "x +".length)

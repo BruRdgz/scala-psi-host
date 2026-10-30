@@ -37,8 +37,12 @@ import com.intellij.navigation.ItemPresentationProviders
 import com.intellij.psi.{FileViewProvider, LanguageFileViewProviders, PsiClass, PsiElement, PsiField, PsiManager}
 import com.intellij.psi.presentation.java.{ClassPresentationProvider, FieldPresentationProvider}
 import com.intellij.psi.stubs.{LanguageStubDefinition, StubElementRegistryService, StubRegistryExtension}
+import com.intellij.psi.impl.cache.impl.id.{IdIndex, IdIndexEntry}
+import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.util.PsiModificationTracker
 import com.intellij.psi.impl.source.resolve.FileContextUtil
+import com.intellij.util.Processor
+import com.intellij.util.indexing.FileBasedIndex
 import com.intellij.util.messages.impl.MessageBusFactoryImpl
 import org.jetbrains.plugins.scala.codeInsight.ScalaCodeInsightSettings
 import org.jetbrains.plugins.scala.externalLibraries.bm4.BetterMonadicForSupport
@@ -85,6 +89,7 @@ final class ScalaPsiHost private (
   val stateDir: Path,
   val project: Project,
   symbolIndex: SymbolIndex,
+  wordIndex: WordIndex,
   libraryFiles: LibraryFileSystem,
   librarySources: ConcurrentHashMap[VirtualFile, VirtualFile],
   val modules: ModuleModel,
@@ -140,6 +145,7 @@ final class ScalaPsiHost private (
       modules.removeSource(file.getViewProvider.getVirtualFile)
       throw new IllegalStateException("source file stubs could not be paired with its PSI")
     }
+    wordIndex.indexFile(file)
     psiChanged()
     file
   }
@@ -177,6 +183,9 @@ final class ScalaPsiHost private (
       documents.commitDocument(document)
       symbolIndex.removeFile(file)
       if (!symbolIndex.indexSourceFile(file)) throw new IllegalStateException(s"stubs of the edited $file could not be paired with its PSI")
+      wordIndex.removeFile(file)
+      wordIndex.indexFile(file)
+      ScalaPsiHost.notifyPsiChanged(project)
     }
     // Work the commit scheduled for the UI thread (after-commit actions) runs before the edit returns.
     HostDispatchThread.drain()
@@ -186,6 +195,7 @@ final class ScalaPsiHost private (
   def closeSource(file: PsiFile): Unit = HostLock.write {
     val virtualFile = file.getViewProvider.getVirtualFile
     symbolIndex.removeFile(file)
+    wordIndex.removeFile(file)
     modules.removeSource(virtualFile)
     // The file store lets go of its view provider (and PSI): a file opened again at the same path is a new file.
     PsiManager.getInstance(project).asInstanceOf[com.intellij.psi.impl.PsiManagerEx].getFileManager.setViewProvider(virtualFile, null)
@@ -298,6 +308,8 @@ final class ScalaPsiHost private (
       case ("ModuleRootManager.getModule", _) => module
       // Host modules declare source membership, but no content entries or inherited package prefixes.
       case ("ModuleRootManager.getContentEntries", _) => Array.empty[com.intellij.openapi.roots.ContentEntry]
+      // The modules this one depends on; the plugin looks among them for sbt's shared-source modules, which the host has none of.
+      case ("ModuleRootManager.getDependencies", _) => hostModule.spec.dependsOn.flatMap(modules.named).map(_.module).toArray
     })
     lazy val module: Module = tableProxy(classOf[Module], "Module") {
       case ("getName", _) => hostModule.spec.name
@@ -377,6 +389,10 @@ object ScalaPsiHost {
     // The inheritors of a class, from the stub index: case clauses and exhaustive matches list a sealed type's.
     "com.intellij.directClassInheritorsSearch", "com.intellij.classInheritorsSearch",
     "com.intellij.extendWordSelectionHandler", "com.intellij.basicWordSelectionFilter",
+    // Find usages: the references to an element, its overriders and implementations, and the use scope widened for
+    // sources shared between modules.
+    "com.intellij.referencesSearch", "com.intellij.methodReferencesSearch", "com.intellij.definitionsSearch",
+    "com.intellij.overridingMethodsSearch", "com.intellij.useScopeEnlarger",
   )
 
   /**
@@ -470,6 +486,11 @@ object ScalaPsiHost {
         if (!HostLock.isReading && !HostLock.hasWriteIntent) throw new IllegalStateException("read access is allowed inside read or write actions only")
         null
       case ("isWriteAccessAllowed", _) => java.lang.Boolean.valueOf(HostLock.isWriting)
+      // The reference search stops its readers when a write starts. An edit cancels the running queries (HostLock),
+      // so there is no write pending while a query reads, and nothing to listen for.
+      case ("isWriteActionPending", _) => java.lang.Boolean.FALSE
+      case ("addApplicationListener", _) => null
+      case ("executeByImpatientReader", Array(r: Runnable)) => r.run(); null
       // Work for the UI thread runs on the host's dispatch thread.
       case ("invokeLater", Array(r: Runnable, _*)) => HostDispatchThread.invokeLater(r); null
       // No modal dialogs exist in the host.
@@ -547,6 +568,10 @@ object ScalaPsiHost {
       val ep = declared.asInstanceOf[ExtensionPointImpl[AnyRef]]
       implementations.foreach(name => ep.registerExtension(newPrivate(Class.forName(name).asInstanceOf[Class[AnyRef]]), root))
     }
+    // The deep inheritors search, which the plugin's overriders search relies on: it walks the direct inheritors that the
+    // plugin's searcher gives. (The Java direct searcher reads compiler indices, and would find Java subclasses only.)
+    area.getExtensionPoint[com.intellij.util.QueryExecutor[com.intellij.psi.PsiClass, com.intellij.psi.search.searches.ClassInheritorsSearch.SearchParameters]](
+      "com.intellij.classInheritorsSearch").registerExtension(new com.intellij.psi.impl.search.JavaClassInheritorsSearcher, root)
     // Descriptor beans preserve both the implementation attributes and the platform's id/order semantics.
     val completionPlugin = new DefaultPluginDescriptor(PluginId.getId("org.intellij.scala"))
     def registerCompletionBeans(epName: String, beans: Seq[ExtensionBean], plugin: com.intellij.openapi.extensions.PluginDescriptor): Unit = {
@@ -1006,7 +1031,10 @@ object ScalaPsiHost {
     val libraryFiles = new LibraryFileSystem
     // Class root → its attached source root.
     val librarySources = new ConcurrentHashMap[VirtualFile, VirtualFile]()
-    // The platform's file-based indexes: only the file-name index exists in the host, answered from library roots.
+    // The platform's file-based indexes: the file-name index, answered from library roots, and the word index of
+    // project sources, which the reference search reads to find the files that mention a name.
+    def wordQuery(words: java.util.Collection[?], checker: Condition[? >: Integer]) =
+      WordQuery(words.asScala.map(_.asInstanceOf[IdIndexEntry]).toSeq, mask => checker == null || checker.value(mask))
     appServices.register(classOf[com.intellij.util.indexing.FileBasedIndex])(new Host_FileBasedIndex(dispatch {
       case ("FileBasedIndex.processFilesContainingAnyKey",
             Array(id: com.intellij.util.indexing.ID[?, ?], names: java.util.Collection[?], scope: com.intellij.psi.search.GlobalSearchScope, _, _,
@@ -1014,7 +1042,67 @@ object ScalaPsiHost {
         val p = processor.asInstanceOf[com.intellij.util.Processor[VirtualFile]]
         val matching = names.asScala.toSeq.flatMap(n => libraryFiles.filesNamed(n.toString)).filter(scope.contains)
         java.lang.Boolean.valueOf(matching.forall(p.process))
+      case ("FileBasedIndex.getContainingFiles", Array(id, word: IdIndexEntry, scope: GlobalSearchScope)) if id == IdIndex.NAME =>
+        wordIndex.filesWith(word, scope).asJava
+      case ("FileBasedIndex.processValues", Array(id, word: IdIndexEntry, inFile, processor: FileBasedIndex.ValueProcessor[?], scope: GlobalSearchScope))
+          if id == IdIndex.NAME =>
+        val p = processor.asInstanceOf[FileBasedIndex.ValueProcessor[Integer]]
+        val files = inFile match {
+          case file: VirtualFile => Seq(file).filter(scope.contains)
+          case _ => wordIndex.filesWith(word, scope)
+        }
+        java.lang.Boolean.valueOf(files.forall(file => wordIndex.occurrences(word, file).forall(mask => p.process(file, mask))))
+      case ("FileBasedIndex.processFilesContainingAllKeys",
+            Array(id, words: java.util.Collection[?], scope: GlobalSearchScope, checker, processor: Processor[?])) if id == IdIndex.NAME =>
+        val p = processor.asInstanceOf[Processor[VirtualFile]]
+        java.lang.Boolean.valueOf(wordIndex.filesWithAll(Seq(wordQuery(words, checker.asInstanceOf[Condition[Integer]])), scope).forall(p.process))
+      // The reference search asks for several indexes at once; the host has the word index only.
+      case ("FileBasedIndex.processFilesContainingAllKeys", Array(queries: java.util.Collection[?], scope: GlobalSearchScope, processor: Processor[?])) =>
+        val p = processor.asInstanceOf[Processor[VirtualFile]]
+        val wordQueries = queries.asScala.toSeq.map {
+          case query: FileBasedIndex.AllKeysQuery[?, ?] if query.getIndexId == IdIndex.NAME =>
+            wordQuery(query.getDataKeys, query.getValueChecker.asInstanceOf[Condition[Integer]])
+          case other => CallLog.unsupported(s"FileBasedIndex.processFilesContainingAllKeys over the index of $other")
+        }
+        java.lang.Boolean.valueOf(wordIndex.filesWithAll(wordQueries, scope).forall(p.process))
     }))
+    // How files are split into words for that index: by language (the plugin's and Java's words scanners; Java's has
+    // its own indexer), and no file type outside a language has one.
+    appServices.register(classOf[com.intellij.lang.cacheBuilder.CacheBuilderRegistry])(new com.intellij.lang.cacheBuilder.CacheBuilderRegistry {
+      override def getCacheBuilder(fileType: com.intellij.openapi.fileTypes.FileType): com.intellij.lang.cacheBuilder.WordsScanner = null
+    })
+    com.intellij.lang.findUsages.LanguageFindUsages.INSTANCE.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE,
+      new org.jetbrains.plugins.scala.lang.findUsages.ScalaFindUsagesProvider)
+    com.intellij.lang.findUsages.LanguageFindUsages.INSTANCE.addExplicitExtension(JavaLanguage.INSTANCE, new com.intellij.lang.java.JavaFindUsagesProvider)
+    com.intellij.psi.impl.cache.impl.id.IdIndexers.INSTANCE.addExplicitExtension(com.intellij.ide.highlighter.JavaFileType.INSTANCE,
+      new com.intellij.psi.impl.cache.impl.idCache.JavaIdIndexer)
+    // Find usages searches the project scope by default; the host offers no other predefined scopes.
+    appServices.register(classOf[com.intellij.find.FindUsagesSettings])(new com.intellij.find.impl.FindUsagesSettingsImpl)
+    appServices.register(classOf[com.intellij.psi.search.PredefinedSearchScopeProvider])(new com.intellij.psi.search.PredefinedSearchScopeProvider {
+      override def getPredefinedScopes(project: Project, dataContext: com.intellij.openapi.actionSystem.DataContext, suggestSearchInLibs: Boolean,
+                                       prevSearchFiles: Boolean, currentSelection: Boolean, usageView: Boolean, showEmptyScopes: Boolean) =
+        java.util.List.of()
+    })
+    // The element a position stands for, as the editor finds it: the plugin's evaluator decides for Scala.
+    declare("com.intellij.targetElementUtilExtender")
+    appServices.register(classOf[com.intellij.codeInsight.TargetElementUtil])(new com.intellij.codeInsight.TargetElementUtil)
+    com.intellij.codeInsight.TargetElementUtilBase.TARGET_ELEMENT_EVALUATOR.addExplicitExtension(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE,
+      new org.jetbrains.plugins.scala.codeInsight.ScalaTargetElementEvaluator)
+    // Extension points the reference search reads, with no extensions in the host.
+    for (name <- Seq("com.intellij.useScopeOptimizer", "com.intellij.codeUsageScopeOptimizer", "com.intellij.searchCandidateBatcher",
+                     "com.intellij.pom.declarationSearcher", "com.intellij.codeInsight.containerProvider")) declare(name)
+    // The platform's reference searcher: it scans the files the word index names for an element's name. (The IDE's
+    // SearcherQueryExecutor, for searches by symbol, is left out: no Scala element is one.)
+    area.getExtensionPoint[com.intellij.util.QueryExecutor[com.intellij.psi.PsiReference, com.intellij.psi.search.searches.ReferencesSearch.SearchParameters]](
+      "com.intellij.referencesSearch").registerExtension(new com.intellij.psi.impl.search.CachesBasedRefSearcher, root)
+    // The search helper's file scans run one after the other, as in the platform's core environment: requests already
+    // hold the host's read lock.
+    appServices.register(classOf[com.intellij.concurrency.JobLauncher])(new com.intellij.core.CoreJobLauncher)
+    // The host is never in dumb mode: indexes are usable.
+    appServices.register(classOf[com.intellij.openapi.project.DumbUtil])(
+      tableProxy(classOf[com.intellij.openapi.project.DumbUtil], "DumbUtil") {
+        case ("mayUseIndices", _) => java.lang.Boolean.TRUE
+      })
     // Persistent file attributes: the plugin caches "is this class file Scala?" in them. The host persists nothing,
     // so every read misses (the plugin recomputes) and writes are discarded.
     appServices.register(classOf[com.intellij.openapi.vfs.newvfs.ManagingFS])(new Host_ManagingFS(dispatch {
@@ -1045,6 +1133,7 @@ object ScalaPsiHost {
       case ("putUserData", Array(k: Key[?], v)) =>
         projectData.putUserData(k.asInstanceOf[Key[AnyRef]], v); null
     }
+    lazy val wordIndex = new WordIndex(project)
     // The host's file store: view providers of project sources and of library files, keyed by virtual file; sources
     // register themselves, library files are created on first request. Other light files are the platform's
     // temporary copies (a reparse makes one per edit): such a file holds its own provider, as in the platform's
@@ -1307,7 +1396,7 @@ object ScalaPsiHost {
     // No language injection in the host: every file is its own top-level file.
     projectServices.register(classOf[com.intellij.lang.injection.InjectedLanguageManager])(new Host_InjectedLanguageManager(dispatch {
       case ("InjectedLanguageManager.getTopLevelFile", Array(e: com.intellij.psi.PsiElement)) => e.getContainingFile
-      case ("InjectedLanguageManager.findInjectedElementAt", _) => null
+      case ("InjectedLanguageManager.findInjectedElementAt" | "InjectedLanguageManager.getInjectedPsiFiles", _) => null
       case ("InjectedLanguageManager.isInjectedViewProvider", _) => java.lang.Boolean.FALSE
       case ("InjectedLanguageManager.getCachedInjectedDocumentsInRange", _) => java.util.List.of()
       // There are no registered injectors, so enumeration has no injected fragments to visit.
@@ -1338,6 +1427,20 @@ object ScalaPsiHost {
       case ("ResolveScopeManager.getDefaultResolveScope", Array(f: VirtualFile)) =>
         moduleModel.resolveScope(f).getOrElse(everythingScope)
     }))
+    // Compiler indices (searching bytecode for implicit, apply and SAM usages) need a project task runner, JPS or sbt
+    // shell, which the host lacks: the settings find none, are inactive, and the plugin searches the text only.
+    declare("com.intellij.projectTaskRunner")
+    projectServices.register(classOf[com.intellij.task.ProjectTaskManager])(new Host_ProjectTaskManager(project, dispatch(PartialFunction.empty)))
+    projectServices.register(classOf[org.jetbrains.plugins.scala.settings.CompilerIndicesSettings])(
+      new org.jetbrains.plugins.scala.settings.CompilerIndicesSettings(project))
+    locally {
+      val cachesClass = Class.forName("com.intellij.psi.impl.search.HighlightingCaches").asInstanceOf[Class[AnyRef]]
+      projectServices.register(cachesClass)(newPrivate(cachesClass, project))
+    }
+    projectServices.register(classOf[com.intellij.psi.search.PsiSearchHelper])(new com.intellij.psi.impl.search.PsiSearchHelperImpl(project))
+    // The options of the plugin's find-usages handler: its own defaults.
+    projectServices.register(classOf[org.jetbrains.plugins.scala.findUsages.factory.ScalaFindUsagesConfiguration])(
+      new org.jetbrains.plugins.scala.findUsages.factory.ScalaFindUsagesConfiguration(project))
     // Index-backed Scala symbol lookup: the real class, answered by the host's StubIndex.
     projectServices.register(classOf[org.jetbrains.plugins.scala.caches.ScalaShortNamesCacheManager])(
       new org.jetbrains.plugins.scala.caches.ScalaShortNamesCacheManager(using project))
@@ -1395,12 +1498,20 @@ object ScalaPsiHost {
     // A source file was added or removed, or a library mounted: what the IDE's PsiModificationTrackerImpl and the
     // plugin's ScalaPsiChangeListener do for a change under a directory (not a Scala element).
     def psiChanged(): Unit = HostLock.write {
+      ScalaPsiHost.notifyPsiChanged(project)
       psiModTracker.incCounter()
       org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager.instance(project).clearOnNonScalaChange()
     }
 
-    new ScalaPsiHost(config.stateDir, project, symbolIndex, libraryFiles, librarySources, moduleModel, () => psiChanged())
+    new ScalaPsiHost(config.stateDir, project, symbolIndex, wordIndex, libraryFiles, librarySources, moduleModel, () => psiChanged())
   }
+
+  /**
+   * Tells the platform's caches that PSI changed, which they clear on (the inheritors the search helper remembers, the
+   * resolve cache): the IDE's PsiManagerImpl does so on every tree change, the host once per change it makes.
+   */
+  private def notifyPsiChanged(project: Project): Unit =
+    project.getMessageBus.syncPublisher(com.intellij.psi.impl.PsiManagerImpl.ANY_PSI_CHANGE_TOPIC).beforePsiChanged(true)
 
   private def newPrivate[T](cls: Class[T], args: AnyRef*): T = {
     val ctor = cls.getDeclaredConstructors.find(_.getParameterCount == args.size)

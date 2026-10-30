@@ -2,14 +2,18 @@ package scalapsihost
 
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
+import com.intellij.psi.search.searches.ReferencesSearch
+import com.intellij.psi.util.PsiTreeUtil
 import org.eclipse.lsp4j.CompletionItemKind
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
+import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunction
 import scalapsihost.TestHost.{applyEdits, choose}
 
 import java.nio.file.Path
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.Duration
+import scala.jdk.CollectionConverters.*
 
 /**
  * Editing as an editor does it: a change to one file's text is reparsed in place and reaches every query that
@@ -55,6 +59,31 @@ class EditingTest extends munit.FunSuite {
         scala.concurrent.Await.result(query, scala.concurrent.duration.Duration(30, "s")))
       assertEquals(host.read(file.getText), "// edited\nobject D\n")
     } finally host.closeSource(file)
+  }
+
+  // The word index follows edits: a usage added to or removed from a file is found, or no longer found.
+  test("reference search finds usages in other files and follows edits") {
+    val aText = "object Searched { def target: Int = 1 }\n"
+    val bText = "object SearchUser { val x: Int = 1 }\n"
+    val a = host.openFile(Path.of("/editing/Searched.scala"), aText, module).asInstanceOf[ScalaFile]
+    val b = host.openFile(Path.of("/editing/SearchUser.scala"), bText, module).asInstanceOf[ScalaFile]
+    def usages: Seq[(String, String)] = host.read {
+      val target = PsiTreeUtil.findChildrenOfType(a, classOf[ScFunction]).asScala.head
+      ReferencesSearch.search(target).findAll().asScala.map(ref => ref.getElement.getContainingFile.getName -> ref.getElement.getText).toSeq
+    }
+    try {
+      assertEquals(usages, Seq.empty)
+
+      val usage = bText.indexOf("1")
+      host.edit(b, usage, usage + 1, "Searched.target")
+      assertEquals(usages, Seq("SearchUser.scala" -> "Searched.target"))
+
+      host.edit(b, usage, usage + "Searched.target".length, "1")
+      assertEquals(usages, Seq.empty)
+    } finally {
+      host.closeSource(a)
+      host.closeSource(b)
+    }
   }
 
   test("an edit is reparsed in place and changes what other files see") {

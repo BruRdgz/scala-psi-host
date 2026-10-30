@@ -1,11 +1,13 @@
 AdvancedSettings.editor.selection.expand-whitespaces
 AnnotationCacheOwnerNormalizer.doNormalize
+Application.addApplicationListener
 Application.addReadActionListener
 Application.addSuspendingWriteActionListener (default)
 Application.addWriteActionListener
 Application.addWriteIntentReadActionListener
 Application.assertReadAccessAllowed
 Application.assertWriteAccessAllowed
+Application.executeByImpatientReader
 Application.getDefaultModalityState
 Application.getExtensionArea
 Application.getLockProhibitedAdvice (default)
@@ -21,6 +23,7 @@ Application.isInternal
 Application.isReadAccessAllowed
 Application.isUnitTestMode
 Application.isWriteAccessAllowed
+Application.isWriteActionPending
 Application.isWriteIntentLockAcquired
 Application.loadClass
 Application.runReadAction
@@ -28,11 +31,13 @@ Application.service com.intellij.codeInsight.CodeInsightSettings
 Application.service com.intellij.codeInsight.completion.CompletionService
 Application.service com.intellij.codeInsight.completion.group.GroupedCompletion
 Application.service com.intellij.codeInsight.hints.settings.ParameterNameHintsSettings
+Application.service com.intellij.concurrency.JobLauncher
 Application.service com.intellij.formatting.Formatter
 Application.service com.intellij.formatting.FormattingProgressCallbackFactory
 Application.service com.intellij.internal.statistic.eventLog.StatisticsEventLogProvidersHolder
 Application.service com.intellij.lang.DefaultASTFactory
 Application.service com.intellij.lang.PsiBuilderFactory
+Application.service com.intellij.lang.cacheBuilder.CacheBuilderRegistry
 Application.service com.intellij.openapi.application.AsyncExecutionService
 Application.service com.intellij.openapi.application.TransactionGuard
 Application.service com.intellij.openapi.command.CommandProcessor
@@ -42,6 +47,7 @@ Application.service com.intellij.openapi.fileEditor.FileDocumentManager
 Application.service com.intellij.openapi.fileTypes.BinaryFileTypeDecompilers
 Application.service com.intellij.openapi.options.advanced.AdvancedSettings
 Application.service com.intellij.openapi.progress.ProgressManager
+Application.service com.intellij.openapi.project.DumbUtil
 Application.service com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 Application.service com.intellij.openapi.vfs.encoding.EncodingManager
 Application.service com.intellij.openapi.vfs.newvfs.ManagingFS
@@ -69,6 +75,7 @@ Application.service org.jetbrains.plugins.scala.settings.ScalaApplicationSetting
 Application.service(null) com.intellij.codeInsight.completion.NewRdCompletionSupport
 Application.service(null) com.intellij.psi.ParsingDiagnostics$ParserDiagnosticsHandler
 Application.service(null) com.intellij.psi.impl.source.tree.mvcc.PsiVersioningGarbageCollector
+Application.tryRunReadAction
 AsyncExecutionService.buildNonBlockingReadAction
 CodeStyleSettingsService.addListener
 CodeStyleSettingsService.getCustomCodeStyleSettingsFactories
@@ -87,13 +94,16 @@ CompletionCaretModel.moveToOffset
 DumbService.isAlternativeResolveEnabled
 DumbService.isDumb
 DumbService.queueTask
+DumbUtil.mayUseIndices
 EditorColorsManager.getGlobalScheme
 Elf.isInElfScope
 Elf.runReadAction
 EncodingManager.getDefaultCharset
 ExternalAnnotationsManager.findExternalAnnotations
 ExternalAnnotationsManager.findExternalAnnotationsFiles
+FileBasedIndex.processFilesContainingAllKeys
 FileBasedIndex.processFilesContainingAnyKey
+FileBasedIndex.processValues
 FileIndexFacade.isInLibraryClasses
 FileManager.findCachedViewProvider
 FileManager.findCachedViewProviders
@@ -176,6 +186,7 @@ Project.service com.intellij.psi.impl.ResolveScopeManager
 Project.service com.intellij.psi.impl.file.impl.JavaFileManager
 Project.service com.intellij.psi.impl.source.resolve.ResolveCache
 Project.service com.intellij.psi.search.ProjectScopeBuilder
+Project.service com.intellij.psi.search.PsiSearchHelper
 Project.service com.intellij.psi.search.PsiShortNamesCache
 Project.service com.intellij.psi.util.CachedValuesManager
 Project.service com.intellij.psi.util.PsiModificationTracker
@@ -221,6 +232,7 @@ PsiManager.getProject
 PsiManager.isAssertOnFileLoading
 PsiManager.isBatchFilesProcessingMode
 PsiManager.isDisposed
+PsiManager.runInBatchFilesMode
 PsiShortNamesCache.getAllClassNames
 PsiShortNamesCache.getClassesByName
 RequestEditor.getCaretModel

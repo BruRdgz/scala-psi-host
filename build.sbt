@@ -15,7 +15,7 @@ val Fixtures = config("fixtures").hide
 val Fixtures212 = config("fixtures212").hide
 // Downloaded only as input to the slice task, never a compile or runtime dependency.
 val InlayPlatform = config("inlay-platform").hide
-val inlayPlatformJar = taskKey[File]("The platform classes used by Scala hints and word selection")
+val inlayPlatformJar = taskKey[File]("The platform classes used by Scala hints, word selection and find-usages handlers")
 
 val scalaPluginJars = taskKey[Seq[File]]("The Scala plugin's jars that go on the classpath")
 
@@ -63,6 +63,7 @@ lazy val root = (project in file("."))
     ),
     libraryDependencies ++= Seq(
       "com.jetbrains.intellij.platform" % "ide-impl" % platformVersion % InlayPlatform intransitive(),
+      "com.jetbrains.intellij.platform" % "ide" % platformVersion % InlayPlatform intransitive(),
       "com.jetbrains.intellij.platform" % "core-impl" % platformVersion,
       "com.jetbrains.intellij.platform" % "analysis-impl" % platformVersion,
       "com.jetbrains.intellij.java" % "java-psi-impl" % platformVersion,
@@ -91,6 +92,8 @@ lazy val root = (project in file("."))
       // AccessLevelProvider, which the plugin's structure-view elements implement (document symbols). Only this jar.
       "com.jetbrains.intellij.java" % "java-structure-view" % platformVersion intransitive(),
       "com.jetbrains.intellij.platform" % "external-system-rt" % platformVersion intransitive(),
+      // ProjectTaskManager and ProjectTaskRunner, which the plugin's compiler-indices settings read. Only this jar; no task runner is installed.
+      "com.jetbrains.intellij.platform" % "execution" % platformVersion intransitive(),
       // XML PSI: ScalaDoc and XML literals parse through it.
       "com.jetbrains.intellij.xml" % "xml-psi" % platformVersion intransitive(),
       "com.jetbrains.intellij.xml" % "xml-psi-impl" % platformVersion intransitive(),
@@ -113,11 +116,8 @@ lazy val root = (project in file("."))
       "org.scala-lang" % "scala-library" % "2.12.21" % Fixtures212 intransitive(),
     ),
     inlayPlatformJar := {
-      val sources = update.value.select(configurationFilter(InlayPlatform.name), moduleFilter(name = "ide-impl"), artifactFilter(`type` = "jar"))
-      val source = sources match {
-        case Seq(jar) => jar
-        case other => sys.error(s"expected one ide-impl jar for the hints slice, got: $other")
-      }
+      val sources = update.value.select(configurationFilter(InlayPlatform.name), moduleFilter(), artifactFilter(`type` = "jar"))
+      if (sources.size != 2) sys.error(s"expected the ide-impl and ide jars for the platform slice, got: $sources")
       // Measured by replaying InlayHintsOracle with class-load logging against the full jar.
       val included = Seq(
         "com/intellij/codeInsight/hints/filtering/", // ScalaInlayParameterHintsPass: MethodInfoExcludeListFilter, the whole filtering package.
@@ -125,19 +125,20 @@ lazy val root = (project in file("."))
         "com/intellij/codeInsight/daemon/impl/HintRenderer.class", // TextPartsHintRenderer: expanded implicit labels in the oracle.
         "com/intellij/codeInsight/daemon/impl/HintRenderer$Companion.class", // TextPartsHintRenderer: its renderer base's companion.
         "com/intellij/openapi/editor/actions/EditorActionUtil.class", // SelectWordUtil: word/lexeme boundaries in the editor's lexer.
+        "com/intellij/openapi/ui/DialogWrapper.class", // The plugin's find-usages handlers: their dialogs extend AbstractFindUsagesDialog; the host opens none.
       )
       val directory = target.value / "inlay-platform"
       val out = directory / s"scala-inlay-platform-$platformVersion.jar"
       val slice = FileFunction.cached(streams.value.cacheDirectory / "inlay-platform", FilesInfo.hash, FilesInfo.exists) { _ =>
         val extracted = directory / "classes"
         IO.delete(extracted)
-        val entries = IO.unzip(source, extracted, new NameFilter {
+        val entries = sources.flatMap(source => IO.unzip(source, extracted, new NameFilter {
           def accept(name: String): Boolean = included.exists(entry => name == entry || entry.endsWith("/") && name.startsWith(entry))
-        })
+        }))
         IO.zip(entries.toSeq.filter(_.isFile).pair(Path.relativeTo(extracted)), out)
         Set(out)
       }
-      slice(Set(source, baseDirectory.value / "build.sbt"))
+      slice(sources.toSet + baseDirectory.value / "build.sbt")
       out
     },
     Compile / unmanagedJars ++= (scalaPluginJars.value :+ inlayPlatformJar.value).classpath,

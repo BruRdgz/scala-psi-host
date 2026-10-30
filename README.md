@@ -193,6 +193,11 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   and settings: **152 agree, 0 disagree, 9 skip**. Types: 25 agree; parameters: 13; type arguments: 62; implicit
   arguments: 38 (Scala 2 and 3); conversions: 14 (Scala 2 and 3). Eight source tests need Java setup, navigation or
   tooltip assertions; the additional range probe is skipped because range hints require `EditorImpl`.
+- `oracle.FindUsagesOracle <intellij-scala> <report.md> [--only=<name>,...]` — the literal `doTest` cases of the plugin's
+  find-usages tests: the target at the caret, and the usages its find-usages handler reports over the project scope, in
+  Scala 2 and Scala 3 (which also runs the Scala 2 methods): **74 agree, 0 disagree, 3 skip** (29/0/1 and 45/0/2). The
+  skips: the Java base method test (several files, Java among them, and the find-usages action) in both, and the
+  presentation test. The test of the find-usages dialog's type is not replayed.
 - `oracle.SelectionOracle <intellij-scala> <report.md>` — the plugin's selectioner tests, step by step: ScalaDoc
   2 agree, 1 disagree; interpolated strings 27 agree; ordinary strings 9 agree; no skips. The multiline/single-line
   helper runs both variants. See the trailing-newline disagreement below.

@@ -7,6 +7,10 @@ import java.util.*;
  * Usage: java -cp <classpath> Gen.java <outDir> <fqcn>...
  */
 public class Gen {
+  // Methods that are not abstract but throw in the base class, and that the host answers: forwarded like the abstract ones.
+  static final Map<String, Set<String>> FORWARDED_CONCRETE = Map.of(
+    "com.intellij.util.indexing.FileBasedIndex", Set.of("processFilesContainingAllKeys"));
+
   public static void main(String[] args) throws Exception {
     String outDir = args[0];
     for (int i = 1; i < args.length; i++) generate(outDir, Class.forName(args[i], false, Gen.class.getClassLoader()));
@@ -38,7 +42,10 @@ public class Gen {
         String key = m.getName() + Arrays.toString(m.getParameterTypes());
         if (m.isBridge() || m.isSynthetic() || Modifier.isStatic(m.getModifiers()) || Modifier.isPrivate(m.getModifiers())) continue;
         if (Modifier.isAbstract(m.getModifiers())) { if (!concrete.contains(key)) abstracts.putIfAbsent(key, m); }
-        else concrete.add(key);
+        else {
+          concrete.add(key);
+          if (FORWARDED_CONCRETE.getOrDefault(base.getName(), Set.of()).contains(m.getName())) abstracts.putIfAbsent(key, m);
+        }
       }
       todo.addAll(Arrays.asList(c.getInterfaces()));
     }
