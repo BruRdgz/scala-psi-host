@@ -204,12 +204,12 @@ Run them with `sbt "Test/runMain scalapsihost.oracle.<Name> ..."`.
 ## Measurements
 
 `SessionBenchmark` on a 522-file Scala 3 project (2 GB heap, one thread). Completion: 300 positions,
-2026-10-29; other requests: 2026-10-28.
+2026-10-30; other requests: 2026-10-28.
 
 | Request | p50 ms | p95 ms | p99 ms |
 |---|---|---|---|
-| completion (first pass) | 81 | 343 | 833 |
-| completion (warm positions) | 52 | 218 | 645 |
+| completion (first pass) | 61 | 261 | 428 |
+| completion (warm positions) | 55 | 186 | 247 |
 | completion import list (40 requests) | 60 | 85 | 131 |
 | hover | 0 | 28 | 83 |
 | definition | 0 | 2 | 8 |
@@ -221,8 +221,8 @@ Run them with `sbt "Test/runMain scalapsihost.oracle.<Name> ..."`.
 | semantic tokens after an edit | 29 | 64 | 71 |
 
 The first completion of a session takes about 2.5 s. Completion is the plugin's contributors, the ordering of every
-result and the presentation of the items sent (200 at most, as the IDE's lookup renders only what it shows); a
-phase probe measured, at p95 on the first pass, contributors 117 ms, ordering 69 ms and presentation 59 ms.
+result and the presentation of the items sent (200 at most, as the IDE's lookup renders only what it shows). Repeated
+runs on this machine vary by about 10%.
 
 Opening the project takes 18–24 s (BSP import, library sources, modules, parsing and indexing the sources); the heap
 holds 650 MB after opening and 1.4 GB once every file was highlighted. Editing one file over and over (120 edits,
@@ -234,9 +234,11 @@ the last (measured with `-XX:SoftRefLRUPolicyMSPerMB=0`, so the plugin's soft-re
 - Requests are answered one at a time, in order: while a file's problems or semantic tokens are computed (seconds
   for the slowest files) or the build reloads, other requests wait.
 
-- Completion misses beta 2's p95 budget of 150 ms (343 ms on the first pass, 218 ms warm, on the project above):
-  the plugin's contributors alone reach 259 ms at some positions (`ScalaBasicCompletionContributor`,
-  `ScalaGlobalMembersCompletionContributor`, `ExhaustiveMatchCompletionContributor`), and ordering up to 833 ms.
+- Completion misses beta 2's p95 budget of 150 ms (261 ms on the first pass, 186 ms warm, on the project above):
+  what the host added was removed (ordering no longer weighs every item again after a weigher fails; index lookups
+  filter by file without navigating PSI), and the rest is the plugin's own code: its contributors (`ScalaBasicCompletionContributor`,
+  `ScalaGlobalMembersCompletionContributor`, `ExhaustiveMatchCompletionContributor`) and weighers
+  (`ScalaExplicitlyImportedWeigher`, `ScalaByExpectedTypeWeigher`).
   The override contributor (member bodies come from the IDE's file templates) and the unresolved-name
   contributor (it reads the IDE daemon's highlights) do not run; handlers that start live templates insert their
   code without tab stops; a weigher failing on a suggestion whose PSI has no containing file leaves it out (cause

@@ -38,10 +38,13 @@ final case class LibraryIndexReport(
  * kept per file, so a source file can be removed or replaced.
  */
 final class SymbolIndex {
-  private val elements = new ConcurrentHashMap[(String, AnyRef), java.util.List[PsiElement]]()
+  // The IDE filters index postings by file before visiting PSI, without repeating each element's PSI navigation.
+  private final case class IndexedElement(file: VirtualFile, psi: PsiElement)
+
+  private val elements = new ConcurrentHashMap[(String, AnyRef), java.util.List[IndexedElement]]()
   private val keys = new ConcurrentHashMap[String, java.util.Set[AnyRef]]()
   /** Index name, key and element of every occurrence a file contributed. */
-  private val entriesByFile = new ConcurrentHashMap[PsiFile, Vector[(String, AnyRef, PsiElement)]]()
+  private val entriesByFile = new ConcurrentHashMap[PsiFile, Vector[(String, AnyRef, IndexedElement)]]()
   private val tracker = new SimpleModificationTracker
 
   // Index keys arrive as arbitrary CharSequences; lookups must compare them by content.
@@ -61,12 +64,13 @@ final class SymbolIndex {
       else {
         CallLog.hit(s"HIT index ${k.getName}")
         // Only elements of files in the caller's scope (a module's dependencies), as the IDE's index filters them.
-        def inScope(e: PsiElement) = scope match {
-          case s: GlobalSearchScope => s.contains(e.getContainingFile.getViewProvider.getVirtualFile)
+        def inScope(entry: IndexedElement) = scope match {
+          case s: GlobalSearchScope => s.contains(entry.file)
           case _ => true
         }
         val p = proc.asInstanceOf[Processor[PsiElement]]
-        java.lang.Boolean.valueOf(found.asScala.filter(e => required.isInstance(e) && inScope(e)).forall(p.process))
+        val candidates = found.asScala.iterator.filter(entry => required.isInstance(entry.psi) && inScope(entry))
+        java.lang.Boolean.valueOf(candidates.forall(entry => p.process(entry.psi)))
       }
     case ("StubIndex.processAllKeys", Array(k: StubIndexKey[?, ?], proc: Processor[?], _*)) =>
       val p = proc.asInstanceOf[Processor[AnyRef]]
@@ -148,17 +152,19 @@ final class SymbolIndex {
   /** Runs the stub indexers over each stub and records the occurrences for its element, as `file`'s entries. */
   private def record(file: PsiFile, stubsWithElements: Seq[(StubElement[?], PsiElement)]): Unit = {
     val registry = StubElementRegistryService.Companion.getInstance()
-    val entries = Vector.newBuilder[(String, AnyRef, PsiElement)]
+    val entries = Vector.newBuilder[(String, AnyRef, IndexedElement)]
+    val virtualFile = file.getViewProvider.getVirtualFile
     for ((stub, psi) <- stubsWithElements; serializer <- Option(registry.getStubSerializer(stub.getElementType))) {
+      val element = IndexedElement(virtualFile, psi)
       val sink = new IndexSink {
         override def occurrence[Psi <: PsiElement, K](key: StubIndexKey[K, Psi], value: K): Unit =
-          entries += ((key.getName, normKey(value.asInstanceOf[AnyRef]), psi))
+          entries += ((key.getName, normKey(value.asInstanceOf[AnyRef]), element))
       }
       serializer.asInstanceOf[ObjectStubSerializer[StubElement[?], ?]].indexStub(stub, sink)
     }
     val fileEntries = entries.result()
-    for ((index, key, psi) <- fileEntries) {
-      elements.computeIfAbsent((index, key), _ => new CopyOnWriteArrayList[PsiElement]()).add(psi)
+    for ((index, key, element) <- fileEntries) {
+      elements.computeIfAbsent((index, key), _ => new CopyOnWriteArrayList[IndexedElement]()).add(element)
       keys.computeIfAbsent(index, _ => ConcurrentHashMap.newKeySet[AnyRef]()).add(key)
     }
     entriesByFile.put(file, fileEntries)
@@ -169,10 +175,10 @@ final class SymbolIndex {
   def removeFile(file: PsiFile): Unit = {
     val fileEntries = entriesByFile.remove(file)
     if (fileEntries != null) {
-      for ((index, key, psi) <- fileEntries) {
+      for ((index, key, element) <- fileEntries) {
         val list = elements.get((index, key))
         if (list != null) {
-          list.remove(psi)
+          list.remove(element)
           if (list.isEmpty) {
             elements.remove((index, key))
             keys.get(index).remove(key)

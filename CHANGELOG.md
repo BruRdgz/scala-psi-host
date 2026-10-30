@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Faster completion: a suggestion whose weigher fails no longer makes the others be weighed again, and index
+  lookups filter postings by file without navigating PSI. First pass p95 300 to 261 ms, p99 988 to 428 ms.
 - Selection ranges from the platform's and Scala plugin's word-selection handlers: each parent replays the next
   Extend Selection step, with the plugin's layered lexer and default editor settings. The selection oracle agrees
   on 38 cases; one ScalaDoc fixture expects an extra step before the final newline.

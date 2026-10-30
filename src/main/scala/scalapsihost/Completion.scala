@@ -24,7 +24,6 @@ import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.{ScEnum, ScObje
 import org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.ScSyntheticFunction
 import org.jetbrains.plugins.scala.project.ScalaFeatures
 
-import scala.annotation.tailrec
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal
@@ -304,29 +303,26 @@ object Completion {
   }
 
   /**
-   * `elements` in the order of `sorter`'s weighers. One a weigher fails on is logged and left out, and the others are
-   * weighed again by a new classifier (the failed one may have weighed it in part): the rest still make a list.
+   * `elements` in the order of `sorter`'s weighers. A failed item is logged and removed through the classifier
+   * chain, as the lookup removes an item: this clears its partial weights without weighing the other items again.
    */
-  @tailrec
   private def classified(sorter: CompletionSorterImpl, elements: Vector[LookupElement], context: ProcessingContext): Vector[LookupElement] = {
     val classifier = sorter.buildClassifier(Classifier.empty[LookupElement]())
-    val failed = elements.find { element =>
+    val weighed = elements.filter { element =>
       ProgressManager.checkCanceled()
       try {
         classifier.addElement(element, context)
-        false
+        true
       } catch {
         case e: ProcessCanceledException => throw e
         case NonFatal(e) =>
           HostLog.error(s"weighing the suggestion ${describe(element)} failed", e)
           CallLog.hit("Completion.weighingFailed")
-          true
+          classifier.removeElement(element, context)
+          false
       }
     }
-    failed match {
-      case Some(element) => classified(sorter, elements.filterNot(_ eq element), context)
-      case None => classifier.classify(elements.asJava, context).asScala.toVector
-    }
+    classifier.classify(weighed.asJava, context).asScala.toVector
   }
 
   /** What a failure report needs to find the element: its kind, and where its PSI is (or is not). */
