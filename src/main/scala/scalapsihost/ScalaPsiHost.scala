@@ -90,6 +90,7 @@ final class ScalaPsiHost private (
   val project: Project,
   symbolIndex: SymbolIndex,
   wordIndex: WordIndex,
+  importIndex: ImportIndex,
   libraryFiles: LibraryFileSystem,
   librarySources: ConcurrentHashMap[VirtualFile, VirtualFile],
   val modules: ModuleModel,
@@ -147,6 +148,7 @@ final class ScalaPsiHost private (
       throw new IllegalStateException("source file stubs could not be paired with its PSI")
     }
     wordIndex.indexFile(file)
+    importIndex.indexFile(file)
     psiChanged()
     file
   }
@@ -190,7 +192,9 @@ final class ScalaPsiHost private (
     symbolIndex.removeFile(file)
     if (!symbolIndex.indexSourceFile(file)) throw new IllegalStateException(s"stubs of the edited $file could not be paired with its PSI")
     wordIndex.removeFile(file)
+    importIndex.removeFile(file)
     wordIndex.indexFile(file)
+    importIndex.indexFile(file)
     ScalaPsiHost.notifyPsiChanged(project)
   }
 
@@ -234,6 +238,7 @@ final class ScalaPsiHost private (
     val virtualFile = file.getViewProvider.getVirtualFile
     symbolIndex.removeFile(file)
     wordIndex.removeFile(file)
+    importIndex.removeFile(file)
     modules.removeSource(virtualFile)
     // The file store lets go of its view provider (and PSI): a file opened again at the same path is a new file.
     PsiManager.getInstance(project).asInstanceOf[com.intellij.psi.impl.PsiManagerEx].getFileManager.setViewProvider(virtualFile, null)
@@ -604,6 +609,10 @@ object ScalaPsiHost {
     }
     // Mod-command intentions copy PSI through the platform preview pipeline.
     declare("com.intellij.modCommandCopyHandler")
+      .asInstanceOf[ExtensionPointImpl[com.intellij.modcommand.ModCommandService.ModCommandPsiCopyHandler]]
+      .registerExtension(new com.intellij.modcommand.ModCommandService.ModCommandPsiCopyHandler {
+        override def createCopy(original: PsiFile): PsiFile = ChangeEngine.copyForModCommand(original)
+      }, root)
     declare("com.intellij.basicWordSelectionFilter")
     val wordFilters = area.getExtensionPoint[Condition[PsiElement]]("com.intellij.basicWordSelectionFilter")
     wordFilters.registerExtension(new DummyBlockWordSelectionFilter, root)
@@ -1122,6 +1131,9 @@ object ScalaPsiHost {
     def wordQuery(words: java.util.Collection[?], checker: Condition[? >: Integer]) =
       WordQuery(words.asScala.map(_.asInstanceOf[IdIndexEntry]).toSeq, mask => checker == null || checker.value(mask))
     appServices.register(classOf[com.intellij.util.indexing.FileBasedIndex])(new Host_FileBasedIndex(dispatch {
+      case ("FileBasedIndex.getValues", Array(id, qualifier: String, scope: GlobalSearchScope))
+          if id == org.jetbrains.plugins.scala.autoImport.ImportOrderingIndexer.Id =>
+        importIndex.values(qualifier, scope)
       case ("FileBasedIndex.processFilesContainingAnyKey",
             Array(id: com.intellij.util.indexing.ID[?, ?], names: java.util.Collection[?], scope: com.intellij.psi.search.GlobalSearchScope, _, _,
                   processor: com.intellij.util.Processor[?])) if id == com.intellij.psi.search.FilenameIndex.NAME =>
@@ -1231,6 +1243,7 @@ object ScalaPsiHost {
         projectData.putUserData(k.asInstanceOf[Key[AnyRef]], v); null
     }
     lazy val wordIndex = new WordIndex(project)
+    lazy val importIndex = new ImportIndex(project)
     // The host's file store: view providers of project sources and of library files, keyed by virtual file; sources
     // register themselves, library files are created on first request. Other light files are the platform's
     // temporary copies (a reparse makes one per edit): such a file holds its own provider, as in the platform's
@@ -1636,7 +1649,7 @@ object ScalaPsiHost {
       org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager.instance(project).clearOnNonScalaChange()
     }
 
-    new ScalaPsiHost(config.stateDir, project, symbolIndex, wordIndex, libraryFiles, librarySources, moduleModel, () => psiChanged(),
+    new ScalaPsiHost(config.stateDir, project, symbolIndex, wordIndex, importIndex, libraryFiles, librarySources, moduleModel, () => psiChanged(),
       new CodeActions(Descriptors.scalaExtensions(config.scalaPluginJars, "com.intellij.intentionAction"),
         Descriptors.scalaExtensions(config.scalaPluginJars, "com.intellij.lang.surroundDescriptor")))
   }

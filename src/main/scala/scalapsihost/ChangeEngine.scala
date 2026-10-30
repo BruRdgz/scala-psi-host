@@ -5,7 +5,7 @@ import com.intellij.diff.comparison.{ByCharRt, ByWordRt, CancellationChecker, Co
 import com.intellij.openapi.editor.Editor
 import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.util.{Computable, TextRange}
-import com.intellij.psi.PsiDocumentManager
+import com.intellij.psi.{PsiDocumentManager, PsiFile}
 import com.intellij.psi.codeStyle.{CodeStyleManager, CodeStyleSettingsManager}
 import com.intellij.psi.impl.PsiManagerEx
 import com.intellij.psi.impl.source.PostprocessReformattingAspect
@@ -28,6 +28,7 @@ import scala.util.Using
  */
 object ChangeEngine {
   private val changesInTurn = new Object
+  private val copyResources = new ThreadLocal[Using.Manager]
 
   /** A replacement of `range` of the original text by `text`. */
   final case class Edit(range: TextRange, text: String)
@@ -47,12 +48,31 @@ object ChangeEngine {
       withPreviewCopy(file) { copy =>
         val document = copy.getViewProvider.getDocument
         Using.Manager { resources =>
-          resources(listenTo(copy))
-          val editor = resources(new RequestEditor(document, copy.getProject, 0))
-          inPreviewSession(editor.editor)(change(file.getText, copy, modify))
+          val previous = copyResources.get()
+          copyResources.set(resources)
+          try {
+            resources(listenTo(copy))
+            val editor = resources(new RequestEditor(document, copy.getProject, 0))
+            inPreviewSession(editor.editor)(change(file.getText, copy, modify))
+          } finally copyResources.set(previous)
         }.get
       }
     }
+  }
+
+  /** ModCommand creates further copies; their documents need the same commit listeners as the preview's file. */
+  private[scalapsihost] def copyForModCommand(original: PsiFile): PsiFile = original match {
+    case file: ScalaFile if copyResources.get() != null =>
+      val resources = copyResources.get()
+      val copy = file.copy() match {
+        case f: ScalaFile => f
+        case other => throw new IllegalStateException(s"mod-command copy is not a Scala file: $other")
+      }
+      resources((() => release(copy)): AutoCloseable)
+      ScalaFeatures.setAttachedScalaFeatures(copy, ScalaFeatures.forPsiOrDefault(file))
+      resources(listenTo(copy))
+      copy
+    case _ => null
   }
 
   /** `modify` on `copy`, its postponed formatting done and its document committed. */

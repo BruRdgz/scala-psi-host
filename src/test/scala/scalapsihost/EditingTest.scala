@@ -351,6 +351,41 @@ class EditingTest extends munit.FunSuite {
     }
   }
 
+  test("type-import actions keep colliding candidates separate and preserve the source") {
+    val targets = Seq("first", "second").map { pack =>
+      scalaFile(s"${pack}ImportChoice", s"package $pack\nclass ImportChoice\n")
+    }
+    val original = "object ImportClient { val value: ImportChoice = ??? }\n"
+    val file = scalaFile("ImportClient", original)
+    try {
+      val at = original.indexOf("ImportChoice")
+      val actions = host.codeActions(file, new TextRange(at, at)).filter(_.title.startsWith("Import '"))
+      for (pack <- Seq("first", "second")) {
+        val title = s"Import '$pack.ImportChoice'"
+        val action = actions.find(_.title == title).getOrElse(fail(actions.toString))
+        assertEquals(action.disabled, None)
+        val changed = applyEdits(original, action.edits)
+        assert(changed.contains(s"import $pack.ImportChoice"), changed)
+        assertEquals(host.read(file.getText), original)
+      }
+      val scope = com.intellij.psi.search.GlobalSearchScope.projectScope(host.project)
+      def importValues = host.read {
+        com.intellij.util.indexing.FileBasedIndex.getInstance.getValues(
+          org.jetbrains.plugins.scala.autoImport.ImportOrderingIndexer.Id, "first", scope).size()
+      }
+      assertEquals(importValues, 0)
+      val chosen = actions.find(_.title == "Import 'first.ImportChoice'").getOrElse(fail(actions.toString))
+      val changed = applyEdits(original, chosen.edits)
+      host.edit(file, 0, original.length, changed)
+      assertEquals(importValues, 1)
+      host.edit(file, 0, changed.length, original)
+      assertEquals(importValues, 0)
+    } finally {
+      host.closeSource(file)
+      targets.foreach(host.closeSource)
+    }
+  }
+
   test("IntelliJ formatting returns minimal edits with request indentation") {
     val text = "object FormatMe {\nval emoji=\"😀\"\nval n=1+2\n}\n"
     val file = host.openFile(Path.of("/editing/FormatMe.scala"), text, module) match {

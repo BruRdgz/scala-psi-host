@@ -49,7 +49,8 @@ The change engine and the formatter (beta 1), completion, signature help, select
 - The change engine.
 - Code actions from the plugin's intentions and the annotators' quick fixes. **Initial integration:** previewable
   intentions, annotation fixes and surrounders return versioned LSP edits. `CodeActionsOracle` replays
-  `SurroundWithTest`: 37 agree, 11 disagree, 0 skip. Remaining: the documented preview gaps, auto-import quick fixes,
+  `SurroundWithTest`: 48 agree, 0 disagree, 0 skip; selected intention suites: 15 agree, 0 disagree, 12 skip.
+  Type-import quick fixes offer each plugin candidate separately. Remaining: global-member/conversion imports
   and broader intention-oracle coverage. `testdata/actions` covers editor key handlers, not these intentions.
 - Organize imports (oracle: `optimize`), auto-import (oracle: `autoImport`), rename (with B; oracle: `refactoring`).
 

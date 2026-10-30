@@ -6,7 +6,11 @@ import com.intellij.lang.surroundWith.SurroundDescriptor
 import com.intellij.modcommand.{ActionContext, ModCommandExecutor}
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.util.TextRange
+import org.jetbrains.plugins.scala.ScalaBundle
+import org.jetbrains.plugins.scala.autoImport.quickFix.{MemberToImport, PrefixPackageToImport, ScalaImportTypeFix}
+import org.jetbrains.plugins.scala.lang.psi.ScImportsHolder
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
+import org.jetbrains.plugins.scala.lang.psi.api.base.ScReference
 
 import scala.util.Using
 import scala.util.control.NonFatal
@@ -97,7 +101,40 @@ final class CodeActions(intentionClasses: Seq[String], descriptorClasses: Seq[St
           }
         }
       }
-      (choices ++ surrounded).distinct
+      (typeImports(file, range, problems) ++ choices ++ surrounded).distinct
+    }
+  }
+
+  /** Offer each type-import candidate separately; the LSP client replaces the IDE's import chooser. */
+  private def typeImports(file: ScalaFile, range: TextRange, problems: Seq[Diagnostic]): Seq[Choice] = {
+    val references = problems.filter(p => p.range.intersects(range) || p.range.containsOffset(range.getStartOffset))
+      .flatMap(p => Option(file.findReferenceAt(p.range.getStartOffset))).collect {
+        case reference: ScReference if reference.qualifier.isEmpty && reference.multiResolveScala(false).isEmpty => reference
+      }.distinct
+    references.flatMap { reference =>
+      ScalaImportTypeFix.getTypesToImport(reference).map { target =>
+        val title = ScalaBundle.message("import.with", target.qualifiedName)
+        try {
+          val (result, _) = preview(file) { copy =>
+            val copied = copy.findReferenceAt(reference.getTextRange.getStartOffset) match {
+              case ref: ScReference => ref
+              case _ => throw new IllegalStateException("the import reference is missing from the preview copy")
+            }
+            // The same binding operations as ScalaAddImportAction.ForReference, without its asynchronous chooser.
+            target match {
+              case PrefixPackageToImport(pack) => copied.bindToPackage(pack, addImport = true)
+              case _: MemberToImport => ScImportsHolder(copied).addImportForPath(target.qualifiedName)
+              case _ => copied.bindToElement(target.element)
+            }
+          }
+          Choice(title, "quickfix", result.edits, None)
+        } catch {
+          case e: ProcessCanceledException => throw e
+          case e @ (NonFatal(_) | _: LinkageError) =>
+            HostLog.warn(s"code action $title could not be previewed", e)
+            Choice(title, "quickfix", Seq.empty, Some("This import could not be previewed."))
+        }
+      }
     }
   }
 

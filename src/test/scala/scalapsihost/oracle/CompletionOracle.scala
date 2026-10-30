@@ -138,7 +138,7 @@ object CompletionOracle {
   }
 
   /** Only PSI-recognized expressions are evaluated; arbitrary test code is never executed. */
-  private def staticString(expression: ScExpression, values: Map[String, String]): Option[String] = expression match {
+  private[oracle] def staticString(expression: ScExpression, values: Map[String, String]): Option[String] = expression match {
     case literal: ScInterpolatedStringLiteral if literal.referenceName == "s" =>
       import org.jetbrains.plugins.scala.lang.lexer.ScalaTokenTypes.*
       val injections = literal.getInjections.toSet

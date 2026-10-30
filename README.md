@@ -29,7 +29,10 @@ choosing the target and preparing the related renames on the current thread.
 Code actions offer the plugin's available intentions and the quick fixes attached to its annotations, plus
 surrounders for a selection. Each runs on a copy through the change engine and the platform's preview or mod-command
 contract. The response contains versioned text edits; the source is left unchanged until the editor reports the edits.
-Actions requiring dialogs, other files, or unsupported previews are unavailable. Inspections are not run.
+Type-import actions query the plugin's candidates synchronously and offer each qualified name separately; the
+plugin's reference binding applies the chosen import on the copy. The plugin's import-order index follows source
+opens, edits and closes. Actions requiring dialogs, other files, or unsupported previews are unavailable.
+Inspections are not run.
 
 Inlay hints come from the plugin's `ImplicitHintsPass`: inferred definition types, parameter names, implicit and
 `using` arguments, conversions, method chains and type arguments. The plugin's settings and defaults apply (parameter
@@ -206,7 +209,7 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
 - `oracle.CompletionOracle <intellij-scala> <report.md>` — the plugin's completion tests: file fixtures, keyword
   completion, auto-import and the `completion3` test methods (parsed with the host's PSI; the resulting text after
   the chosen suggestion's handler). completion3: 118 agree, 11 disagree; keywords 70 of 70; Scala 3 fixtures are
-  not replayed yet.
+  not replayed yet. Auto-import: **13 agree, 0 disagree**, through the same copy engine.
 - `oracle.FormatterOracle <intellij-scala> <report.md>` — the plugin's file-based formatter tests: 187 of 187 (its
   inline Scala test methods are not replayed).
 - `oracle.ParameterInfoOracle <intellij-scala> <report.md>` — the plugin's parameter info tests: 104 agree,
@@ -236,10 +239,12 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   optional automatic renames, Java-only carets, package moves, comments and unsupported test setup. File renames
   are compared by text only: the host returns source edits, not file operations.
 - `oracle.CodeActionsOracle <intellij-scala> <report.md>` — replays the 48 Scala 2/3 `SurroundWithTest` fixtures
-  through the code-action API: **37 agree, 11 disagree, 0 skip**. Six Scala 2 match/try previews fail while processing
-  placeholder patterns; five Scala 3 fixtures encounter inconsistent PSI/document trees while previewing the available
-  actions. Errors remain disagreements, and failed previews are disabled. Intentions and annotator quick fixes have
-  focused host and JSON-RPC tests; their full upstream test suites are not replayed by this oracle.
+  through the code-action API: **48 agree, 0 disagree, 0 skip**. Internal mod-command copies retain Scala features
+  and participate in the host's synchronous document commits; their listeners and view providers are released with
+  the preview. The selected Scala 2 intention suites (negate comparison, expand boolean, argument to block) add
+  **15 agree, 0 disagree, 12 skip**: custom setup and Scala 3 intention methods are not replayed. Test texts are
+  extracted with Scala PSI and the same static string evaluator as CompletionOracle. Combined: **63/0/12**.
+  Annotator fixes and conflicting type-import choices have focused host and JSON-RPC tests.
 - `oracle.SelectionOracle <intellij-scala> <report.md>` — the plugin's selectioner tests, step by step: ScalaDoc
   2 agree, 1 disagree; interpolated strings 27 agree; ordinary strings 9 agree; no skips. The multiline/single-line
   helper runs both variants. See the trailing-newline disagreement below.
@@ -288,8 +293,9 @@ the last (measured with `-XX:SoftRefLRUPolicyMSPerMB=0`, so the plugin's soft-re
   platform's Java searcher for them reads the compiler indices). Workspace symbols list Scala classes and members;
   Java declarations and the JDK's and libraries' are not listed.
 - Code actions cover edits to the current file whose preview succeeds. The access-modifier intention requires the
-  desktop rename UI; removing unnecessary parentheses requires an inspection profile; neither is loaded. Auto-import
-  quick fixes are not offered yet: the plugin computes their candidates asynchronously and supplies no text preview.
+  desktop rename UI; removing unnecessary parentheses requires an inspection profile; neither is loaded. Type-import
+  quick fixes cover the plugin's candidates for unqualified unresolved references. Global-member and implicit-conversion
+  import fixes are not offered yet; Java short-name imports retain the indexing limitation below.
   Inspection quick fixes, dialogs, file operations, snippets and post-action caret placement are not supported.
   Actions are previewed eagerly when requested; no latency budget has been established.
 - Rename shares the search limitations above: a Java override of a Scala member can keep its old name even when
