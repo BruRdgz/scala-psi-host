@@ -1243,6 +1243,8 @@ object ScalaPsiHost {
     projectServices.register(classOf[com.intellij.codeInsight.NullableNotNullManager])(new Host_NullableNotNullManager(project, dispatch {
       case ("NullableNotNullManager.getNullityDefault", _) => com.intellij.codeInsight.ContextNullabilityInfo.EMPTY
       case ("NullableNotNullManager.findEffectiveNullabilityInfo", _) => null
+      // Asked of a type's annotations while substituting generics (the plugin's isInheritor on a class file).
+      case ("NullableNotNullManager.getAnnotationNullability", _) => java.util.Optional.empty()
     }))
     // Java class files navigate to their sources through this helper, as the IDE's: the source file of the same
     // package and name in the sources attached to the class's library, or the class file itself (a library without
