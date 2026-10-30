@@ -399,8 +399,8 @@ final class ScalaLanguageServer(
     }
 
     override def hover(params: HoverParams): CompletableFuture[Hover] = onSource("hover", params.getTextDocument, null) { (s, path) =>
-      s.hover(path, lineColumn(params.getPosition)).map { signature =>
-        new Hover(new MarkupContent(MarkupKind.MARKDOWN, s"```scala\n$signature\n```"))
+      s.hover(path, lineColumn(params.getPosition)).map { markdown =>
+        new Hover(new MarkupContent(MarkupKind.MARKDOWN, markdown))
       }.orNull
     }
 

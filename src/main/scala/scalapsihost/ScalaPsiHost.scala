@@ -7,6 +7,7 @@ import com.intellij.codeInsight.editorActions.ExtendWordSelectionHandler
 import com.intellij.codeInsight.intention.preview.IntentionPreviewUtils
 import com.intellij.core.{CoreApplicationEnvironment, CoreFileTypeRegistry}
 import com.intellij.ide.highlighter.HtmlFileHighlighter
+import com.intellij.lang.documentation.{ClientDocumentationSettings, DocumentationSettings}
 import com.intellij.lang.html.HTMLLanguage
 import com.intellij.lang.java.JavaLanguage
 import com.intellij.lang.annotation.HighlightSeverity
@@ -594,6 +595,15 @@ object ScalaPsiHost {
     // or hide inlay hints as a whole, so they are on.
     InlayHints.setImplicitHintsEnabled(true)
     appServices.register(classOf[ParameterNameHintsSettings])(new ParameterNameHintsSettings)
+    // Quick documentation becomes Markdown, which the editor highlights itself: the HTML carries no colors.
+    appServices.register(classOf[ClientDocumentationSettings])(new ClientDocumentationSettings {
+      override def isHighlightingOfQuickDocSignaturesEnabled: Boolean = false
+      override def isHighlightingOfCodeBlocksEnabled: Boolean = false
+      override def isSemanticHighlightingOfLinksEnabled: Boolean = false
+      override def isCodeBackgroundEnabled: Boolean = false
+      override def getInlineCodeHighlightingMode: DocumentationSettings.InlineCodeHighlightingMode =
+        DocumentationSettings.InlineCodeHighlightingMode.NO_HIGHLIGHTING
+    })
     // Usage statistics behind the IDE's tips ("did you know..."): the host records no use and advertises nothing.
     appServices.register(classOf[FeatureUsageTracker])(new FeatureUsageTracker {
       override def triggerFeatureUsed(featureId: String): Unit = ()
@@ -791,6 +801,9 @@ object ScalaPsiHost {
     appServices.register(classOf[com.intellij.openapi.editor.colors.EditorColorsManager])(new Host_EditorColorsManager(dispatch {
       case ("EditorColorsManager.getGlobalScheme", _) => noColors
     }))
+    // A key's own defaults, which code blocks in quick documentation fall back to: empty as well.
+    appServices.register(classOf[com.intellij.openapi.editor.colors.TextAttributesKey.TextAttributeKeyDefaultsProvider])(
+      _ => new com.intellij.openapi.editor.markup.TextAttributes())
     // Plugin attribution of logged platform errors (e.g. an annotation range outside its element); the host does not
     // track plugins, so the exception names none.
     appServices.register(classOf[com.intellij.diagnostic.PluginProblemReporter])(
@@ -1043,25 +1056,38 @@ object ScalaPsiHost {
       if (isTemporary(f)) f.getUserData(temporaryViewProvider) else viewProviders.get(f)
     val directories = new ConcurrentHashMap[VirtualFile, com.intellij.psi.PsiDirectory]()
     var psiManagerRef: PsiManager = null
-    def viewProvider(f: VirtualFile): FileViewProvider = Option(cachedViewProvider(f)).getOrElse(viewProviders.computeIfAbsent(f, {
-      // Physical (event system enabled), as the IDE's library files: a non-physical file loads its syntax tree up
-      // front, while a physical one stays stub-based until something navigates into it.
-      case lib: LibraryFile if com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType) != null =>
-        com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType).createFileViewProvider(lib, null, psiManagerRef, true)
-      // Library sources, as project sources below (the plugin's substitutor reads Scala 3 from the source jar's name).
-      case lib: LibraryFile if lib.isLibrarySource => sourceViewProvider(lib)
-      // Project sources are physical too: their syntax tree follows document commits (reparse) and can be dropped
-      // when no one holds it. The language's view provider when it has one (Scala), the platform's default otherwise.
-      case source: SourceFile => sourceViewProvider(source)
-      case other => CallLog.unsupported(s"FileManager.findViewProvider for a file the host does not own: $other")
-    }))
+    def viewProvider(f: VirtualFile): FileViewProvider = Option(cachedViewProvider(f)).getOrElse {
+      if (isTemporary(f)) newTemporaryViewProvider(f)
+      else viewProviders.computeIfAbsent(f, {
+        // Physical (event system enabled), as the IDE's library files: a non-physical file loads its syntax tree up
+        // front, while a physical one stays stub-based until something navigates into it.
+        case lib: LibraryFile if com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType) != null =>
+          com.intellij.psi.FileTypeFileViewProviders.INSTANCE.forFileType(lib.getFileType).createFileViewProvider(lib, null, psiManagerRef, true)
+        // Library sources, as project sources below (the plugin's substitutor reads Scala 3 from the source jar's name).
+        case lib: LibraryFile if lib.isLibrarySource => sourceViewProvider(lib, physical = true)
+        // Project sources are physical too: their syntax tree follows document commits (reparse) and can be dropped
+        // when no one holds it. The language's view provider when it has one (Scala), the platform's default otherwise.
+        case source: SourceFile => sourceViewProvider(source, physical = true)
+        case other => CallLog.unsupported(s"FileManager.findViewProvider for a file the host does not own: $other")
+      })
+    }
+    // A temporary file no one gave a provider (the plugin highlights a ScalaDoc code block in one): a non-physical
+    // provider, held by the file as setViewProvider holds the others.
+    def newTemporaryViewProvider(f: VirtualFile): FileViewProvider = {
+      val provider = f.getFileType match {
+        case _: com.intellij.openapi.fileTypes.LanguageFileType => sourceViewProvider(f, physical = false)
+        case _ => new com.intellij.psi.SingleRootFileViewProvider(psiManagerRef, f, false)
+      }
+      f.putUserData(temporaryViewProvider, provider)
+      provider
+    }
     // As the IDE's FileManagerImpl: the file type's language, as substituted for this file (Scala 3 modules).
-    def sourceViewProvider(source: VirtualFile): FileViewProvider = {
+    def sourceViewProvider(source: VirtualFile, physical: Boolean): FileViewProvider = {
       val language = com.intellij.psi.LanguageSubstitutors.getInstance.substituteLanguage(
         source.getFileType.asInstanceOf[com.intellij.openapi.fileTypes.LanguageFileType].getLanguage, source, project)
       Option(LanguageFileViewProviders.INSTANCE.forLanguage(language))
-        .map(_.createFileViewProvider(source, language, psiManagerRef, true))
-        .getOrElse(new com.intellij.psi.SingleRootFileViewProvider(psiManagerRef, source, true))
+        .map(_.createFileViewProvider(source, language, psiManagerRef, physical))
+        .getOrElse(new com.intellij.psi.SingleRootFileViewProvider(psiManagerRef, source, physical))
     }
     val fileManager = tableProxy(classOf[com.intellij.psi.impl.file.impl.FileManagerEx], "FileManager") {
       case ("findCachedViewProvider", Array(f: VirtualFile)) => cachedViewProvider(f)

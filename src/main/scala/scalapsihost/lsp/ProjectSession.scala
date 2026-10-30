@@ -8,7 +8,7 @@ import com.intellij.openapi.util.TextRange
 import com.intellij.openapi.util.text.StringUtil
 import com.intellij.psi.{PsiDocumentManager, PsiElement, PsiFile, PsiNameIdentifierOwner, PsiNamedElement, SyntaxTraverser}
 import org.eclipse.lsp4j.SymbolKind
-import org.jetbrains.plugins.scala.editor.documentationProvider.ScalaDocQuickInfoGenerator
+import org.jetbrains.plugins.scala.editor.documentationProvider.{ScalaDocQuickInfoGenerator, ScalaDocumentationProvider}
 import org.jetbrains.plugins.scala.lang.folding.ScalaFoldingBuilder
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.api.expr.ScBlock
@@ -24,6 +24,7 @@ import java.nio.file.{Files, Path}
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import scala.jdk.CollectionConverters.*
+import scala.util.control.NonFatal
 
 /** A problem in a file, from the plugin (`scala-plugin`) or the compiler (`scalac`). */
 final case class FileProblem(severity: HighlightSeverity, start: LineColumn, end: LineColumn, message: String, source: String)
@@ -245,8 +246,9 @@ final class ProjectSession private (
     host.modules.ofFile(file.getViewProvider.getVirtualFile).flatMap(m => compileSpecs.get(m.spec.name))
 
   /**
-   * The signature of the symbol referenced at `at`, as the IDE's quick documentation shows it: the plugin's quick
-   * info, without the editor's hint styling (ScalaDocumentationProvider adds that for its Swing popup).
+   * The Markdown the IDE's quick documentation shows for the symbol referenced at `at`: its signature, from the
+   * plugin's quick info without the editor's hint styling (ScalaDocumentationProvider adds that for its Swing popup),
+   * then its ScalaDoc, if it has any.
    */
   def hover(path: Path, at: LineColumn): Option[String] = host.read {
     val f = file(path)
@@ -259,8 +261,24 @@ final class ProjectSession private (
     for {
       (target, original) <- subject
       html <- ScalaDocQuickInfoGenerator.getQuickNavigateInfo(target, original)
-    } yield StringUtil.unescapeXmlEntities(StringUtil.removeHtmlTags(html, true)).trim
+    } yield {
+      val signature = StringUtil.unescapeXmlEntities(StringUtil.removeHtmlTags(html, true)).trim
+      (s"```scala\n$signature\n```" +: documentation(target, original).toSeq).mkString("\n\n")
+    }
   }
+
+  /**
+   * The ScalaDoc of `target` as Markdown; none for a symbol without any, or that is not Scala's (a JDK class). A
+   * library symbol's doc is in its attached source: the navigation element, as the IDE documents it.
+   */
+  private def documentation(target: PsiElement, original: PsiElement): Option[String] =
+    try Option(new ScalaDocumentationProvider().generateDoc(target.getNavigationElement, original)).flatMap(QuickDoc.toMarkdown)
+    catch {
+      // A linkage error: the generator reached an IDE class the host does not ship; the signature is still worth showing.
+      case e @ (NonFatal(_) | _: LinkageError) =>
+        HostLog.warn(s"no documentation for ${target.getText.take(40)}", e)
+        None
+    }
 
   private def declarationNamedAt(file: PsiFile, at: Int): Option[PsiNameIdentifierOwner] =
     Option(file.findElementAt(at)).flatMap { leaf =>

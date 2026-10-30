@@ -24,6 +24,7 @@ class LanguageServerTest extends munit.FunSuite {
   private val main = fixture.resolve("app/src/main/scala/app/Main.scala")
   private val greeting = fixture.resolve("core/src/main/scala/core/Greeting.scala")
   private val counter = fixture.resolve("core/src/main/scala/core/Counter.scala")
+  private val greet3 = fixture.resolve("core3/src/main/scala/core3/Greet3.scala")
 
   /** Records what the server sends. */
   private final class RecordingClient extends ClientBase {
@@ -242,6 +243,23 @@ class LanguageServerTest extends munit.FunSuite {
     val hover = server.getTextDocumentService.hover(new HoverParams(document(greeting), new Position(2, 20))).get(1, TimeUnit.MINUTES)
     assert(hover != null, "no hover on a declaration's name")
     assert(hover.getContents.getRight.getValue.contains("case class Greeting"), hover.getContents.getRight.getValue)
+  }
+
+  // `println` (line 7 of Main.scala): Predef's ScalaDoc, in scala-library's source jar.
+  test("shows the documentation of a library symbol") {
+    val hover = server.getTextDocumentService.hover(new HoverParams(document(main), new Position(7, 4))).get(1, TimeUnit.MINUTES)
+    val markdown = hover.getContents.getRight.getValue
+    assert(markdown.contains("def println(x: Any): Unit"), markdown)
+    assert(markdown.contains("Prints out an object to the default output, followed by a newline character."), markdown)
+  }
+
+  // `hello` (line 11 of Greet3.scala), in the Scala 3 module: its ScalaDoc is Markdown, which the plugin parses as such.
+  test("shows a Scala 3 symbol's Markdown documentation") {
+    val hover = server.getTextDocumentService.hover(new HoverParams(document(greet3), new Position(11, 6))).get(1, TimeUnit.MINUTES)
+    val markdown = hover.getContents.getRight.getValue
+    assert(markdown.contains("Greets `name` **warmly**."), markdown)
+    assert(markdown.contains("```scala\nGreet3.hello(\"you\")\n```"), markdown)
+    assert(markdown.contains("**Params:** `name` – who to greet"), markdown)
   }
 
   // Inside the literal "Hello, $name": text, not a symbol.
