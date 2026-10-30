@@ -51,6 +51,9 @@ private[scalapsihost] final class HostPsiDocumentManager(project: Project) exten
     }
   }
 
+  // The platform commits from its event thread; the host commits where the change was made, under the write lock.
+  override def commitAllDocuments(): Unit = getUncommittedDocuments.foreach(commitDocument)
+
   override def isDocumentBlockedByPsi(document: Document): Boolean = {
     val aspect = com.intellij.psi.impl.source.PostprocessReformattingAspect.getInstance(project)
     getCachedViewProviders(document).asScala.exists(aspect.isViewProviderLocked)

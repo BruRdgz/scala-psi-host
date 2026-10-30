@@ -2,6 +2,7 @@ package scalapsihost.lsp
 
 import com.intellij.psi.PsiManager
 import org.eclipse.lsp4j.*
+import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode
 import org.eclipse.lsp4j.launch.LSPLauncher
 import scalapsihost.TestHost
 
@@ -190,6 +191,7 @@ class LanguageServerTest extends munit.FunSuite {
     assert(capabilities.getTypeDefinitionProvider.getLeft)
     assert(capabilities.getReferencesProvider.getLeft)
     assert(capabilities.getImplementationProvider.getLeft)
+    assert(capabilities.getRenameProvider.getRight.getPrepareProvider)
     assert(capabilities.getWorkspaceSymbolProvider.getLeft)
     assert(capabilities.getDocumentHighlightProvider.getLeft)
     assert(capabilities.getDocumentSymbolProvider.getLeft)
@@ -316,6 +318,37 @@ class LanguageServerTest extends munit.FunSuite {
       .get(1, TimeUnit.MINUTES).asScala.toSeq)
     assertEquals(references(includeDeclaration = false), Seq(span(main, 6, 49, 53)))
     assertEquals(references(includeDeclaration = true), sorted(Seq(span(greeting, 3, 6, 10), span(main, 6, 49, 53))))
+  }
+
+  // `.text` again (line 6, columns 49-53), renamed from its use in the app module: the declaration in core changes too.
+  test("renames a symbol across modules, leaving the files as they are until the editor reports the edits") {
+    val service = server.getTextDocumentService
+    assertEquals(service.prepareRename(new PrepareRenameParams(document(main), new Position(6, 50))).get(1, TimeUnit.MINUTES).getFirst,
+      new Range(new Position(6, 49), new Position(6, 53)))
+    val edit = service.rename(new RenameParams(document(main), new Position(6, 50), "message")).get(1, TimeUnit.MINUTES)
+    val changes = edit.getDocumentChanges.asScala.map(_.getLeft).map(c => c.getTextDocument.getUri -> c.getEdits.asScala.toSeq).toMap
+    def only(path: Path, line: Int, startColumn: Int, endColumn: Int) =
+      Seq(
+        new TextEdit(new Range(new Position(line, startColumn), new Position(line, startColumn + 1)), "m"),
+        new TextEdit(new Range(new Position(line, startColumn + 2), new Position(line, endColumn)), "ssage"))
+    assertEquals(changes, Map(greeting.toUri.toString -> only(greeting, 3, 6, 10), main.toUri.toString -> only(main, 6, 49, 53)))
+    // The edits are the editor's to apply: until it reports them, the server's files are the old ones.
+    assert(service.hover(new HoverParams(document(main), new Position(6, 50))).get(1, TimeUnit.MINUTES)
+      .getContents.getRight.getValue.contains("def text: String"))
+    assertEquals(spans(service.references(new ReferenceParams(document(main), new Position(6, 50), new ReferenceContext(false)))
+      .get(1, TimeUnit.MINUTES).asScala.toSeq), Seq(span(main, 6, 49, 53)))
+  }
+
+  // `println` (line 7 of Main.scala) is the library's; `1text` is no identifier.
+  test("refuses to rename a library symbol, and to rename to an invalid name") {
+    val service = server.getTextDocumentService
+    def failure(request: => CompletableFuture[?]) = intercept[java.util.concurrent.ExecutionException](request.get(1, TimeUnit.MINUTES))
+      .getCause.asInstanceOf[org.eclipse.lsp4j.jsonrpc.ResponseErrorException].getResponseError
+    val library = failure(service.prepareRename(new PrepareRenameParams(document(main), new Position(7, 4))))
+    assertEquals(library.getCode, ResponseErrorCode.RequestFailed.getValue)
+    assertEquals(failure(service.rename(new RenameParams(document(main), new Position(7, 4), "print"))).getCode, ResponseErrorCode.RequestFailed.getValue)
+    val invalid = failure(service.rename(new RenameParams(document(main), new Position(6, 50), "1text")))
+    assert(invalid.getMessage.contains("'1text' is not a valid name"), invalid.getMessage)
   }
 
   test("finds the implementations of a trait and of its abstract member") {

@@ -1,8 +1,8 @@
 # scala-psi-host
 
 > **Alpha.** Diagnostics, hover, go-to-definition, references, implementations, workspace symbols, completion,
-> signature help, inlay hints, selection ranges and formatting work;
-> rename and code actions do not exist yet. See [ROADMAP.md](ROADMAP.md) and
+> signature help, inlay hints, selection ranges, formatting and rename work;
+> code actions do not exist yet. See [ROADMAP.md](ROADMAP.md) and
 > [Known limitations](#known-limitations).
 
 A Scala language server built on the IntelliJ Scala plugin's PSI and type checker, running **without an IntelliJ
@@ -11,13 +11,20 @@ answers, through fixed tables, what the plugin and the IntelliJ platform's PSI l
 
 It serves LSP diagnostics, hover, go to definition, type definition and implementation, references, document
 highlights, document and workspace symbols, folding ranges, semantic tokens, completion, signature help, inlay
-hints, selection ranges and formatting for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
+hints, selection ranges, formatting and rename for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
 
 Completion lists the suggestions of the plugin's completion contributors, ordered by its weighers; a suggestion's
 insert handler (parentheses, imports, generated code) runs once the user has chosen it, as in the IDE: the item's
 command asks the server, which applies the handler's edits (`workspace/applyEdit`) and moves the caret
 (`window/showDocument`). Formatting is the IntelliJ formatter; a change runs on a copy of the file and comes back as
 minimal edits.
+
+Rename runs the plugin's rename processors over the project's sources, including companions, overriders and
+references. Package-private use scopes use the packages declared in source text, including child packages.
+A conflict or invalid name refuses the request. The host restores its files before returning the edits;
+the editor applies them and reports the changed text. File names and optional automatic renames stay unchanged.
+The processors' unit-test answers choose base members and matching getters/setters without dialogs, only while
+choosing the target and preparing the related renames on the current thread.
 
 Inlay hints come from the plugin's `ImplicitHintsPass`: inferred definition types, parameter names, implicit and
 `using` arguments, conversions, method chains and type arguments. The plugin's settings and defaults apply (parameter
@@ -218,6 +225,11 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   (`ChooseClassOrSymbolByNameTest`, for Scala 2.13 and Scala 3): the files each test adds, the symbols found for its
   query and its expectations: **20 agree, 0 disagree, 2 skip** (10/0/1 each). The skip searches JDK classes, which the
   host does not list.
+- `oracle.RenameOracle <intellij-scala> <report.md> [--only=<name>,...]` — the plugin's literal rename tests,
+  generated class/parameter fixtures and before/after projects, in Scala 2 and 3: **112 agree, 1 disagree, 18 skip**.
+  The disagreement leaves a Java override of a Scala val unchanged (Java inheritors are not indexed). Skips cover
+  optional automatic renames, Java-only carets, package moves, comments and unsupported test setup. File renames
+  are compared by text only: the host returns source edits, not file operations.
 - `oracle.SelectionOracle <intellij-scala> <report.md>` — the plugin's selectioner tests, step by step: ScalaDoc
   2 agree, 1 disagree; interpolated strings 27 agree; ordinary strings 9 agree; no skips. The multiline/single-line
   helper runs both variants. See the trailing-newline disagreement below.
@@ -265,6 +277,8 @@ the last (measured with `-XX:SoftRefLRUPolicyMSPerMB=0`, so the plugin's soft-re
   declarations have no references, and Java subclasses of a Scala class are not among its implementations (the
   platform's Java searcher for them reads the compiler indices). Workspace symbols list Scala classes and members;
   Java declarations and the JDK's and libraries' are not listed.
+- Rename shares the search limitations above: a Java override of a Scala member can keep its old name even when
+  references change. File/package moves, optional automatic renames, comments and string occurrences are not offered.
 - Completion misses beta 2's p95 budget of 150 ms (261 ms on the first pass, 186 ms warm, on the project above):
   what the host added was removed (ordering no longer weighs every item again after a weigher fails; index lookups
   filter by file without navigating PSI), and the rest is the plugin's own code: its contributors (`ScalaBasicCompletionContributor`,

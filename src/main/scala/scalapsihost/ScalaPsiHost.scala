@@ -175,21 +175,58 @@ final class ScalaPsiHost private (
    * plugin's caches. The file's index entries are then rebuilt. Queries running meanwhile are cancelled.
    */
   def edit(file: PsiFile, start: Int, end: Int, replacement: String): Unit = {
-    HostLock.write {
-      val documents = com.intellij.psi.PsiDocumentManager.getInstance(project)
-      val document = documents.getDocument(file)
-      if (document == null) throw new IllegalArgumentException(s"$file has no document: only files opened with openFile can be edited")
-      document.replaceString(start, end, replacement)
-      documents.commitDocument(document)
-      symbolIndex.removeFile(file)
-      if (!symbolIndex.indexSourceFile(file)) throw new IllegalStateException(s"stubs of the edited $file could not be paired with its PSI")
-      wordIndex.removeFile(file)
-      wordIndex.indexFile(file)
-      ScalaPsiHost.notifyPsiChanged(project)
-    }
+    HostLock.write(replaceText(file, start, end, replacement))
     // Work the commit scheduled for the UI thread (after-commit actions) runs before the edit returns.
     HostDispatchThread.drain()
   }
+
+  private def replaceText(file: PsiFile, start: Int, end: Int, replacement: String): Unit = {
+    val documents = com.intellij.psi.PsiDocumentManager.getInstance(project)
+    val document = documents.getDocument(file)
+    if (document == null) throw new IllegalArgumentException(s"$file has no document: only files opened with openFile can be edited")
+    document.replaceString(start, end, replacement)
+    documents.commitDocument(document)
+    symbolIndex.removeFile(file)
+    if (!symbolIndex.indexSourceFile(file)) throw new IllegalStateException(s"stubs of the edited $file could not be paired with its PSI")
+    wordIndex.removeFile(file)
+    wordIndex.indexFile(file)
+    ScalaPsiHost.notifyPsiChanged(project)
+  }
+
+  /**
+   * The edits that rename the symbol at `offset` of `file` to `newName`, by file (see [[Rename]]). The plugin's rename
+   * runs on the project's files, so the files change while it does; their texts are restored before this returns, as
+   * the editor applies the edits and reports them back. Queries running meanwhile are cancelled.
+   */
+  def rename(file: PsiFile, offset: Int, newName: String): Seq[(PsiFile, Seq[ChangeEngine.Edit])] = {
+    val (originals, changed) = try HostLock.writeIntent {
+      // Keep the read plan valid until its write: another editor change must not enter between the two.
+      val target = renameTarget(file, offset)
+      val plan = read(Rename.plan(target, newName))
+      HostLock.write {
+        val originals = plan.files.map(f => f -> f.getText)
+        try {
+          // The platform changes physical PSI inside a command or an undo-transparent action; the host has no undo.
+          com.intellij.openapi.command.CommandProcessor.getInstance.runUndoTransparentAction(() => Rename.perform(plan))
+          (originals, plan.files.map(_.getText))
+        } finally com.intellij.openapi.progress.ProgressManager.getInstance.executeNonCancelableSection((() => {
+          val documents = com.intellij.psi.PsiDocumentManager.getInstance(project)
+          originals.foreach { (f, text) =>
+            val document = documents.getDocument(f)
+            documents.doPostponedOperationsAndUnblockDocument(document)
+            replaceText(f, 0, document.getTextLength, text)
+          }
+        }): Runnable)
+      }
+    } finally HostDispatchThread.drain()
+    originals.zip(changed).map { case ((f, before), after) => f -> ChangeEngine.diff(before, after) }.filter(_._2.nonEmpty)
+  }
+
+  /**
+   * The element the IDE renames for the symbol at `offset` (see [[Rename.target]]). The Java processors ask for the
+   * event thread when they look for a method's base methods, which they do for a symbol of a Java source.
+   */
+  def renameTarget(file: PsiFile, offset: Int): PsiElement = HostDispatchThread.call(read(Rename.target(file, offset)))
 
   /** Removes a source file opened with [[openSource]] or [[openFile]] from the project. */
   def closeSource(file: PsiFile): Unit = HostLock.write {
@@ -393,6 +430,8 @@ object ScalaPsiHost {
     // sources shared between modules.
     "com.intellij.referencesSearch", "com.intellij.methodReferencesSearch", "com.intellij.definitionsSearch",
     "com.intellij.overridingMethodsSearch", "com.intellij.useScopeEnlarger",
+    // Rename: the descriptions of elements in the conflicts the Java rename processors report ("method foo(): Int").
+    "com.intellij.elementDescriptionProvider",
   )
 
   /**
@@ -493,6 +532,8 @@ object ScalaPsiHost {
       case ("executeByImpatientReader", Array(r: Runnable)) => r.run(); null
       // Work for the UI thread runs on the host's dispatch thread.
       case ("invokeLater", Array(r: Runnable, _*)) => HostDispatchThread.invokeLater(r); null
+      // No modal progress exists: the task runs where it was asked, and is never cancelled by a user.
+      case ("runProcessWithProgressSynchronously", Array(task: Runnable, _*)) => task.run(); java.lang.Boolean.TRUE
       // No modal dialogs exist in the host.
       case ("getDefaultModalityState", _) => ModalityState.nonModal()
       case ("assertWriteAccessAllowed", _) =>
@@ -502,7 +543,7 @@ object ScalaPsiHost {
       case ("runWriteAction", Array(c: com.intellij.openapi.util.Computable[?])) => runWriteAction(c.compute()).asInstanceOf[AnyRef]
       case ("runWriteAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) => runWriteAction(c.compute()).asInstanceOf[AnyRef]
       case ("assertIsNonDispatchThread" | "assertReadAccessNotAllowed", _) => null
-      case ("isUnitTestMode", _) => java.lang.Boolean.valueOf(config.unitTestMode)
+      case ("isUnitTestMode", _) => java.lang.Boolean.valueOf(config.unitTestMode || Rename.isAnsweringDialogs)
       case ("isInternal" | "isEAP" | "isDisposed", _) => java.lang.Boolean.FALSE
       case ("isHeadlessEnvironment" | "isCommandLine", _) => java.lang.Boolean.TRUE
       case ("getUserData", Array(k: Key[?])) => appData.getUserData(k).asInstanceOf[AnyRef]
@@ -568,10 +609,37 @@ object ScalaPsiHost {
       val ep = declared.asInstanceOf[ExtensionPointImpl[AnyRef]]
       implementations.foreach(name => ep.registerExtension(newPrivate(Class.forName(name).asInstanceOf[Class[AnyRef]]), root))
     }
+    // Rename: the plugin's processors, in the order its descriptors give (the first that accepts an element renames it),
+    // and its veto of elements that have no name to change. Validators of new names: the language's names validator.
+    val renameProcessors = declare("com.intellij.renamePsiElementProcessor").asInstanceOf[ExtensionPointImpl[AnyRef]]
+    for (bean <- Descriptors.scalaExtensionBeans(config.scalaPluginJars, "com.intellij.renamePsiElementProcessor")) {
+      val processor = newPrivate(Class.forName(bean.implementation).asInstanceOf[Class[AnyRef]])
+      renameProcessors.registerExtension(processor, com.intellij.openapi.extensions.LoadingOrder.readOrder(bean.attributes.getOrElse("order", "")), root)
+    }
+    // Renaming a reference in a Java source builds the new identifier with the Java tree generator.
+    declare("com.intellij.treeGenerator").asInstanceOf[ExtensionPointImpl[AnyRef]]
+      .registerExtension(new com.intellij.psi.impl.source.tree.JavaTreeGenerator, root)
+    // Java sources of mixed projects rename with the Java plugin's processors, after the Scala ones that extend them.
+    for (name <- Seq("RenameJavaClassProcessor", "RenameJavaMethodProcessor", "RenameJavaVariableProcessor"))
+      renameProcessors.registerExtension(newPrivate(Class.forName(s"com.intellij.refactoring.rename.$name").asInstanceOf[Class[AnyRef]]), root)
+    declare("com.intellij.renameInputValidator")
+    val renameVetoes = declare("com.intellij.vetoRenameCondition").asInstanceOf[ExtensionPointImpl[AnyRef]]
+    for (name <- Descriptors.scalaExtensions(config.scalaPluginJars, "com.intellij.vetoRenameCondition"))
+      renameVetoes.registerExtension(newPrivate(Class.forName(name).asInstanceOf[Class[AnyRef]]), root)
     // The deep inheritors search, which the plugin's overriders search relies on: it walks the direct inheritors that the
     // plugin's searcher gives. (The Java direct searcher reads compiler indices, and would find Java subclasses only.)
     area.getExtensionPoint[com.intellij.util.QueryExecutor[com.intellij.psi.PsiClass, com.intellij.psi.search.searches.ClassInheritorsSearch.SearchParameters]](
       "com.intellij.classInheritorsSearch").registerExtension(new com.intellij.psi.impl.search.JavaClassInheritorsSearcher, root)
+    // The references to a Java method, and its overriders in Java classes and in Scala ones (through the inheritors search).
+    area.getExtensionPoint[AnyRef]("com.intellij.methodReferencesSearch").asInstanceOf[ExtensionPointImpl[AnyRef]]
+      .registerExtension(new com.intellij.psi.impl.search.MethodUsagesSearcher, root)
+    area.getExtensionPoint[AnyRef]("com.intellij.overridingMethodsSearch").asInstanceOf[ExtensionPointImpl[AnyRef]]
+      .registerExtension(new com.intellij.psi.impl.search.JavaOverridingMethodsSearcher, root)
+    // The Java rename processors look for the base methods of a method through the super-methods searches.
+    declare("com.intellij.superMethodsSearch").asInstanceOf[ExtensionPointImpl[AnyRef]]
+      .registerExtension(new com.intellij.psi.impl.search.MethodSuperSearcher, root)
+    declare("com.intellij.deepestSuperMethodsSearch").asInstanceOf[ExtensionPointImpl[AnyRef]]
+      .registerExtension(new com.intellij.psi.impl.search.MethodDeepestSuperSearcher, root)
     // Descriptor beans preserve both the implementation attributes and the platform's id/order semantics.
     val completionPlugin = new DefaultPluginDescriptor(PluginId.getId("org.intellij.scala"))
     def registerCompletionBeans(epName: String, beans: Seq[ExtensionBean], plugin: com.intellij.openapi.extensions.PluginDescriptor): Unit = {
@@ -707,6 +775,12 @@ object ScalaPsiHost {
         new com.intellij.openapi.editor.impl.DocumentImpl(text, /* forUseInNonAWTThread = */ true)))
     // Library source files are read as the IDE reads files from disk, guessing their charset: UTF-8 by default (the
     // JDK's default since 18, and the build tools'), none set per file.
+    // The sets of files a package scope holds.
+    appServices.register(classOf[com.intellij.openapi.vfs.VirtualFileSetFactory])(new com.intellij.openapi.vfs.VirtualFileSetFactory {
+      override def createCompactVirtualFileSet(): com.intellij.openapi.vfs.VirtualFileSet = new HostVirtualFileSet
+      override def createCompactVirtualFileSet(files: java.util.Collection[? <: VirtualFile]): com.intellij.openapi.vfs.VirtualFileSet =
+        new HostVirtualFileSet(new java.util.LinkedHashSet[VirtualFile](files))
+    })
     appServices.register(classOf[com.intellij.openapi.vfs.encoding.EncodingManager])(new Host_EncodingManager(dispatch {
       case ("EncodingManager.getEncoding", _) => null
       case ("EncodingManager.getDefaultCharset", _) => java.nio.charset.StandardCharsets.UTF_8
@@ -1324,6 +1398,31 @@ object ScalaPsiHost {
     // One scope for everything, as one scope per module: the plugin keys its caches by scope, so a new object per
     // request would add entries on every lookup that are never found again.
     val everythingScope = new com.intellij.psi.search.EverythingGlobalScope(project)
+    // Packages are declared in the files' text, not by directories (the host's files have none): the index holds no
+    // directory, and lists the files that declare a package, which the package scope of a package-private member needs.
+    projectServices.register(classOf[com.intellij.openapi.roots.PackageIndex])(new com.intellij.openapi.roots.PackageIndex {
+      override def getDirsByPackageName(packageName: String, includeLibrarySources: Boolean): com.intellij.util.Query[VirtualFile] =
+        com.intellij.util.EmptyQuery.getEmptyQuery
+      override def getFilesByPackageName(packageName: String): com.intellij.util.Query[VirtualFile] = {
+        val declaring = moduleModel.all.flatMap(_.sources.asScala).filter { source =>
+          PsiManager.getInstance(project).findFile(source) match {
+            case owner: com.intellij.psi.PsiClassOwner => owner.getPackageName == packageName
+            case _ => false
+          }
+        }
+        new com.intellij.util.CollectionQuery(declaring.asJava)
+      }
+      override def getPackageNameByDirectory(dir: VirtualFile): String = null
+    })
+    projectServices.register(classOf[com.intellij.psi.impl.source.resolve.JavaResolveCache])(
+      new com.intellij.psi.impl.source.resolve.JavaResolveCache(project))
+    // The project's Java language level, which a class's declarations are processed at (the highest, as the files' own).
+    projectServices.register(classOf[com.intellij.openapi.roots.LanguageLevelProjectExtension])(new com.intellij.openapi.roots.LanguageLevelProjectExtension {
+      override def getLanguageLevel: com.intellij.pom.java.LanguageLevel = com.intellij.pom.java.LanguageLevel.HIGHEST
+      override def setLanguageLevel(level: com.intellij.pom.java.LanguageLevel): Unit = CallLog.unsupported("LanguageLevelProjectExtension.setLanguageLevel")
+      override def getDefault: java.lang.Boolean = java.lang.Boolean.TRUE
+      override def setDefault(value: java.lang.Boolean): Unit = CallLog.unsupported("LanguageLevelProjectExtension.setDefault")
+    })
     projectServices.register(classOf[com.intellij.psi.search.ProjectScopeBuilder])(new Host_ProjectScopeBuilder(dispatch {
       case ("ProjectScopeBuilder.buildProjectScope" | "ProjectScopeBuilder.buildContentScope", _) => moduleModel.sourcesScope
       case ("ProjectScopeBuilder.buildLibrariesScope" | "ProjectScopeBuilder.buildLibraryClassesScope", _) => moduleModel.librariesScope
@@ -1362,6 +1461,8 @@ object ScalaPsiHost {
           psi <- Option(psiManagerRef.findFile(sourceFile))
         } yield psi
         source.getOrElse(f)
+      // A class of a file that is not a copy is its own original.
+      case ("JavaPsiImplementationHelper.getOriginalClass", Array(c: PsiClass)) if c.getContainingFile.getOriginalFile eq c.getContainingFile => c
       // Java sources parse at the highest language level: it accepts the syntax of every Java release the build may
       // target (the build's own release is not read yet).
       case ("JavaPsiImplementationHelper.getEffectiveLanguageLevel", _) => com.intellij.pom.java.LanguageLevel.HIGHEST
@@ -1420,7 +1521,10 @@ object ScalaPsiHost {
       classOf[com.intellij.lang.jvm.facade.JvmElementProvider])
     projectServices.register(classOf[com.intellij.lang.jvm.facade.JvmFacade])(new com.intellij.lang.jvm.facade.JvmFacadeImpl(project))
     projectServices.register(classOf[com.intellij.psi.impl.file.impl.JavaFileManager])(
-      tableProxy(classOf[com.intellij.psi.impl.file.impl.JavaFileManager], "JavaFileManager")(PartialFunction.empty))
+      tableProxy(classOf[com.intellij.psi.impl.file.impl.JavaFileManager], "JavaFileManager") {
+        // The build's source roots have no package prefix.
+        case ("getNonTrivialPackagePrefixes", _) => java.util.List.of[String]()
+      })
     projectServices.register(classOf[com.intellij.psi.JavaPsiFacade])(new com.intellij.psi.impl.JavaPsiFacadeImpl(project, null))
     // Resolution inside Java sources (mixed projects).
     projectServices.register(classOf[com.intellij.psi.PsiResolveHelper])(new com.intellij.psi.impl.source.resolve.PsiResolveHelperImpl(project))

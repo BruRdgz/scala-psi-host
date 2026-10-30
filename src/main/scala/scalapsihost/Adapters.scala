@@ -183,6 +183,13 @@ private[scalapsihost] object HostDispatchThread {
   def invokeAndWait(action: Runnable): Unit =
     if (isCurrent) action.run() else executor.submit(action).get()
 
+  /** The result of `body` run on the dispatch thread, as the IDE runs the steps of a refactoring; its failure is rethrown here. */
+  def call[T](body: => T): T =
+    if (isCurrent) body
+    else
+      try executor.submit((() => body): java.util.concurrent.Callable[T]).get()
+      catch { case e: java.util.concurrent.ExecutionException => throw e.getCause }
+
   /** Waits until the work scheduled so far has run. */
   def drain(): Unit = invokeAndWait(() => ())
 }
@@ -363,4 +370,23 @@ final class ServiceTable(label: String) {
         }
       }
     }
+}
+
+/** The platform's compact set looks up the VFS manager even for files without ids; the host keeps files directly. */
+private[scalapsihost] final class HostVirtualFileSet(private var files: java.util.Set[com.intellij.openapi.vfs.VirtualFile])
+    extends java.util.AbstractSet[com.intellij.openapi.vfs.VirtualFile] with com.intellij.openapi.vfs.VirtualFileSet {
+  def this() = this(new java.util.LinkedHashSet)
+
+  override def iterator(): java.util.Iterator[com.intellij.openapi.vfs.VirtualFile] = files.iterator()
+  override def size(): Int = files.size
+  override def contains(o: Object): Boolean = files.contains(o)
+  override def add(file: com.intellij.openapi.vfs.VirtualFile): Boolean = files.add(file)
+  override def remove(o: Object): Boolean = files.remove(o)
+  override def freezed(): java.util.Set[com.intellij.openapi.vfs.VirtualFile] = {
+    freeze()
+    this
+  }
+  override def freeze(): Unit = files = java.util.Collections.unmodifiableSet(files)
+  override def process(processor: com.intellij.util.Processor[? >: com.intellij.openapi.vfs.VirtualFile]): Boolean =
+    files.asScala.forall(processor.process)
 }

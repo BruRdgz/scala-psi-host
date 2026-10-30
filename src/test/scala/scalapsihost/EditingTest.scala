@@ -86,6 +86,45 @@ class EditingTest extends munit.FunSuite {
     }
   }
 
+  test("rename restores class and word indices before the editor applies its edits") {
+    val original = "package renamed\nclass BeforeRename\nobject RenameUser { val x = new BeforeRename }\n"
+    val file = scalaFile("BeforeRename", original)
+    try {
+      val documents = com.intellij.psi.PsiDocumentManager.getInstance(host.project)
+      for (_ <- 1 to 2) {
+        val changes = host.rename(file, original.indexOf("BeforeRename"), "AfterRename")
+        assertEquals(changes.map(_._1), Seq(file))
+        assertEquals(applyEdits(original, changes.head._2), original.replace("BeforeRename", "AfterRename"))
+        host.read {
+          assertEquals(file.getText, original)
+          assertEquals(documents.getDocument(file).getText, original)
+          assert(documents.isCommitted(documents.getDocument(file)))
+          val facade = com.intellij.psi.JavaPsiFacade.getInstance(host.project)
+          val scope = com.intellij.psi.search.GlobalSearchScope.projectScope(host.project)
+          assert(facade.findClass("renamed.BeforeRename", scope) != null)
+          assertEquals(facade.findClass("renamed.AfterRename", scope), null)
+          assertEquals(ProjectSearch.usages(ProjectSearch.usageTarget(file, original.indexOf("BeforeRename")).get).size, 1)
+        }
+      }
+    } finally host.closeSource(file)
+  }
+
+  // PackagePrivateUseScopeTest: the scope includes the declaring package and its children, but not another package.
+  test("package-private use scopes include sources in child packages") {
+    val texts = Seq(
+      "package scoped\nprivate[scoped] class ScopedClass\n",
+      "package scoped\nobject SamePackage\n",
+      "package scoped.child\nobject ChildPackage\n",
+      "package elsewhere\nobject OtherPackage\n",
+    )
+    val files = texts.zipWithIndex.map((text, i) => scalaFile(s"Scope$i", text))
+    try host.read {
+      val target = ProjectSearch.usageTarget(files.head, texts.head.indexOf("ScopedClass")).get
+      val scope = target.getUseScope
+      assertEquals(files.map(f => scope.contains(f.getVirtualFile)), Seq(true, true, true, false))
+    } finally files.foreach(host.closeSource)
+  }
+
   test("an edit is reparsed in place and changes what other files see") {
     val aText = "object A { def f: Int = 1 }\n"
     val a = host.openFile(Path.of("/editing/A.scala"), aText, module).asInstanceOf[ScalaFile]

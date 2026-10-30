@@ -42,6 +42,9 @@ final case class WorkspaceSymbolMatch(name: String, kind: SymbolKind, container:
 /** The text between `start` and `end` becomes `text`. */
 final case class TextChange(start: LineColumn, end: LineColumn, text: String)
 
+/** The changes to a project file. */
+final case class FileChanges(path: Path, changes: Seq[TextChange])
+
 /** A completion suggestion, whose lookup string the editor puts between `start` and `end`. */
 final case class CompletionChoice(suggestion: Completion.Suggestion, start: LineColumn, end: LineColumn)
 
@@ -387,6 +390,38 @@ final class ProjectSession private (
       val declaration = if (includeDeclaration) nameSpan(target.getNavigationElement) else None
       (declaration.toSeq ++ usages).distinct
     }
+  }
+
+  /**
+   * The range of the name at `at` that a rename changes: the reference's, or the declaration's name. Refused
+   * ([[Rename.Refused]]) where the IDE would not rename: no symbol, a library symbol, a keyword...
+   */
+  def prepareRename(path: Path, at: LineColumn): (LineColumn, LineColumn) = {
+    val f = file(path)
+    val cursor = host.read(offset(document(f), at))
+    host.renameTarget(f, cursor)
+    host.read {
+      val reference = Option(f.findReferenceAt(cursor)).map(r => r.getRangeInElement.shiftRight(r.getElement.getTextRange.getStartOffset))
+      val name = reference.orElse(declarationNamedAt(f, cursor).map(_.getNameIdentifier.getTextRange))
+        .getOrElse(throw new Rename.Refused(Seq("There is no name to rename here.")))
+      position(document(f), name.getStartOffset) -> position(document(f), name.getEndOffset)
+    }
+  }
+
+  /**
+   * The changes that rename the symbol at `at` to `newName`, in every project file affected; the files are left as
+   * they are, for the editor to apply the changes to and report back. Refused ([[Rename.Refused]]) for what the IDE
+   * would not rename, an invalid name or a conflict.
+   */
+  def rename(path: Path, at: LineColumn, newName: String): Seq[FileChanges] = {
+    val f = file(path)
+    val edits = host.rename(f, host.read(offset(document(f), at)), newName)
+    host.read(edits.flatMap { (changed, fileEdits) =>
+      changed.getViewProvider.getVirtualFile match {
+        case source: SourceFile => Some(FileChanges(source.path, fileEdits.map(textChange(document(changed), _))))
+        case _ => None
+      }
+    })
   }
 
   /** The names of the implementations and overriders of the symbol at `at` (project sources only). */

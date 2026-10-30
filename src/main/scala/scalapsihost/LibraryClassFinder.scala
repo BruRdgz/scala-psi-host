@@ -101,6 +101,20 @@ final class LibraryClassFinder(project: Project, files: LibraryFileSystem) exten
     }
   }
 
+  /** PackageScope asks the finders for source files whose declared packages have no backing directory. */
+  override def processPackageFiles(psiPackage: PsiPackage, scope: GlobalSearchScope, includeSubpackages: Boolean,
+                                   consumer: com.intellij.util.Processor[? >: VirtualFile]): Boolean = {
+    val name = psiPackage.getQualifiedName
+    val prefix = if (name.isEmpty) "" else name + "."
+    val names = if (includeSubpackages)
+      StubIndex.getInstance.getAllKeys(ScalaIndexKeys.PACKAGE_FQN_KEY, project).asScala.toSeq
+        .map(_.toString).filter(n => n == name || n.startsWith(prefix))
+    else Seq(name)
+    val sources = names.flatMap(ScPackagingFqnIndex.instance.getElements(_, project, scope).asScala)
+      .map(_.getContainingFile.getVirtualFile).distinct
+    sources.forall(consumer.process)
+  }
+
   /** As the IDE: the classes of every class file in the package's directories that has a PSI file of its own. */
   override def getClasses(psiPackage: PsiPackage, scope: GlobalSearchScope): Array[PsiClass] =
     directoriesOf(psiPackage.getQualifiedName).flatMap(_.getChildren)

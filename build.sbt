@@ -80,6 +80,14 @@ lazy val root = (project in file("."))
       // check, behind the "class needs to be abstract" error. Only these jars; nothing in them is registered.
       "com.jetbrains.intellij.java" % "java-impl" % platformVersion intransitive(),
       "com.jetbrains.intellij.platform" % "lang-impl" % platformVersion intransitive(),
+      // RenameUtil and PsiElementRenameHandler: the platform's rename steps, which the plugin's rename processors extend. Only this jar.
+      "com.jetbrains.intellij.platform" % "refactoring" % platformVersion intransitive(),
+      // RenameJavaClassProcessor, RenameJavaMethodProcessor and the like: the plugin's rename processors extend them. Only this jar.
+      "com.jetbrains.intellij.java" % "java-impl-refactorings" % platformVersion intransitive(),
+      // JavaBundle, the messages of the Java processors' super-method check. Only this jar.
+      "com.jetbrains.intellij.java" % "java" % platformVersion intransitive(),
+      // UsageViewUtil, which describes the elements in the platform's rename conflicts. Only this jar.
+      "com.jetbrains.intellij.platform" % "usage-view" % platformVersion intransitive(),
       "com.jetbrains.intellij.platform" % "lang" % platformVersion intransitive(),
       // Java's highlighting keys (JavaHighlightInfoTypes), which the plugin's Scala highlighting keys derive from; quick
       // documentation (hover) renders signatures with them. Only these jars (and their message bundle); the host has
@@ -125,6 +133,10 @@ lazy val root = (project in file("."))
         "com/intellij/codeInsight/daemon/impl/HintRenderer.class", // TextPartsHintRenderer: expanded implicit labels in the oracle.
         "com/intellij/codeInsight/daemon/impl/HintRenderer$Companion.class", // TextPartsHintRenderer: its renderer base's companion.
         "com/intellij/openapi/editor/actions/EditorActionUtil.class", // SelectWordUtil: word/lexeme boundaries in the editor's lexer.
+        // RefactoringUIUtil, which the Java rename processors' conflict checks (ConflictsUtil) load: a field of editor settings.
+        "com/intellij/openapi/editor/ex/FocusChangeListener.class",
+        "com/intellij/openapi/editor/ex/EditorEx.class",
+        "com/intellij/ui/EditorSettingsProvider.class",
         "com/intellij/openapi/ui/DialogWrapper.class", // The plugin's find-usages handlers: their dialogs extend AbstractFindUsagesDialog; the host opens none.
       )
       val directory = target.value / "inlay-platform"

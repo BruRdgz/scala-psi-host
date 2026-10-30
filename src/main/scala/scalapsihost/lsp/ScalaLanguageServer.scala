@@ -6,9 +6,9 @@ import com.intellij.openapi.progress.ProcessCanceledException
 import com.google.gson.JsonPrimitive
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException
-import org.eclipse.lsp4j.jsonrpc.messages.{Either as LspEither, ResponseError, ResponseErrorCode, Tuple}
+import org.eclipse.lsp4j.jsonrpc.messages.{Either as LspEither, Either3 as LspEither3, ResponseError, ResponseErrorCode, Tuple}
 import org.eclipse.lsp4j.services.*
-import scalapsihost.{CallLog, ChangeEngine, HostLog, LineColumn, ParameterInfo, ScalaPsiHost}
+import scalapsihost.{CallLog, ChangeEngine, HostLog, LineColumn, ParameterInfo, Rename, ScalaPsiHost}
 
 import java.net.URI
 import java.nio.file.Path
@@ -159,6 +159,7 @@ final class ScalaLanguageServer(
     capabilities.setTypeDefinitionProvider(true)
     capabilities.setReferencesProvider(true)
     capabilities.setImplementationProvider(true)
+    capabilities.setRenameProvider(new RenameOptions(/* prepareProvider = */ true))
     capabilities.setWorkspaceSymbolProvider(true)
     capabilities.setDocumentHighlightProvider(true)
     capabilities.setDocumentSymbolProvider(true)
@@ -311,6 +312,7 @@ final class ScalaLanguageServer(
         case e: DiffTooBigException =>
           HostLog.warn(s"$kind: the change is too large to compare", e)
           throw requestError(ResponseErrorCode.RequestFailed, "the change is too large to compare")
+        case e: Rename.Refused => throw requestError(ResponseErrorCode.RequestFailed, e.getMessage)
         case e: ChangeEngine.UnsupportedFormatter =>
           client.showMessage(new MessageParams(MessageType.Error, e.getMessage))
           throw requestError(ResponseErrorCode.RequestFailed, e.getMessage)
@@ -475,6 +477,22 @@ final class ScalaLanguageServer(
         : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
       onSource("implementation", params.getTextDocument, spanLocations(Seq.empty)) { (s, path) =>
         spanLocations(s.implementations(path, lineColumn(params.getPosition)))
+      }
+
+    override def prepareRename(params: PrepareRenameParams)
+        : CompletableFuture[LspEither3[Range, PrepareRenameResult, PrepareRenameDefaultBehavior]] =
+      onSource("prepareRename", params.getTextDocument, null) { (s, path) =>
+        LspEither3.forFirst[Range, PrepareRenameResult, PrepareRenameDefaultBehavior](range(s.prepareRename(path, lineColumn(params.getPosition))))
+      }
+
+    // Answered like formatting: the changes are for the documents as they are, and an edit after the request outdates them.
+    override def rename(params: RenameParams): CompletableFuture[WorkspaceEdit] =
+      onEditsRequest("rename", params.getTextDocument, new WorkspaceEdit()) { (s, path) =>
+        val edits = s.rename(path, lineColumn(params.getPosition), params.getNewName).map { file =>
+          val document = new VersionedTextDocumentIdentifier(file.path.toUri.toString, versions.get(file.path))
+          LspEither.forLeft[TextDocumentEdit, ResourceOperation](new TextDocumentEdit(document, textEdits(file.changes)))
+        }
+        new WorkspaceEdit(edits.asJava)
       }
 
     private def locations(found: Seq[(Path, LineColumn)]): LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]] =

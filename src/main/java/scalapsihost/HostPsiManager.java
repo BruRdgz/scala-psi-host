@@ -79,6 +79,13 @@ public final class HostPsiManager extends PsiManagerEx {
   @Override public PsiFile findFile(VirtualFile f, CodeInsightContext c) { hit("findFile(context)"); return fileManager.findFile(f); }
   @Override public FileViewProvider findViewProvider(VirtualFile f, CodeInsightContext c) { hit("findViewProvider(context)"); return fileManager.findViewProvider(f); }
 
+  // The project's content is its source files; library files (even attached sources) and copies are not in it.
+  @Override public boolean isInProject(PsiElement e) {
+    hit("isInProject");
+    PsiFile file = e.getContainingFile();
+    return file != null && file.getViewProvider().getVirtualFile() instanceof SourceFile;
+  }
+
   // Unsupported until a scenario proves they are needed.
   @Override public void cleanupForNextTest() { no("cleanupForNextTest"); }
   @Override public void dropResolveCacheRegularly(ProgressIndicator i) { no("dropResolveCacheRegularly"); }
@@ -102,5 +109,4 @@ public final class HostPsiManager extends PsiManagerEx {
   @Override public <T> T runInBatchFilesMode(Computable<T> c) { hit("runInBatchFilesMode"); return c.compute(); }
   @Override public void dropResolveCaches() { no("dropResolveCaches"); }
   @Override public void dropPsiCaches() { no("dropPsiCaches"); }
-  @Override public boolean isInProject(PsiElement e) { return no("isInProject"); }
 }
