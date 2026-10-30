@@ -7,7 +7,7 @@ import org.eclipse.lsp4j.jsonrpc.Launcher
 
 import java.net.URI
 import java.nio.file.{Files, Path}
-import java.util.concurrent.{ConcurrentHashMap, TimeUnit}
+import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ExecutionException, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
@@ -57,6 +57,7 @@ final class BuildConnection private[scalapsihost] (
   server: BspImport.HostBuildServer,
   capabilities: BuildServerCapabilities,
   client: BspImport.DiagnosticsClient,
+  log: Path,
   timeoutMinutes: Long,
 ) extends AutoCloseable {
   import BspImport.gson
@@ -65,7 +66,7 @@ final class BuildConnection private[scalapsihost] (
   private val ShutdownDeadlineSeconds = 2L
   private val closed = new AtomicBoolean()
 
-  private def await[T](f: java.util.concurrent.CompletableFuture[T]): T = f.get(timeoutMinutes, TimeUnit.MINUTES)
+  private def await[T](f: CompletableFuture[T]): T = BspImport.await(process, log, f, timeoutMinutes)
 
   // The build's Scala targets, asked for once per build definition (again after a reload).
   @volatile private var targets: Option[Seq[BuildTarget]] = None
@@ -208,19 +209,33 @@ object BspImport {
         .create()
       launcher.startListening()
       val server = launcher.getRemoteProxy
-      val initialized = server.buildInitialize(new InitializeBuildParams(
+      val initialized = await(process, log, server.buildInitialize(new InitializeBuildParams(
         "scala-psi-host", "0.1", BspVersion, projectDir.toUri.toString,
-        new BuildClientCapabilities(java.util.List.of("scala")))).get(timeoutMinutes, TimeUnit.MINUTES)
+        new BuildClientCapabilities(java.util.List.of("scala")))), timeoutMinutes)
       server.onBuildInitialized()
       // A build server that was already running (sbt keeps its server between clients) may hold an older build
       // definition: reload it, as IDEs do on import.
-      server.workspaceReload().get(timeoutMinutes, TimeUnit.MINUTES)
-      new BuildConnection(process, server, initialized.getCapabilities, client, timeoutMinutes)
+      await(process, log, server.workspaceReload(), timeoutMinutes)
+      new BuildConnection(process, server, initialized.getCapabilities, client, log, timeoutMinutes)
     } catch {
       case e: Throwable =>
         destroyProcess(process)
         throw e
     }
+  }
+
+  /** The build server's process ended, so it will answer no request. */
+  final class BuildServerExited(exitCode: Int, log: Path)
+    extends RuntimeException(s"the build server exited (code $exitCode) without answering; its output: $log")
+
+  /**
+   * The build server's answer to a request. A server that exits never answers (sbt's exits when the build fails to
+   * load), so its exit ends the wait rather than the timeout.
+   */
+  private[scalapsihost] def await[T](process: Process, log: Path, request: CompletableFuture[T], timeoutMinutes: Long): T = {
+    val exited = process.onExit().thenApply[T](p => throw new BuildServerExited(p.exitValue(), log))
+    try request.applyToEither(exited, answer => answer).get(timeoutMinutes, TimeUnit.MINUTES)
+    catch { case e: ExecutionException if e.getCause.isInstanceOf[BuildServerExited] => throw e.getCause }
   }
 
   private[scalapsihost] def destroyProcess(process: Process): Unit =

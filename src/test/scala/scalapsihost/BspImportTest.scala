@@ -27,6 +27,18 @@ class BspImportTest extends munit.FunSuite {
     assert(sbtServerListening(), "closing the connection stopped the sbt server")
   }
 
+  // The server reads the request and exits, as sbt does when the build fails to load.
+  test("a build server that exits without answering fails the connection at once, not at the timeout") {
+    val project = Files.createTempDirectory("scala-psi-host-exiting-server")
+    Files.createDirectory(project.resolve(".bsp"))
+    Files.writeString(project.resolve(".bsp/exiting.json"),
+      """{"name":"exiting","version":"0","bspVersion":"2.1.0","languages":["scala"],"argv":["sh","-c","head -c 1 >/dev/null; exit 3"]}""")
+    val started = System.nanoTime()
+    val failure = intercept[BspImport.BuildServerExited](BspImport.connect(project, timeoutMinutes = 1))
+    assert((System.nanoTime() - started).nanos < 30.seconds, "waited for the timeout")
+    assert(failure.getMessage.contains("code 3"), failure.getMessage)
+  }
+
   // While sbt's server runs, project/target/active.json names the socket it listens on.
   private def sbtServerListening(): Boolean = {
     val active = BspImport.gson.fromJson(Files.readString(fixture.resolve("project/target/active.json")), classOf[JsonObject])
