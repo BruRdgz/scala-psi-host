@@ -98,8 +98,9 @@ lazy val root = (project in file("."))
       "com.jetbrains.intellij.xml" % "xml-syntax" % platformVersion intransitive(),
       // Libraries the plugin jars expect from the IDE distribution.
       "org.apache.maven" % "maven-artifact" % "3.9.9" intransitive(),
-      // The version the IDE bundles (lib/intellij.libraries.markdown.jar): same MarkdownParser API as 0.7.17.
-      "org.jetbrains" % "markdown-jvm" % "0.7.17" intransitive(),
+      // The version the IDE bundles (lib/intellij.libraries.markdown.jar, class for class): the plugin's ScalaDoc
+      // Markdown parser extends its block constraints, which 0.7.17 changed (tag descriptions came out empty).
+      "org.jetbrains" % "markdown-jvm" % "0.7.16" intransitive(),
       "org.apache.commons" % "commons-text" % "1.12.0" intransitive(),
       // LSP protocol types; the JSON-RPC layer (lsp4j.jsonrpc) comes with the plugin's jars, at this version.
       "org.eclipse.lsp4j" % "org.eclipse.lsp4j" % "0.20.1" intransitive(),
