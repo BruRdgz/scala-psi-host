@@ -159,6 +159,7 @@ final class ScalaLanguageServer(
     capabilities.setTypeDefinitionProvider(true)
     capabilities.setReferencesProvider(true)
     capabilities.setImplementationProvider(true)
+    capabilities.setCodeActionProvider(new CodeActionOptions(java.util.List.of(CodeActionKind.QuickFix, CodeActionKind.RefactorRewrite)))
     capabilities.setRenameProvider(new RenameOptions(/* prepareProvider = */ true))
     capabilities.setWorkspaceSymbolProvider(true)
     capabilities.setDocumentHighlightProvider(true)
@@ -477,6 +478,25 @@ final class ScalaLanguageServer(
         : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
       onSource("implementation", params.getTextDocument, spanLocations(Seq.empty)) { (s, path) =>
         spanLocations(s.implementations(path, lineColumn(params.getPosition)))
+      }
+
+    override def codeAction(params: CodeActionParams): CompletableFuture[java.util.List[LspEither[Command, CodeAction]]] =
+      onEditsRequest("codeAction", params.getTextDocument, java.util.List.of[LspEither[Command, CodeAction]]()) { (s, path) =>
+        val requested = Option(params.getContext.getOnly).map(_.asScala.toSeq).getOrElse(Seq.empty)
+        s.codeActions(path, lineColumn(params.getRange.getStart), lineColumn(params.getRange.getEnd))
+          .filter { (choice, _) => requested.isEmpty || requested.exists(k => choice.kind == k || choice.kind.startsWith(k + ".")) }
+          .map { (choice, changes) =>
+            val action = new CodeAction(choice.title)
+            action.setKind(choice.kind)
+            choice.disabled match {
+              case Some(reason) => action.setDisabled(new CodeActionDisabled(reason))
+              case None =>
+                val document = new VersionedTextDocumentIdentifier(path.toUri.toString, versions.get(path))
+                val edit = new TextDocumentEdit(document, textEdits(changes))
+                action.setEdit(new WorkspaceEdit(java.util.List.of(LspEither.forLeft[TextDocumentEdit, ResourceOperation](edit))))
+            }
+            LspEither.forRight[Command, CodeAction](action)
+          }.asJava
       }
 
     override def prepareRename(params: PrepareRenameParams)

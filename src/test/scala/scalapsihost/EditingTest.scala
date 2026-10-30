@@ -329,6 +329,28 @@ class EditingTest extends munit.FunSuite {
     } finally host.closeSource(file)
   }
 
+  test("code actions preview intentions and annotator fixes without changing the source") {
+    val cases = Seq(
+      ("object Action { val a = 1; val b = 2; val x = a ==<caret> b }", "Negate",
+        "object Action { val a = 1; val b = 2; val x = !(a != b)\n}"),
+      ("object wrapper { val string: String = ???; val value: Int = <caret>string }", "Change type 'Int' to 'String'",
+        "object wrapper { val string: String = ???; val value: String = string }"),
+    )
+    TestHost.libraryReport
+    for ((marked, title, expected) <- cases) {
+      val original = marked.replace("<caret>", "")
+      val file = scalaFile("Action", original)
+      try {
+        val at = marked.indexOf("<caret>")
+        val actions = host.codeActions(file, new TextRange(at, at))
+        val chosen = actions.find(_.title.startsWith(title)).getOrElse(fail(actions.toString))
+        assertEquals(chosen.disabled, None)
+        assertEquals(applyEdits(original, chosen.edits), expected)
+        assertEquals(host.read(file.getText), original)
+      } finally host.closeSource(file)
+    }
+  }
+
   test("IntelliJ formatting returns minimal edits with request indentation") {
     val text = "object FormatMe {\nval emoji=\"😀\"\nval n=1+2\n}\n"
     val file = host.openFile(Path.of("/editing/FormatMe.scala"), text, module) match {

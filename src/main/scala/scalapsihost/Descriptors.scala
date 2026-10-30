@@ -14,8 +14,8 @@ import scala.util.Using
 final case class EpDecl(name: String, className: String, kind: ExtensionPoint.Kind, dynamic: Boolean, fromScalaPlugin: Boolean)
 
 /** Descriptor attributes retained for bean extension points, including their platform ordering constraints. */
-final case class ExtensionBean(attributes: Map[String, String]) {
-  def implementation: String = attributes.getOrElse("implementationClass", attributes.getOrElse("implementation", ""))
+final case class ExtensionBean(attributes: Map[String, String], children: Map[String, String] = Map.empty) {
+  def implementation: String = attributes.getOrElse("implementationClass", attributes.getOrElse("implementation", children.getOrElse("className", "")))
 }
 
 /**
@@ -96,6 +96,11 @@ object Descriptors {
     } yield ExtensionBean((0 until e.getAttributes.getLength).map { a =>
       val attribute = e.getAttributes.item(a)
       attribute.getNodeName -> attribute.getNodeValue
+    }.toMap, (0 until e.getChildNodes.getLength).flatMap { i =>
+      e.getChildNodes.item(i) match {
+        case child: org.w3c.dom.Element => Some(child.getTagName -> child.getTextContent.trim)
+        case _ => None
+      }
     }.toMap)
   }
 

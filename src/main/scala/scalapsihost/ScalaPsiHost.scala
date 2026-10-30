@@ -94,6 +94,7 @@ final class ScalaPsiHost private (
   librarySources: ConcurrentHashMap[VirtualFile, VirtualFile],
   val modules: ModuleModel,
   psiChanged: () => Unit,
+  private val actions: CodeActions,
 ) {
   // Library jars by real path: a jar on the classpath of several modules is mounted and indexed once.
   private val libraryRoots = new ConcurrentHashMap[Path, VirtualFile]()
@@ -368,6 +369,10 @@ final class ScalaPsiHost private (
     org.jetbrains.plugins.scala.settings.ScalaHighlightingMode.isShowErrorsFromCompilerEnabled(file)
   }
 
+  /** Text actions for the selected range, preserving their annotator fixes and previewing on file copies. */
+  def codeActions(file: ScalaFile, range: TextRange): Seq[CodeActions.Choice] =
+    read(actions.collect(file, range, diagnostics(file)))
+
   /**
    * The problems the IDE's highlighting pass reports for `file`: syntax errors, and the plugin's `ScalaAnnotator`
    * run over every element through the platform's annotation session. Presentation-only annotations (no message)
@@ -387,7 +392,8 @@ final class ScalaPsiHost private (
     })
     syntaxErrors ++ annotations.collect {
       case a if a.getMessage != null =>
-        Diagnostic(a.getSeverity, new TextRange(a.getStartOffset, a.getEndOffset), a.getMessage)
+        Diagnostic(a.getSeverity, new TextRange(a.getStartOffset, a.getEndOffset), a.getMessage,
+          Option(a.getQuickFixes).toSeq.flatMap(_.asScala).map(f => f.textRange -> f.quickFix))
     }
   }
 
@@ -415,7 +421,8 @@ final class ScalaPsiHost private (
   }
 }
 
-final case class Diagnostic(severity: HighlightSeverity, range: TextRange, message: String)
+final case class Diagnostic(severity: HighlightSeverity, range: TextRange, message: String,
+                            fixes: Seq[(TextRange, com.intellij.codeInsight.intention.IntentionAction)] = Seq.empty)
 
 object ScalaPsiHost {
   @volatile private var started: Option[ScalaPsiHost] = None
@@ -595,6 +602,8 @@ object ScalaPsiHost {
       val handler = newPrivate(Class.forName(name))
       selectioners.registerExtension(classOf[ExtendWordSelectionHandler].cast(handler), root)
     }
+    // Mod-command intentions copy PSI through the platform preview pipeline.
+    declare("com.intellij.modCommandCopyHandler")
     declare("com.intellij.basicWordSelectionFilter")
     val wordFilters = area.getExtensionPoint[Condition[PsiElement]]("com.intellij.basicWordSelectionFilter")
     wordFilters.registerExtension(new DummyBlockWordSelectionFilter, root)
@@ -930,6 +939,9 @@ object ScalaPsiHost {
     // Write-safety checks of PSI change notifications: they only check the UI thread, which the host never runs on.
     appServices.register(classOf[com.intellij.openapi.application.TransactionGuard])(new com.intellij.openapi.application.TransactionGuardImpl)
     // Annotations carry their quick fixes, which the platform wraps as intentions when the annotation is created.
+    // The batch executor applies textual mod commands to preview copies without the desktop executor.
+    appServices.register(classOf[com.intellij.modcommand.ModCommandExecutor])(
+      new com.intellij.lang.impl.modcommand.ModCommandBatchExecutorImpl)
     appServices.register(classOf[com.intellij.modcommand.ModCommandService])(new com.intellij.lang.impl.modcommand.ModCommandServiceImpl)
     // Interpolation references give completion its Scala prefix inside plain strings; file paths and URL providers need IDE navigation.
     appServices.register(classOf[com.intellij.psi.PsiReferenceService])(new com.intellij.psi.PsiReferenceServiceImpl)
@@ -1624,7 +1636,9 @@ object ScalaPsiHost {
       org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager.instance(project).clearOnNonScalaChange()
     }
 
-    new ScalaPsiHost(config.stateDir, project, symbolIndex, wordIndex, libraryFiles, librarySources, moduleModel, () => psiChanged())
+    new ScalaPsiHost(config.stateDir, project, symbolIndex, wordIndex, libraryFiles, librarySources, moduleModel, () => psiChanged(),
+      new CodeActions(Descriptors.scalaExtensions(config.scalaPluginJars, "com.intellij.intentionAction"),
+        Descriptors.scalaExtensions(config.scalaPluginJars, "com.intellij.lang.surroundDescriptor")))
   }
 
   /**

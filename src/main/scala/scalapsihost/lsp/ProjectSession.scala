@@ -392,6 +392,17 @@ final class ProjectSession private (
     }
   }
 
+  /** Applicable plugin actions, with edits against the current document. */
+  def codeActions(path: Path, start: LineColumn, end: LineColumn): Seq[(CodeActions.Choice, Seq[TextChange])] = host.read {
+    file(path) match {
+      case f: ScalaFile =>
+        val d = document(f)
+        host.codeActions(f, new TextRange(offset(d, start), offset(d, end)))
+          .map(choice => choice -> choice.edits.map(textChange(d, _)))
+      case _ => Seq.empty
+    }
+  }
+
   /**
    * The range of the name at `at` that a rename changes: the reference's, or the declaration's name. Refused
    * ([[Rename.Refused]]) where the IDE would not rename: no symbol, a library symbol, a keyword...

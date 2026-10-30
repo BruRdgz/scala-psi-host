@@ -1,8 +1,8 @@
 # scala-psi-host
 
 > **Alpha.** Diagnostics, hover, go-to-definition, references, implementations, workspace symbols, completion,
-> signature help, inlay hints, selection ranges, formatting and rename work;
-> code actions do not exist yet. See [ROADMAP.md](ROADMAP.md) and
+> signature help, inlay hints, selection ranges, formatting, rename and previewable code actions work.
+> See [ROADMAP.md](ROADMAP.md) and
 > [Known limitations](#known-limitations).
 
 A Scala language server built on the IntelliJ Scala plugin's PSI and type checker, running **without an IntelliJ
@@ -11,7 +11,7 @@ answers, through fixed tables, what the plugin and the IntelliJ platform's PSI l
 
 It serves LSP diagnostics, hover, go to definition, type definition and implementation, references, document
 highlights, document and workspace symbols, folding ranges, semantic tokens, completion, signature help, inlay
-hints, selection ranges, formatting and rename for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
+hints, selection ranges, formatting, rename and code actions for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
 
 Completion lists the suggestions of the plugin's completion contributors, ordered by its weighers; a suggestion's
 insert handler (parentheses, imports, generated code) runs once the user has chosen it, as in the IDE: the item's
@@ -25,6 +25,11 @@ A conflict or invalid name refuses the request. The host restores its files befo
 the editor applies them and reports the changed text. File names and optional automatic renames stay unchanged.
 The processors' unit-test answers choose base members and matching getters/setters without dialogs, only while
 choosing the target and preparing the related renames on the current thread.
+
+Code actions offer the plugin's available intentions and the quick fixes attached to its annotations, plus
+surrounders for a selection. Each runs on a copy through the change engine and the platform's preview or mod-command
+contract. The response contains versioned text edits; the source is left unchanged until the editor reports the edits.
+Actions requiring dialogs, other files, or unsupported previews are unavailable. Inspections are not run.
 
 Inlay hints come from the plugin's `ImplicitHintsPass`: inferred definition types, parameter names, implicit and
 `using` arguments, conversions, method chains and type arguments. The plugin's settings and defaults apply (parameter
@@ -230,6 +235,11 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   The disagreement leaves a Java override of a Scala val unchanged (Java inheritors are not indexed). Skips cover
   optional automatic renames, Java-only carets, package moves, comments and unsupported test setup. File renames
   are compared by text only: the host returns source edits, not file operations.
+- `oracle.CodeActionsOracle <intellij-scala> <report.md>` — replays the 48 Scala 2/3 `SurroundWithTest` fixtures
+  through the code-action API: **37 agree, 11 disagree, 0 skip**. Six Scala 2 match/try previews fail while processing
+  placeholder patterns; five Scala 3 fixtures encounter inconsistent PSI/document trees while previewing the available
+  actions. Errors remain disagreements, and failed previews are disabled. Intentions and annotator quick fixes have
+  focused host and JSON-RPC tests; their full upstream test suites are not replayed by this oracle.
 - `oracle.SelectionOracle <intellij-scala> <report.md>` — the plugin's selectioner tests, step by step: ScalaDoc
   2 agree, 1 disagree; interpolated strings 27 agree; ordinary strings 9 agree; no skips. The multiline/single-line
   helper runs both variants. See the trailing-newline disagreement below.
@@ -277,6 +287,11 @@ the last (measured with `-XX:SoftRefLRUPolicyMSPerMB=0`, so the plugin's soft-re
   declarations have no references, and Java subclasses of a Scala class are not among its implementations (the
   platform's Java searcher for them reads the compiler indices). Workspace symbols list Scala classes and members;
   Java declarations and the JDK's and libraries' are not listed.
+- Code actions cover edits to the current file whose preview succeeds. The access-modifier intention requires the
+  desktop rename UI; removing unnecessary parentheses requires an inspection profile; neither is loaded. Auto-import
+  quick fixes are not offered yet: the plugin computes their candidates asynchronously and supplies no text preview.
+  Inspection quick fixes, dialogs, file operations, snippets and post-action caret placement are not supported.
+  Actions are previewed eagerly when requested; no latency budget has been established.
 - Rename shares the search limitations above: a Java override of a Scala member can keep its old name even when
   references change. File/package moves, optional automatic renames, comments and string occurrences are not offered.
 - Completion misses beta 2's p95 budget of 150 ms (261 ms on the first pass, 186 ms warm, on the project above):

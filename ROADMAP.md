@@ -47,7 +47,10 @@ The change engine and the formatter (beta 1), completion, signature help, select
 - `CodeStyleManager` and the formatter; formatting, range formatting. Oracle: `formatter`. Decide how scalafmt
   configurations are honoured (the plugin can delegate to scalafmt).
 - The change engine.
-- Code actions from the plugin's intentions and the annotators' quick fixes. Oracles: `actions`, `surroundWith`.
+- Code actions from the plugin's intentions and the annotators' quick fixes. **Initial integration:** previewable
+  intentions, annotation fixes and surrounders return versioned LSP edits. `CodeActionsOracle` replays
+  `SurroundWithTest`: 37 agree, 11 disagree, 0 skip. Remaining: the documented preview gaps, auto-import quick fixes,
+  and broader intention-oracle coverage. `testdata/actions` covers editor key handlers, not these intentions.
 - Organize imports (oracle: `optimize`), auto-import (oracle: `autoImport`), rename (with B; oracle: `refactoring`).
 
 ## Beta 2 — completion and inspections

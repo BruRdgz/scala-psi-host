@@ -544,6 +544,39 @@ class LanguageServerTest extends munit.FunSuite {
     } finally change(original, 26)
   }
 
+  test("code actions return versioned edits and honor the requested kind") {
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    val text = "package app\nobject Action { val string: String = ???; val value: Int = string }"
+    val service = server.getTextDocumentService
+    def change(value: String, version: Int): Unit = service.didChange(new DidChangeTextDocumentParams(
+      new VersionedTextDocumentIdentifier(main.toUri.toString, version),
+      java.util.List.of(new TextDocumentContentChangeEvent(value))))
+    try {
+      change(text, 27)
+      val column = text.split("\n").last.lastIndexOf("string")
+      val at = new Position(1, column)
+      val context = new CodeActionContext(java.util.List.of())
+      context.setOnly(java.util.List.of(CodeActionKind.QuickFix))
+      val params = new CodeActionParams(document(main), new Range(at, at), context)
+      val actions = service.codeAction(params).get(1, TimeUnit.MINUTES).asScala.map(_.getRight)
+      assert(actions.forall(_.getKind == CodeActionKind.QuickFix))
+      val action = actions.find(_.getTitle == "Change type 'Int' to 'String'").getOrElse(fail(actions.toString))
+      assertEquals(action.getDisabled, null)
+      val edit = action.getEdit.getDocumentChanges.get(0).getLeft
+      assertEquals(edit.getTextDocument.getVersion, Integer.valueOf(27))
+      assertEquals(edit.getTextDocument.getUri, main.toUri.toString)
+      val lineStart = text.indexOf('\n') + 1
+      val changes = edit.getEdits.asScala.toSeq.map { change =>
+        val range = change.getRange
+        scalapsihost.ChangeEngine.Edit(new com.intellij.openapi.util.TextRange(
+          lineStart + range.getStart.getCharacter, lineStart + range.getEnd.getCharacter), change.getNewText)
+      }
+      assertEquals(TestHost.applyEdits(text, changes), text.replace("value: Int", "value: String"))
+      assertEquals(service.codeAction(params).get(1, TimeUnit.MINUTES).asScala.map(_.getRight.getTitle).toSeq,
+        actions.map(_.getTitle).toSeq)
+    } finally change(original, 28)
+  }
+
   test("completion answers for its position while the user types on, as editors expect") {
     val original = Files.readString(main).replace("val text: String", "val text: Int")
     // The next keystroke arrives before the completion has run.
