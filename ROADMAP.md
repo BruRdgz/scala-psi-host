@@ -52,12 +52,17 @@ The change engine and the formatter (beta 1), completion, signature help, select
 
 ## Beta 2 — completion and inspections
 
+Closed on 2026-10-30 (`v0.1.0-b2`) without inspections: their milestone is still to decide.
+
 - The `Editor` object.
 - Selection ranges. **Done:** successive Extend Selection steps through `SelectWordUtil`, the platform's base
   handlers and the plugin's descriptor-registered handlers; the editor supplies default settings and its layered lexer.
 - Completion (oracles: `completion`, `completion3`, `keywordCompletion`) and signature help (oracle:
-  `parameterInfo`), with a latency budget (p95 under 150 ms on the acceptance projects).
-- Inspections as diagnostics, with their quick fixes as code actions. Oracle: `inspections`.
+  `parameterInfo`), with a latency budget (p95 under 150 ms on the acceptance projects). **Done**, the budget
+  waived: p95 261 ms first pass, 186 ms warm on YggDrasil, the remainder being the plugin's own contributors and
+  weighers, a gap to the IDE judged insignificant.
+- Inspections as diagnostics, with their quick fixes as code actions. Oracle: `inspections`. **Not done**; the
+  quick fixes need beta 1's code actions.
 
 ## 0.1 — release
 

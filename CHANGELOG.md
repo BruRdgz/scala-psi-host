@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.0-b2 — 2026-10-30
+
+Beta 2: completion, signature help, selection ranges, formatting and inlay hints from the Scala plugin itself; the
+alpha 2 gaps closed (no memory held per edit; korolev agrees with the plugin's own project test). Inspections as
+diagnostics and Scala 3 oracle fixtures are not part of it.
 
 - Faster completion: a suggestion whose weigher fails no longer makes the others be weighed again, and index
   lookups filter postings by file without navigating PSI. First pass p95 300 to 261 ms, p99 988 to 428 ms.
