@@ -13,7 +13,8 @@ import scalapsihost.language.{ChangeEngine, Completion, ProjectSearch}
 import scalapsihost.platform.{CallLog, HostLock, RequestEditor}
 
 import java.nio.file.Path
-import java.util.concurrent.{CountDownLatch, TimeUnit}
+import java.util.concurrent.{CompletableFuture, CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.atomic.AtomicReference
 
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.Duration
@@ -110,6 +111,83 @@ class EditingTest extends munit.FunSuite {
         scala.concurrent.Await.result(query, scala.concurrent.duration.Duration(30, "s")))
       assertEquals(host.read(file.getText), "// edited\nobject D\n")
     } finally host.closeSource(file)
+  }
+
+  test("a writer cancels a query between read acquisition and progress registration") {
+    host.project
+    val executor = Executors.newFixedThreadPool(2)
+    val readerThread = new AtomicReference[Thread]()
+    val writerThread = new AtomicReference[Thread]()
+    val reading = new CountDownLatch(1)
+    val writing = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
+    val listeners = com.intellij.openapi.util.Disposer.newDisposable()
+    HostLock.addReadListener(new com.intellij.openapi.application.ReadActionListener {
+      override def readActionStarted(action: Class[?]): Unit =
+        if (Thread.currentThread() eq readerThread.get()) {
+          reading.countDown()
+          if (!release.await(30, TimeUnit.SECONDS)) throw new IllegalStateException("the reader was not released")
+        }
+    }, listeners)
+    HostLock.addWriteListener(new com.intellij.openapi.application.WriteActionListener {
+      override def beforeWriteActionStart(action: Class[?]): Unit =
+        if (Thread.currentThread() eq writerThread.get()) writing.countDown()
+    }, listeners)
+    try {
+      val query = CompletableFuture.supplyAsync(() => {
+        readerThread.set(Thread.currentThread())
+        HostLock.query(42)
+      }, executor)
+      assert(reading.await(30, TimeUnit.SECONDS))
+      val writer = CompletableFuture.runAsync(() => {
+        writerThread.set(Thread.currentThread())
+        HostLock.write(())
+      }, executor)
+      assert(writing.await(30, TimeUnit.SECONDS))
+      release.countDown()
+      val error = intercept[java.util.concurrent.ExecutionException](query.get(30, TimeUnit.SECONDS))
+      assert(error.getCause.isInstanceOf[com.intellij.openapi.progress.ProcessCanceledException])
+      writer.get(30, TimeUnit.SECONDS)
+      assertEquals(HostLock.query(42), 42)
+    } finally {
+      release.countDown()
+      executor.shutdown()
+      val stopped = executor.awaitTermination(30, TimeUnit.SECONDS)
+      com.intellij.openapi.util.Disposer.dispose(listeners)
+      assert(stopped)
+    }
+  }
+
+  test("queries arriving while a writer waits for intent are cancelled too") {
+    host.project
+    val executor = Executors.newFixedThreadPool(2)
+    val writerThread = new AtomicReference[Thread]()
+    val writing = new CountDownLatch(1)
+    val listeners = com.intellij.openapi.util.Disposer.newDisposable()
+    HostLock.addIntentListener(new com.intellij.openapi.application.WriteIntentReadActionListener {
+      override def beforeWriteIntentReadActionStart(action: Class[?]): Unit =
+        if (Thread.currentThread() eq writerThread.get()) writing.countDown()
+    }, listeners)
+    try {
+      val writer = HostLock.writeIntent {
+        val pending = CompletableFuture.runAsync(() => {
+          writerThread.set(Thread.currentThread())
+          HostLock.write(())
+        }, executor)
+        assert(writing.await(30, TimeUnit.SECONDS))
+        val query = CompletableFuture.supplyAsync(() => HostLock.query(42), executor)
+        val error = intercept[java.util.concurrent.ExecutionException](query.get(30, TimeUnit.SECONDS))
+        assert(error.getCause.isInstanceOf[com.intellij.openapi.progress.ProcessCanceledException])
+        pending
+      }
+      writer.get(30, TimeUnit.SECONDS)
+      assertEquals(HostLock.query(42), 42)
+    } finally {
+      executor.shutdown()
+      val stopped = executor.awaitTermination(30, TimeUnit.SECONDS)
+      com.intellij.openapi.util.Disposer.dispose(listeners)
+      assert(stopped)
+    }
   }
 
   // The word index follows edits: a usage added to or removed from a file is found, or no longer found.

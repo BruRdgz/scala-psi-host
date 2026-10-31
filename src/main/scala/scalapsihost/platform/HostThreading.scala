@@ -6,6 +6,8 @@ import scala.jdk.CollectionConverters.*
 private[scalapsihost] object HostLock {
   private val lock = new java.util.concurrent.locks.ReentrantReadWriteLock(/* fair = */ true)
   private val queries = java.util.concurrent.ConcurrentHashMap.newKeySet[com.intellij.openapi.progress.ProgressIndicator]()
+  // Covers readers registering after cancellation, including while a writer waits for write intent.
+  private val pendingWrites = new java.util.concurrent.atomic.AtomicInteger()
 
   private val intent = new java.util.concurrent.locks.ReentrantLock(true)
   private val writeListeners = new java.util.concurrent.CopyOnWriteArrayList[com.intellij.openapi.application.WriteActionListener]()
@@ -71,7 +73,7 @@ private[scalapsihost] object HostLock {
     }
   }
 
-  /** An editor notification can cancel reads before its queued write acquires the documents thread. */
+  /** Cancels queries already registered with the host's progress manager. */
   def cancelQueries(): Unit = queries.forEach(_.cancel())
 
   /** A read without its own cancellation (the platform's `runReadAction`): the lock only. */
@@ -101,10 +103,15 @@ private[scalapsihost] object HostLock {
     else {
       val indicator = new com.intellij.openapi.progress.EmptyProgressIndicator
       readLocked {
-        // Platform/plugin cancellation checks observe this indicator and release the read through runProcess.
-        queries.add(indicator)
-        try com.intellij.openapi.progress.ProgressManager.getInstance.runProcess((() => body): com.intellij.openapi.util.Computable[T], indicator)
-        finally queries.remove(indicator)
+        com.intellij.openapi.progress.ProgressManager.getInstance.runProcess((() => {
+          // runProcess starts the indicator, resetting cancellation; only register it after that reset.
+          queries.add(indicator)
+          try {
+            if (pendingWrites.get() > 0) indicator.cancel()
+            indicator.checkCanceled()
+            body
+          } finally queries.remove(indicator)
+        }): com.intellij.openapi.util.Computable[T], indicator)
       }
     }
 
@@ -112,23 +119,26 @@ private[scalapsihost] object HostLock {
   def write[T](body: => T): T = {
     // A read lock cannot become a write lock: waiting for it here would wait for this thread's own read forever.
     if (isReading && !isWriting) throw new IllegalStateException("an edit cannot start inside a read")
-    if (!isWriting) cancelQueries()
-    writeIntent {
-      if (isWriting) body
-      else {
-        val listeners = writeListeners.asScala.toVector
-        val action = HostLock.getClass
-        listeners.foreach(_.beforeWriteActionStart(action))
-        lock.writeLock.lock()
-        try {
-          listeners.foreach(_.writeActionStarted(action))
-          try body
-          finally listeners.foreach(_.writeActionFinished(action))
-        } finally {
-          lock.writeLock.unlock()
-          listeners.foreach(_.afterWriteActionFinished(action))
+    if (isWriting) body
+    else {
+      pendingWrites.incrementAndGet()
+      try {
+        cancelQueries()
+        writeIntent {
+          val listeners = writeListeners.asScala.toVector
+          val action = HostLock.getClass
+          listeners.foreach(_.beforeWriteActionStart(action))
+          lock.writeLock.lock()
+          try {
+            listeners.foreach(_.writeActionStarted(action))
+            try body
+            finally listeners.foreach(_.writeActionFinished(action))
+          } finally {
+            lock.writeLock.unlock()
+            listeners.foreach(_.afterWriteActionFinished(action))
+          }
         }
-      }
+      } finally pendingWrites.decrementAndGet()
     }
   }
 }
