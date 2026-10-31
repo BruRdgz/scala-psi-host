@@ -76,6 +76,9 @@ final class ScalaLanguageServer(
   @volatile private var projectRequested = false
   private val ending = new AtomicBoolean()
   private val documents = Executors.newSingleThreadExecutor(daemon("scala-psi-host-documents"))
+  private val builds = Executors.newSingleThreadExecutor(daemon("scala-psi-host-builds"))
+  // At most one compile waits behind the running one; every compile includes all Scala targets.
+  private val compileQueued = new AtomicBoolean()
   private val diagnostics = Executors.newSingleThreadScheduledExecutor(daemon("scala-psi-host-diagnostics"))
   private val session = new CompletableFuture[ProjectSession]
   // Each document's latest version, as the client numbers them; diagnostics of older versions are dropped.
@@ -299,6 +302,7 @@ final class ScalaLanguageServer(
   /** Stops request executors and closes a session already being opened, with the server's shutdown deadline. */
   private lazy val closing: CompletableFuture[AnyRef] = {
     documents.shutdownNow()
+    builds.shutdownNow()
     diagnostics.shutdownNow()
     val closed = if (!projectRequested) CompletableFuture.completedFuture[AnyRef](null)
     else session.handleAsync[AnyRef]((opened, error) => {
@@ -387,11 +391,13 @@ final class ScalaLanguageServer(
   private def pathOf(uri: String): Path = Path.of(URI.create(uri))
 
   /** A notification: handled in order on the documents thread; a failure is logged (a notification has no answer). */
-  private def onDocuments(kind: String)(action: ProjectSession => Unit): Unit =
+  private def onDocuments(kind: String)(action: ProjectSession => Unit): Unit = {
+    val submitted = System.nanoTime()
     documents.execute { () =>
-      try timed(kind, System.nanoTime())(action(session.join()))
+      try timed(kind, submitted)(action(session.join()))
       catch { case NonFatal(e) => HostLog.error(s"$kind failed", e) }
     }
+  }
 
   /** A request: answered in order on the documents thread; a failure is logged and answered as an error. */
   private def onDocuments[T](kind: String)(request: ProjectSession => T): CompletableFuture[T] = {
@@ -495,9 +501,19 @@ final class ScalaLanguageServer(
     /** Keeps project sources open until a build reimport or session shutdown, even after editor tabs close. */
     override def didClose(params: DidCloseTextDocumentParams): Unit = ()
 
-    /** Compiles the imported build after a save, then refreshes diagnostics that may have changed in other sources. */
-    override def didSave(params: DidSaveTextDocumentParams): Unit = onDocuments("compile on save") { s =>
-      s.compileBuild().foreach(scheduleDiagnostics)
+    /** Queues a build compile without holding up edits and requests; pending saves share the next compile. */
+    override def didSave(params: DidSaveTextDocumentParams): Unit = onDocuments("didSave") { s =>
+      if (compileQueued.compareAndSet(false, true)) {
+        val submitted = System.nanoTime()
+        builds.execute { () =>
+          compileQueued.set(false)
+          try timed("compile on save", submitted)(s.compileBuild().foreach(scheduleDiagnostics))
+          catch {
+            case _: InterruptedException => Thread.currentThread().interrupt()
+            case NonFatal(e) => HostLog.error("compile on save failed", e)
+          }
+        }
+      }
     }
 
     /** Returns the documentation at the requested project-source position as Markdown. */

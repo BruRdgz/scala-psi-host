@@ -21,9 +21,10 @@ import scala.util.Using
  * this API; edits update in-memory documents rather than saving files to disk. Source requests require a path
  * registered by the build and fail if a partial import has left the session unavailable.
  *
- * Callers serialize session operations and imports, as the LSP documents executor does. Only `isSource` and
- * `problems` support concurrent diagnostic work: their guard excludes partial host updates. `snapshot` provides
- * counts from the last completed import without waiting for the current one.
+ * Callers serialize document operations and imports, as the LSP documents executor does. `isSource` and
+ * `problems` support concurrent diagnostic work: their guard excludes partial host updates. `compileBuild` may
+ * run alongside document operations; BSP compilation, imports and closure are serialized within the session.
+ * `snapshot` provides counts from the last completed import without waiting for the current one.
  *
  * Close the session to release its BSP connection, formatter and document compiler. The shared host and its
  * mounted libraries remain owned by the process.
@@ -40,6 +41,9 @@ final class ProjectSession private (
   private val files = new ConcurrentHashMap[Path, PsiFile]()
   // Diagnostics run apart from the serialized documents executor; keep their source check/read outside a partial import.
   private val importSnapshotLock = new ReentrantReadWriteLock(true)
+  // Build compilation runs apart from document requests, but must never overlap a reload/import or BSP shutdown.
+  private val buildLock = new Object
+  @volatile private var closed = false
   // The build's modules as last imported (changed only by `importBuild`, on the session's thread).
   @volatile private var imported: Seq[ImportedModule] = Seq.empty
   @volatile private var compileSpecs: Map[String, CompileSpec] = Map.empty
@@ -98,8 +102,11 @@ final class ProjectSession private (
   /** Reads the last completed import's counts without waiting for ongoing updates. */
   private[scalapsihost] def snapshot: ProjectSession.Snapshot = lastImportedSnapshot
 
-  /** Throws the recorded unavailability error after a partial import failure. */
-  private def ensureUsable(): Unit = unavailable.foreach(message => throw new ProjectSession.Unavailable(message))
+  /** Rejects requests after closure or a partial import failure. */
+  private def ensureUsable(): Unit = {
+    if (closed) throw new IllegalStateException("the project session is closed")
+    unavailable.foreach(message => throw new ProjectSession.Unavailable(message))
+  }
 
   /** Marks the session unavailable under the caller's import guard and host write lock. */
   private def markUnavailable(error: Throwable): Unit = {
@@ -398,7 +405,7 @@ final class ProjectSession private (
    *               to build-definition files, or `false` to refresh modules and sources without reloading it
    * @param progress callback invoked synchronously on the calling thread as each stage starts; defaults to a no-op
    */
-  def importBuild(reload: Boolean, progress: String => Unit = _ => ()): Unit = {
+  def importBuild(reload: Boolean, progress: String => Unit = _ => ()): Unit = buildLock.synchronized {
     val start = System.nanoTime()
 
     /** Applies a prepared plan under both locks, recording mutation failures before unlocking. */
@@ -575,11 +582,12 @@ final class ProjectSession private (
    * Compiles the build and replaces the stored build diagnostics.
    *
    * This blocks on BSP and does not save editor buffers; document compilation is handled separately by `problems`.
+   * Document operations can continue during compilation. Imports and closure wait for its BSP request to finish.
    * The build can report compilation errors without throwing, in which case its diagnostics are still stored.
    *
    * @return `Set[Path]` of registered sources whose stored diagnostics changed and may need republishing
    */
-  def compileBuild(): Set[Path] = {
+  def compileBuild(): Set[Path] = buildLock.synchronized {
     ensureUsable()
 
     val previousProblems = buildProblems.get
@@ -593,12 +601,18 @@ final class ProjectSession private (
   /**
    * Releases the session's compiler, formatter and BSP connection.
    *
-   * Waits for in-flight document compilations before closing compiler loaders. Every resource is offered for
+   * Waits for in-flight build operations and document compilations before releasing their resources. Closing is
+   * idempotent. Every resource is offered for
    * closure even if another close fails; cleanup failures propagate with suppressed errors as managed by `Using`.
    * Callers must stop session operations before closing. Host modules, source PSI and mounted libraries remain
    * in the process-scoped host.
    */
-  override def close(): Unit = Using.resources(build, scalafmt, documentCompiler)((_, _, _) => ())
+  override def close(): Unit = buildLock.synchronized {
+    if (!closed) {
+      closed = true
+      Using.resources(build, scalafmt, documentCompiler)((_, _, _) => ())
+    }
+  }
 }
 
 /** Opens workspaces and defines the session's import-status and failure values. */

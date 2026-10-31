@@ -727,6 +727,49 @@ class LanguageServerTest extends munit.FunSuite {
       changes.map((path, kind) => new FileEvent(path.toUri.toString, kind)).asJava))
   }
 
+  test("saving the build leaves document requests responsive and groups pending saves") {
+    val service = implementation.getTextDocumentService
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    val compiling = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
+    val first = new java.util.concurrent.atomic.AtomicBoolean(true)
+    val finished = new LinkedBlockingQueue[String]()
+    val threshold = HostLog.threshold
+    HostLog.threshold = HostLog.Level.Debug
+    val sink = HostLog.addSink { entry =>
+      if (entry.message.startsWith("compile on save:") || entry.message.startsWith("slow: compile on save took")) {
+        if (first.compareAndSet(true, false)) {
+          compiling.countDown()
+          val released = release.await(30, TimeUnit.SECONDS)
+          assert(released, "the build worker was not released")
+        }
+        finished.add(Thread.currentThread().getName)
+      }
+    }
+    try {
+      service.didSave(new DidSaveTextDocumentParams(document(main)))
+      assert(compiling.await(1, TimeUnit.MINUTES), "the build did not compile")
+      for (_ <- 1 to 3) service.didSave(new DidSaveTextDocumentParams(document(main)))
+      service.didChange(new DidChangeTextDocumentParams(new VersionedTextDocumentIdentifier(main.toUri.toString, 40),
+        java.util.List.of(new TextDocumentContentChangeEvent("package app\nobject WhileCompiling\n"))))
+      val symbols = service.documentSymbol(new DocumentSymbolParams(document(main))).get(5, TimeUnit.SECONDS)
+      assertEquals(symbols.asScala.map(_.getRight.getName).toSeq, Seq("WhileCompiling"))
+      release.countDown()
+      assertEquals(Option(finished.poll(1, TimeUnit.MINUTES)), Some("scala-psi-host-builds"))
+      assertEquals(Option(finished.poll(1, TimeUnit.MINUTES)), Some("scala-psi-host-builds"))
+      val stats = implementation.status().join().get("requests").asInstanceOf[java.util.Map[String, Object]]
+      val compiles = stats.get("compile on save").asInstanceOf[java.util.Map[String, Object]]
+      assertEquals(compiles.get("count"), java.lang.Long.valueOf(2))
+    } finally {
+      release.countDown()
+      sink.close()
+      HostLog.threshold = threshold
+      service.didChange(new DidChangeTextDocumentParams(new VersionedTextDocumentIdentifier(main.toUri.toString, 41),
+        java.util.List.of(new TextDocumentContentChangeEvent(original))))
+      service.documentSymbol(new DocumentSymbolParams(document(main))).get(30, TimeUnit.SECONDS)
+    }
+  }
+
   test("opens a source file created after the import, and lets it go when it is deleted") {
     val added = fixture.resolve("core/src/main/scala/core/Added.scala")
     Files.writeString(added, "package core\n\nobject Added {\n  val n: Int = Counter.zero.current\n}\n")
