@@ -18,12 +18,13 @@ import scala.util.Using
 import scala.util.control.NonFatal
 
 /**
- * An open connection to a build server, through the Build Server Protocol (as other editors, and IntelliJ's BSP
- * support, talk to builds): it imports the build's modules and compiles them.
+ * Imports and compiles Scala modules over an initialized BSP connection.
  *
  * Only Scala targets (data kind `scala`) become modules: sbt's own build definition targets are left out. Classpath
  * entries that are directories (the class output of other targets) are dropped, since target dependencies are
  * modules' `dependsOn`.
+ * Callers serialize requests and close the connection after use. Closing ends this client process while
+ * leaving a build server shared by other clients available.
  */
 final class BuildConnection private[scalapsihost] (
   process: Process,
@@ -38,12 +39,11 @@ final class BuildConnection private[scalapsihost] (
   // A local shutdown handshake needs seconds, not the minutes allowed for importing and compiling a build.
   private val ShutdownDeadlineSeconds = 2L
   private val closed = new AtomicBoolean()
+  /** Caches Scala targets until a successful build reload. */
+  @volatile private var targets: Option[Seq[BuildTarget]] = None
 
   /** Waits with the connection's import/compile deadline and reports early process exit with its log path. */
   private def await[T](f: CompletableFuture[T]): T = BspImport.await(process, log, f, timeoutMinutes)
-
-  // The build's Scala targets, asked for once per build definition (again after a reload).
-  @volatile private var targets: Option[Seq[BuildTarget]] = None
 
   /** Loads and caches Scala build targets until [[reload]] invalidates the build definition. */
   private def scalaTargets: Seq[BuildTarget] = targets.getOrElse {
@@ -54,17 +54,25 @@ final class BuildConnection private[scalapsihost] (
     found
   }
 
-  /** The Scala modules, each after the modules it depends on. */
+  /**
+   * Imports Scala targets, source ownership and compiler settings.
+   *
+   * Stable target URIs identify modules even when display names collide. Duplicate identities, shared sources,
+   * missing dependencies and dependency cycles are rejected before a host can apply the result.
+   *
+   * @return imported modules ordered after their dependencies
+   */
   def modules(): Seq[ImportedModule] = {
-    val ids = scalaTargets.map(_.getId).asJava
+    val buildTargets = scalaTargets
+    val ids = buildTargets.map(_.getId).asJava
     val optionsById = await(server.buildTargetScalacOptions(new ScalacOptionsParams(ids))).getItems.asScala
       .map(item => item.getTarget -> item).toMap
     val sourcesById = await(server.buildTargetSources(new SourcesParams(ids))).getItems.asScala
       .map(item => item.getTarget -> item).toMap
-    val nameById = scalaTargets.map(t => t.getId -> BspImport.moduleName(t)).toMap
-    val identityById = scalaTargets.map(t => t.getId -> BspImport.targetIdentity(t)).toMap
+    val nameById = buildTargets.map(t => t.getId -> BspImport.moduleName(t)).toMap
+    val identityById = buildTargets.map(t => t.getId -> BspImport.targetIdentity(t)).toMap
 
-    val modules = scalaTargets.map { target =>
+    val imported = buildTargets.map { target =>
       val scala = gson.fromJson(target.getData.asInstanceOf[JsonElement], classOf[ScalaBuildTarget])
       val options = optionsById.getOrElse(target.getId,
         throw new IllegalStateException(s"build server sent no scalac options for ${target.getId.getUri}"))
@@ -87,20 +95,27 @@ final class BuildConnection private[scalapsihost] (
       )
       ImportedModule(spec, sourcesById.get(target.getId).toSeq.flatMap(BspImport.sourceFiles), compile)
     }
-    BspImport.dependenciesFirst(modules)
+    BspImport.dependenciesFirst(imported)
   }
 
-  /** Reloads the build's definition (after a change to it); the next [[modules]] describe the reloaded build. */
+  /**
+   * Reloads the build definition and invalidates cached targets after success.
+   *
+   * A failed reload leaves the cached targets intact; callers decide whether to retry the import.
+   */
   def reload(): Unit = {
     await(server.workspaceReload())
     targets = None
   }
 
   /**
-   * The source jars of the Scala modules' classpath jars, as the build server provides them (sbt downloads them on
-   * this request): classpath jar → its source jar. A source jar is paired with the classpath jar of the same name
-   * without `-sources`, next to it (as dependency caches lay them out); the others are left out. Nothing when the
-   * server does not provide dependency sources.
+   * Finds source archives for imported classpath jars.
+   *
+   * The request may download sources. A `-sources.jar` is paired only with a sibling classpath jar of the same
+   * base name. Servers without dependency-source support produce an empty result.
+   *
+   * @param classpath binary jar paths eligible for source attachments
+   * @return binary jar paths mapped to their source archives
    */
   def librarySources(classpath: Set[Path]): Map[Path, Path] =
     if (!Option(capabilities.getDependencySourcesProvider).exists(_.booleanValue)) Map.empty
@@ -115,8 +130,12 @@ final class BuildConnection private[scalapsihost] (
     }
 
   /**
-   * Compiles every Scala target (incrementally, as the build server does) and returns the compiler's problems by
-   * file. The server publishes them during the compile request, so they have all arrived when it answers.
+   * Requests an incremental compile of every Scala target.
+   *
+   * Diagnostics are published during the request and retained across compiles according to BSP reset flags.
+   * A compile error response is treated as a failed compile; other connection failures propagate.
+   *
+   * @return compile success and the latest published compiler diagnostics by file
    */
   def compile(): scalapsihost.build.CompileResult = {
     val succeeded =
@@ -130,8 +149,10 @@ final class BuildConnection private[scalapsihost] (
   }
 
   /**
-   * Ends the connection: the shutdown handshake, then the client process is killed if it overran it. The build's own
-   * server (sbt keeps one per build directory, shared by its clients) is left running.
+   * Shuts down the BSP connection and terminates its client process.
+   *
+   * Closing is idempotent. The handshake has a short deadline and process cleanup runs even when it fails.
+   * A build server shared by other clients remains running.
    */
   override def close(): Unit = if (closed.compareAndSet(false, true)) {
     val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(ShutdownDeadlineSeconds)
@@ -158,9 +179,15 @@ object BspImport {
   trait HostBuildServer extends BuildServer with ScalaBuildServer
 
   /**
-   * Starts the build server named by a connection file in `<project>/.bsp` and initializes it.
+   * Starts and initializes the BSP client process selected from a workspace's connection files.
    *
+   * Initialization includes a build reload so an already running server sees the current definition.
+   * Startup failures terminate the new client process; the caller owns the returned connection.
+   *
+   * @param projectDir workspace directory containing `.bsp` connection files
    * @param connection the connection file's name (e.g. `sbt`) when `.bsp` has several; with one it may be omitted
+   * @param timeoutMinutes deadline for each initialization, import or compile request
+   * @return an initialized connection ready to import modules
    */
   def connect(projectDir: Path, connection: Option[String] = None, timeoutMinutes: Long = 10): BuildConnection = {
     val details = connectionDetails(projectDir, connection)
@@ -202,14 +229,16 @@ object BspImport {
     }
   }
 
-  /** The build server's process ended, so it will answer no request. */
+  /**
+   * Reports that the BSP client process exited before answering a request.
+   *
+   * @param exitCode client process exit code
+   * @param log path containing its stderr output
+   */
   final class BuildServerExited(exitCode: Int, log: Path)
     extends RuntimeException(s"the build server exited (code $exitCode) without answering; its output: $log")
 
-  /**
-   * The build server's answer to a request. A server that exits never answers (sbt's exits when the build fails to
-   * load), so its exit ends the wait rather than the timeout.
-   */
+  /** Awaits a BSP response within its deadline, ending the wait early if the client process exits. */
   private[scalapsihost] def await[T](process: Process, log: Path, request: CompletableFuture[T], timeoutMinutes: Long): T = {
     val exited = process.onExit().thenApply[T](p => throw new BuildServerExited(p.exitValue(), log))
     try request.applyToEither(exited, answer => answer).get(timeoutMinutes, TimeUnit.MINUTES)
@@ -221,13 +250,25 @@ object BspImport {
     try { if (process.isAlive) process.destroyForcibly() }
     catch { case NonFatal(e) => HostLog.warn(s"could not kill build server ${process.pid()}", e) }
 
-  /** Imports the build's Scala modules, each after the modules it depends on, and disconnects. */
+  /**
+   * Imports Scala modules using a temporary BSP connection.
+   *
+   * The connection is closed after import, including on failure.
+   *
+   * @param projectDir workspace directory containing `.bsp` connection files
+   * @param connection connection filename without `.json`, required when several are available
+   * @param timeoutMinutes deadline for each BSP request
+   * @return imported modules ordered after their dependencies
+   */
   def importBuild(projectDir: Path, connection: Option[String] = None, timeoutMinutes: Long = 10): Seq[ImportedModule] =
     Using.resource(connect(projectDir, connection, timeoutMinutes))(_.modules())
 
   /** Each module after the modules it depends on, so they can be added to the host in order. */
   private[scalapsihost] def dependenciesFirst(modules: Seq[ImportedModule]): Seq[ImportedModule] = {
     val byId = scala.collection.mutable.LinkedHashMap.empty[String, ImportedModule]
+    val sourceOwners = scala.collection.mutable.LinkedHashMap.empty[Path, ImportedModule]
+    val ordered = scala.collection.mutable.LinkedHashMap.empty[String, ImportedModule]
+
     modules.foreach { module =>
       val id = module.spec.stableId
       if (id == null || id.isBlank)
@@ -237,9 +278,8 @@ object BspImport {
       byId(id) = module.copy(sources = module.sources.map(_.toAbsolutePath.normalize).distinct)
     }
 
-    val sourceOwners = scala.collection.mutable.LinkedHashMap.empty[Path, ImportedModule]
     byId.values.foreach { module =>
-      module.sources.map(_.toAbsolutePath.normalize).distinct.foreach { path =>
+      module.sources.foreach { path =>
         sourceOwners.get(path) match {
           case Some(owner) if owner.spec.stableId != module.spec.stableId =>
             throw new IllegalArgumentException(
@@ -258,7 +298,6 @@ object BspImport {
       throw new IllegalArgumentException(s"unknown module dependencies: ${details.mkString(", ")}")
     }
 
-    val ordered = scala.collection.mutable.LinkedHashMap.empty[String, ImportedModule]
     var waiting = byId.values.toSeq
     while (waiting.nonEmpty) {
       val (ready, blocked) = waiting.partition(_.spec.dependsOn.forall(ordered.contains))
@@ -297,13 +336,12 @@ object BspImport {
 
   /** The BSP target URI is stable across display-name collisions and build reloads. */
   private[scalapsihost] def targetIdentity(target: BuildTarget): String = {
-    val uri = Option(target.getId).flatMap(id => Option(id.getUri)).filter(_.nonEmpty)
+    Option(target.getId).flatMap(id => Option(id.getUri)).filter(_.nonEmpty)
       .getOrElse(throw new IllegalArgumentException(s"build target has no identity URI: ${target.getDisplayName}"))
-    uri
   }
 
   /** The only source extensions the host imports from BSP targets. */
-  private def isSource(path: Path) = path.toString.endsWith(".scala") || path.toString.endsWith(".java")
+  private def isSource(path: Path): Boolean = path.toString.endsWith(".scala") || path.toString.endsWith(".java")
 
   /** Resolves existing Scala and Java files from a BSP source item, expanding directory entries recursively. */
   private[scalapsihost] def sourceFiles(item: SourcesItem): Seq[Path] =
@@ -316,11 +354,7 @@ object BspImport {
       else Seq.empty
     }
 
-  /**
-   * Keeps the compiler problems the server publishes, per file and build target: a notification with `reset`
-   * replaces that pair's problems, one without adds to them (BSP `build/publishDiagnostics`). Logs and progress are
-   * not used.
-   */
+  /** Retains published diagnostics per source and target, replacing or appending according to BSP's reset flag. */
   private[scalapsihost] final class DiagnosticsClient extends BuildClient {
     private val published = new ConcurrentHashMap[(Path, BuildTargetIdentifier), Vector[CompilerDiagnostic]]()
 

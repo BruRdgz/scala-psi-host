@@ -21,10 +21,23 @@ import scala.util.control.NonFatal
 
 /** Scalafmt configuration lookup and failures shared by project sessions. */
 object ScalafmtFormatting {
-  /** A formatting/configuration failure surfaced to the LSP request. */
+  /**
+   * A formatting or configuration failure surfaced to the caller.
+   *
+   * @param message explanation suitable for the formatting response
+   * @param cause underlying failure, or null when absent
+   */
   final class Failed(message: String, cause: Throwable = null) extends RuntimeException(message, cause)
 
-  /** The nearest config inside the workspace; sources outside it use the workspace's config. */
+  /**
+   * Finds the nearest scalafmt configuration within the workspace.
+   *
+   * Sources outside the workspace use its root configuration. The search never ascends above the workspace root.
+   *
+   * @param root workspace directory
+   * @param file source path whose parent directories should be searched
+   * @return the nearest configuration, or none when the workspace contains no applicable configuration
+   */
   def configFor(root: Path, file: Path): Option[Path] = {
     val workspace = root.toAbsolutePath.normalize()
     var directory = file.toAbsolutePath.normalize().getParent
@@ -37,7 +50,14 @@ object ScalafmtFormatting {
   }
 }
 
-/** The plugin's scalafmt dynamic engine, with Maven Central artifacts cached under the host's state directory. */
+/**
+ * Formats Scala sources using the version declared by their scalafmt configuration.
+ *
+ * Runtime artifacts are resolved from Maven Central and cached on disk. Calls to format and close are serialized;
+ * the session owns this instance and clears its formatter resources when closing.
+ *
+ * @param cache directory for downloaded formatter dependencies
+ */
 final class ScalafmtFormatting(cache: Path) extends AutoCloseable {
   import ScalafmtFormatting.Failed
 
@@ -60,7 +80,17 @@ final class ScalafmtFormatting(cache: Path) extends AutoCloseable {
   private val formatter = new ScalafmtDynamic(downloader).withReporter(reporter).withRespectVersion(true)
     .withRespectProjectFilters(true)
 
-  /** Formats `text` at `file` with the declared scalafmt version and project filters. */
+  /**
+   * Formats a document snapshot with the configured scalafmt version and project filters.
+   *
+   * Cancellation is checked before and after formatting. Configuration, download and formatter failures
+   * are reported as [[ScalafmtFormatting.Failed]]; cancellation propagates unchanged.
+   *
+   * @param config scalafmt configuration file declaring the formatter version
+   * @param file source path used for dialect selection and project filters
+   * @param text current document contents
+   * @return formatted text, or the original text when excluded by project filters
+   */
   def format(config: Path, file: Path, text: String): String = synchronized {
     ProgressManager.checkCanceled()
     try {
@@ -131,5 +161,6 @@ final class ScalafmtFormatting(cache: Path) extends AutoCloseable {
     } finally ivy.getLoggerEngine.popLogger()
   }
 
+  /** Clears formatter sessions and class-loader caches after any active format call finishes. */
   override def close(): Unit = synchronized(formatter.clear())
 }

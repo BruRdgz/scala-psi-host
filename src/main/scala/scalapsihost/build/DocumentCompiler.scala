@@ -18,21 +18,30 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 /**
- * Compiles one document of a Scala 3 module with the module's own compiler, as the IDE's document compilation does
- * for compiler-based highlighting: the document's current text, against the module's classpath and class output,
- * up to the last phase that reports errors (before code generation), as the plugin's DocumentCompiler stops it.
+ * Compiles current document text with a Scala 3 module's own compiler.
  *
- * The compiler runs in a class loader of its own per set of compiler jars (kept, so later compilations reuse the
- * loaded compiler), apart from the host's own Scala, through the compiler's Java interface
- * (`dotty.tools.dotc.interfaces`). A project session owns this compiler and closes it after its in-flight compilations.
- * Scala 2 has no such interface; its files' errors come from the build's compile.
+ * Compilation uses the module's classpath and existing class output, stopping before code generation by default.
+ * Compiler loaders are isolated from the host's Scala and reused per set of compiler jars. The session must close
+ * this instance after use; close waits for in-flight compilations. Scala 2 diagnostics come from the build instead.
  */
 final class DocumentCompiler extends AutoCloseable {
   private val loaders = new ConcurrentHashMap[Seq[Path], URLClassLoader]()
   private val lifecycle = new ReentrantReadWriteLock(true)
   private var closed = false
 
-  /** The compiler's problems in `text`, the content of the module's file named `fileName`. */
+  /**
+   * Compiles a document snapshot and collects its diagnostics.
+   *
+   * Temporary source and output files are removed before returning. Compilation may run concurrently;
+   * cached class loaders remain open until this instance is closed.
+   *
+   * @param spec Scala 3 compiler settings for the source's module
+   * @param fileName source filename within the temporary compilation directory
+   * @param text current document contents
+   * @return compiler diagnostics, including run-level errors at the start of the document
+   * @throws UnsupportedOperationException when the module uses Scala 2
+   * @throws java.lang.IllegalStateException when this compiler has been closed
+   */
   def compile(spec: CompileSpec, fileName: String, text: String): Seq[CompilerDiagnostic] = {
     if (!spec.scalaVersion.startsWith("3."))
       throw new UnsupportedOperationException(
@@ -60,7 +69,11 @@ final class DocumentCompiler extends AutoCloseable {
     }
   }
 
-  /** Closes the compiler loaders after any in-flight document compilations have finished. */
+  /**
+   * Waits for active compilations and closes cached compiler loaders.
+   *
+   * Closing is idempotent. Every loader is attempted; later close failures are suppressed on the first.
+   */
   override def close(): Unit = {
     val writeLock = lifecycle.writeLock()
     writeLock.lock()
@@ -105,13 +118,13 @@ final class DocumentCompiler extends AutoCloseable {
 
   /** Runs dotc through its Java interface and collects diagnostics without linking the host to that Scala version. */
   private def runCompiler(loader: ClassLoader, args: Seq[String]): Seq[CompilerDiagnostic] = {
+    /** Calls a version-specific compiler-interface method without linking to that compiler version. */
+    def call(target: AnyRef, interface: Class[?], method: String): AnyRef = interface.getMethod(method).invoke(target)
+
     val reporterInterface = loader.loadClass("dotty.tools.dotc.interfaces.SimpleReporter")
     val callbackInterface = loader.loadClass("dotty.tools.dotc.interfaces.CompilerCallback")
     val diagnosticInterface = loader.loadClass("dotty.tools.dotc.interfaces.Diagnostic")
     val positionInterface = loader.loadClass("dotty.tools.dotc.interfaces.SourcePosition")
-    /** Calls a version-specific compiler-interface method without linking the host to that compiler version. */
-    def call(target: AnyRef, interface: Class[?], method: String): AnyRef = interface.getMethod(method).invoke(target)
-
     val reported = mutable.ArrayBuffer.empty[CompilerDiagnostic]
     val reporter: InvocationHandler = (proxy: AnyRef, method: Method, args: Array[AnyRef]) => method.getName match {
       case "report" =>
@@ -122,7 +135,8 @@ final class DocumentCompiler extends AutoCloseable {
         // A problem without a position is about the run, not the document. An error (e.g. a bad option) explains why
         // the document has no other problems, so it is reported at the start of the file; anything else (the
         // compiler's "N errors found" summary is a warning) is only logged.
-        def at(line: String, column: String) =
+        /** Reads compiler coordinates, locating a positionless run error at the document start. */
+        def at(line: String, column: String): LineColumn =
           if (position.isEmpty) LineColumn(0, 0)
           else LineColumn(call(position.get, positionInterface, line).asInstanceOf[Int], call(position.get, positionInterface, column).asInstanceOf[Int])
         if (position.isPresent || level == HighlightSeverity.ERROR)
@@ -140,7 +154,11 @@ final class DocumentCompiler extends AutoCloseable {
     val thread = Thread.currentThread
     val previousLoader = thread.getContextClassLoader
     thread.setContextClassLoader(loader)
-    try process.invoke(mainModule.getField("MODULE$").get(null), args.toArray, Proxy.newProxyInstance(loader, Array(reporterInterface), reporter), null)
+    try {
+      val compiler = mainModule.getField("MODULE$").get(null)
+      val simpleReporter = Proxy.newProxyInstance(loader, Array(reporterInterface), reporter)
+      process.invoke(compiler, args.toArray, simpleReporter, null)
+    }
     finally thread.setContextClassLoader(previousLoader)
     reported.toSeq
   }
