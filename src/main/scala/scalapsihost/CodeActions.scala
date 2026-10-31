@@ -7,6 +7,7 @@ import com.intellij.modcommand.{ActionContext, ModCommandExecutor}
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.util.TextRange
 import org.jetbrains.plugins.scala.ScalaBundle
+import org.jetbrains.plugins.scala.editor.importOptimizer.ScalaImportOptimizer
 import org.jetbrains.plugins.scala.autoImport.quickFix.{MemberToImport, PrefixPackageToImport, ScalaImportTypeFix}
 import org.jetbrains.plugins.scala.lang.psi.ScImportsHolder
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
@@ -31,6 +32,12 @@ object CodeActions {
 /** Plugin intentions and annotator fixes, applied through the platform's preview contract to a file copy. */
 final class CodeActions(intentionClasses: Seq[String], descriptorClasses: Seq[String]) {
   import CodeActions.{Candidate, Choice}
+
+  /** The plugin analyzes and rewrites imports on the preview copy, leaving the source unchanged. */
+  def organizeImports(file: ScalaFile): Choice = {
+    val (result, _) = preview(file)(copy => new ScalaImportOptimizer().processFile(copy).run())
+    Choice("Organize imports", "source.organizeImports", result.edits, None)
+  }
 
   def collect(file: ScalaFile, range: TextRange, problems: Seq[Diagnostic]): Seq[Choice] = {
     val project = file.getProject

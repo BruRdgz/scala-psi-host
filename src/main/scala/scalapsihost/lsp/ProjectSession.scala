@@ -393,12 +393,18 @@ final class ProjectSession private (
   }
 
   /** Applicable plugin actions, with edits against the current document. */
-  def codeActions(path: Path, start: LineColumn, end: LineColumn): Seq[(CodeActions.Choice, Seq[TextChange])] = host.read {
+  def codeActions(path: Path, start: LineColumn, end: LineColumn, only: Seq[String] = Seq.empty)
+      : Seq[(CodeActions.Choice, Seq[TextChange])] = host.read {
     file(path) match {
       case f: ScalaFile =>
         val d = document(f)
-        host.codeActions(f, new TextRange(offset(d, start), offset(d, end)))
-          .map(choice => choice -> choice.edits.map(textChange(d, _)))
+        def accepts(kind: String): Boolean = only.isEmpty || only.exists(k => kind == k || kind.startsWith(k + "."))
+        val contextual = if (accepts("quickfix") || accepts("refactor.rewrite"))
+          host.codeActions(f, new TextRange(offset(d, start), offset(d, end))).filter(choice => accepts(choice.kind))
+        else Seq.empty
+        val source = if (only.nonEmpty && accepts("source.organizeImports")) Seq(host.organizeImports(f)) else Seq.empty
+        val choices = contextual ++ source
+        choices.map(choice => choice -> choice.edits.map(textChange(d, _)))
       case _ => Seq.empty
     }
   }

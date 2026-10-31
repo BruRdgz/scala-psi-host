@@ -574,7 +574,21 @@ class LanguageServerTest extends munit.FunSuite {
       assertEquals(TestHost.applyEdits(text, changes), text.replace("value: Int", "value: String"))
       assertEquals(service.codeAction(params).get(1, TimeUnit.MINUTES).asScala.map(_.getRight.getTitle).toSeq,
         actions.map(_.getTitle).toSeq)
-    } finally change(original, 28)
+      val withImport = text.replace("object Action", "import scala.util.Try\nobject Action")
+      change(withImport, 28)
+      context.setOnly(java.util.List.of(CodeActionKind.Source))
+      params.setRange(new Range(new Position(0, 0), new Position(0, 0)))
+      val sourceActions = service.codeAction(params).get(1, TimeUnit.MINUTES).asScala.map(_.getRight)
+      assertEquals(sourceActions.map(_.getKind).toSeq, Seq(CodeActionKind.SourceOrganizeImports))
+      val sourceEdit = sourceActions.head.getEdit.getDocumentChanges.get(0).getLeft
+      assertEquals(sourceEdit.getTextDocument.getVersion, Integer.valueOf(28))
+      assert(!sourceEdit.getEdits.isEmpty)
+      context.setOnly(java.util.List.of(CodeActionKind.SourceOrganizeImports, CodeActionKind.QuickFix))
+      val shifted = new Position(2, column)
+      params.setRange(new Range(shifted, shifted))
+      val combined = service.codeAction(params).get(1, TimeUnit.MINUTES).asScala.map(_.getRight.getKind).toSet
+      assertEquals(combined, Set(CodeActionKind.SourceOrganizeImports, CodeActionKind.QuickFix))
+    } finally change(original, 29)
   }
 
   test("completion answers for its position while the user types on, as editors expect") {

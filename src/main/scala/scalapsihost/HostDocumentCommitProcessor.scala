@@ -40,6 +40,11 @@ final class HostDocumentCommitProcessor extends DocumentCommitProcessor {
 
 /** Mirrors the platform's postponed-formatting unblock without installing its editor event multicaster. */
 private[scalapsihost] final class HostPsiDocumentManager(project: Project) extends PsiDocumentManagerBase(project) {
+  // File-level changes such as ScalaImportOptimizer ask the manager for their preview copy's document.
+  override def getDocument(file: PsiFile): Document =
+    if (com.intellij.codeInsight.intention.preview.IntentionPreviewUtils.isPreviewElement(file)) file.getViewProvider.getDocument
+    else super.getDocument(file)
+
   /** The priority collector records event ranges before the manager decides whether a commit is needed. */
   def listenTo(document: Document): AutoCloseable = {
     val collector = new PriorityEventCollector

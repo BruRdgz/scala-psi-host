@@ -159,7 +159,8 @@ final class ScalaLanguageServer(
     capabilities.setTypeDefinitionProvider(true)
     capabilities.setReferencesProvider(true)
     capabilities.setImplementationProvider(true)
-    capabilities.setCodeActionProvider(new CodeActionOptions(java.util.List.of(CodeActionKind.QuickFix, CodeActionKind.RefactorRewrite)))
+    capabilities.setCodeActionProvider(new CodeActionOptions(java.util.List.of(
+      CodeActionKind.QuickFix, CodeActionKind.RefactorRewrite, CodeActionKind.SourceOrganizeImports)))
     capabilities.setRenameProvider(new RenameOptions(/* prepareProvider = */ true))
     capabilities.setWorkspaceSymbolProvider(true)
     capabilities.setDocumentHighlightProvider(true)
@@ -483,8 +484,7 @@ final class ScalaLanguageServer(
     override def codeAction(params: CodeActionParams): CompletableFuture[java.util.List[LspEither[Command, CodeAction]]] =
       onEditsRequest("codeAction", params.getTextDocument, java.util.List.of[LspEither[Command, CodeAction]]()) { (s, path) =>
         val requested = Option(params.getContext.getOnly).map(_.asScala.toSeq).getOrElse(Seq.empty)
-        s.codeActions(path, lineColumn(params.getRange.getStart), lineColumn(params.getRange.getEnd))
-          .filter { (choice, _) => requested.isEmpty || requested.exists(k => choice.kind == k || choice.kind.startsWith(k + ".")) }
+        s.codeActions(path, lineColumn(params.getRange.getStart), lineColumn(params.getRange.getEnd), requested)
           .map { (choice, changes) =>
             val action = new CodeAction(choice.title)
             action.setKind(choice.kind)

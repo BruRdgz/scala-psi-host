@@ -34,6 +34,10 @@ plugin's reference binding applies the chosen import on the copy. The plugin's i
 opens, edits and closes. Actions requiring dialogs, other files, or unsupported previews are unavailable.
 Inspections are not run.
 
+Organize imports is the plugin's `ScalaImportOptimizer`: it analyzes usage on a preview copy and returns versioned
+edits through `source.organizeImports`. It is computed only when the client requests source actions; contextual
+quick fixes can be requested alongside it. The original file remains unchanged until the editor applies the edits.
+
 Inlay hints come from the plugin's `ImplicitHintsPass`: inferred definition types, parameter names, implicit and
 `using` arguments, conversions, method chains and type arguments. The plugin's settings and defaults apply (parameter
 names and local/member variable types are off by default); implicit hints are enabled. Only the two range-hint
@@ -245,6 +249,12 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   **15 agree, 0 disagree, 12 skip**: custom setup and Scala 3 intention methods are not replayed. Test texts are
   extracted with Scala PSI and the same static string evaluator as CompletionOracle. Combined: **63/0/12**.
   Annotator fixes and conflicting type-import choices have focused host and JSON-RPC tests.
+- `oracle.OptimizeImportsOracle <intellij-scala> <report.md>` — the file fixtures in `testdata/optimize`, with
+  `OptimizeImportsTestBase`'s source/expected extraction and the suites' Scala versions and Unicode-arrow setting:
+  **53 agree, 1 disagree, 7 skip**. Simple/wildcard fixtures see their sibling sources. `simple/ImportChainUsed`
+  reorders a local import chain with colliding top-level `A` declarations in that setup; an isolated local-chain
+  regression preserves the dependency. Six skips require scalafmt and one custom scalastyle grouping. Inline test
+  methods and the IDE's notification text are not replayed.
 - `oracle.SelectionOracle <intellij-scala> <report.md>` — the plugin's selectioner tests, step by step: ScalaDoc
   2 agree, 1 disagree; interpolated strings 27 agree; ordinary strings 9 agree; no skips. The multiline/single-line
   helper runs both variants. See the trailing-newline disagreement below.

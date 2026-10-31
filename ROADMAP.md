@@ -52,7 +52,9 @@ The change engine and the formatter (beta 1), completion, signature help, select
   `SurroundWithTest`: 48 agree, 0 disagree, 0 skip; selected intention suites: 15 agree, 0 disagree, 12 skip.
   Type-import quick fixes offer each plugin candidate separately. Remaining: global-member/conversion imports
   and broader intention-oracle coverage. `testdata/actions` covers editor key handlers, not these intentions.
-- Organize imports (oracle: `optimize`), auto-import (oracle: `autoImport`), rename (with B; oracle: `refactoring`).
+- Organize imports. **Done:** `source.organizeImports` invokes the plugin optimizer on a preview copy;
+  `OptimizeImportsOracle`: 53 agree, 1 disagree, 7 skip, with the limits documented in README.
+- Auto-import of types and rename are implemented; their remaining search/preview gaps are in README.
 
 ## Beta 2 — completion and inspections
 

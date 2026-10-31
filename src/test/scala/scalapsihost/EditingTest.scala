@@ -386,6 +386,38 @@ class EditingTest extends munit.FunSuite {
     }
   }
 
+  test("organize imports removes unused imports on a copy and keeps used imports") {
+    TestHost.libraryReport
+    val original = "import scala.util.Try\nimport scala.collection.mutable.ArrayBuffer\n\n" +
+      "object Organized { val buffer = ArrayBuffer.empty[Int] }\n"
+    val file = scalaFile("Organized", original)
+    try {
+      val action = host.organizeImports(file)
+      val changed = applyEdits(original, action.edits)
+      assertEquals(changed, original.replace("import scala.util.Try\n", ""))
+      assertEquals(host.read(file.getText), original)
+      host.edit(file, 0, original.length, changed)
+      assertEquals(host.organizeImports(file).edits, Seq.empty)
+    } finally host.closeSource(file)
+  }
+
+  test("organize imports preserves a local import dependency") {
+    val original = """object LocalChain {
+      |  object R {
+      |    object C {
+      |      class D
+      |    }
+      |  }
+      |
+      |  import R._
+      |  import C.D
+      |  val x : D = new D
+      |}""".stripMargin
+    val file = scalaFile("LocalChain", original)
+    try assertEquals(applyEdits(original, host.organizeImports(file).edits), original)
+    finally host.closeSource(file)
+  }
+
   test("IntelliJ formatting returns minimal edits with request indentation") {
     val text = "object FormatMe {\nval emoji=\"😀\"\nval n=1+2\n}\n"
     val file = host.openFile(Path.of("/editing/FormatMe.scala"), text, module) match {

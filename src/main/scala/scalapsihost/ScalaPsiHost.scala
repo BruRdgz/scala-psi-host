@@ -374,6 +374,8 @@ final class ScalaPsiHost private (
     org.jetbrains.plugins.scala.settings.ScalaHighlightingMode.isShowErrorsFromCompilerEnabled(file)
   }
 
+  def organizeImports(file: ScalaFile): CodeActions.Choice = read(actions.organizeImports(file))
+
   /** Text actions for the selected range, preserving their annotator fixes and previewing on file copies. */
   def codeActions(file: ScalaFile, range: TextRange): Seq[CodeActions.Choice] =
     read(actions.collect(file, range, diagnostics(file)))
