@@ -7,7 +7,7 @@ import scalapsihost.LineColumn
 
 import scala.jdk.CollectionConverters.*
 
-/** The LSP semantic-token legend and relative integer encoding for workspace semantic categories. */
+/** Maps protocol-neutral semantic tokens to the LSP legend and relative integer encoding. */
 object SemanticColoring {
   private val types = Seq(
     SemanticTokenTypes.Namespace, SemanticTokenTypes.Type, SemanticTokenTypes.Class, SemanticTokenTypes.Enum,
@@ -17,7 +17,11 @@ object SemanticColoring {
   )
   private val modifiers = Seq(SemanticTokenModifiers.Readonly, SemanticTokenModifiers.Abstract, SemanticTokenModifiers.Declaration)
 
-  /** The token types and modifiers whose indexes are used by [[encode]]. */
+  /**
+   * The token-type and modifier ordering used by [[encode]].
+   *
+   * Advertise this legend unchanged for the lifetime of the server.
+   */
   val legend: SemanticTokensLegend = new SemanticTokensLegend(types.asJava, modifiers.asJava)
 
   private val kindType: Map[SemanticTokenKind, String] = Map(
@@ -44,8 +48,13 @@ object SemanticColoring {
   )
 
   /**
-   * Encodes workspace tokens for LSP. Tokens may not overlap: among equal ranges the last wins, and an overlapping
-   * later range is dropped.
+   * Encodes semantic tokens as LSP delta tuples.
+   *
+   * Tokens are sorted by position. Equal ranges keep the last input token; later overlapping ranges are dropped.
+   * Input positions and lengths use UTF-16 code units and each token must fit within one line.
+   *
+   * @param tokens tokens expressed in the language model's categories
+   * @return flattened delta-line, delta-column, length, type-index and modifier-bit tuples
    */
   def encode(tokens: Seq[SemanticToken]): Seq[Int] = {
     val lastPerRange = tokens.groupMapReduce(token => (token.start, token.length))(identity)((_, later) => later).values

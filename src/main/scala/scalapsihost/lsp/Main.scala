@@ -29,12 +29,22 @@ object Main {
   // Child-process hooks only send kill signals; a stuck platform hook must not keep the JVM alive after cleanup.
   private val HaltDelayMs = 1000L
 
-  /** Starts the host, installs its log sinks and serves the language server on standard input and output. */
+  /**
+   * Starts the PSI host and serves LSP on standard input and output.
+   *
+   * Configuration comes from the system properties and environment described on [[Main]]. Standard output is
+   * reserved for protocol traffic; other process output is redirected to standard error.
+   *
+   * @param args launcher arguments, currently unused
+   */
   def main(args: Array[String]): Unit = {
+    /** Reads required launcher configuration, failing before the host is started when it is absent. */
+    def property(name: String): String =
+      sys.props.getOrElse(name, throw new IllegalArgumentException(s"system property $name is not set"))
+
     // Stdout carries the protocol: anything else printed there would corrupt it, so it goes to stderr.
     val protocolOut = System.out
     System.setOut(System.err)
-    def property(name: String) = sys.props.getOrElse(name, throw new IllegalArgumentException(s"system property $name is not set"))
     val stateDir = Path.of(property("scalapsihost.stateDir"))
     if (sys.env.get("SCALA_PSI_HOST_LOG").exists(_.equalsIgnoreCase("debug"))) HostLog.threshold = HostLog.Level.Debug
     val logFile = openLogFile(stateDir.resolve("logs"))
@@ -44,11 +54,11 @@ object Main {
 
     val heap = Runtime.getRuntime.maxMemory / (1024 * 1024)
     HostLog.info(s"scala-psi-host 0.1 starting: JDK ${System.getProperty("java.version")}, heap max $heap MB, state $stateDir, log $logFile")
-    val host = HostLog.timed("host started")(ScalaPsiHost.start(HostConfig(
+    val host = try HostLog.timed("host started")(ScalaPsiHost.start(HostConfig(
       stateDir = stateDir,
       scalaPluginJars = property("scalapsihost.scalaPluginJars").split(File.pathSeparator).toSeq.map(Path.of(_)),
     )))
-    buffering.close()
+    finally buffering.close()
     val server = new ScalaLanguageServer(host, code => {
       val watchdog = new Thread(() => {
         Thread.sleep(HaltDelayMs)
@@ -69,13 +79,15 @@ object Main {
       .setInput(input)
       .setOutput(output)
       .create()
-    server.connect(launcher.getRemoteProxy)
-    try launcher.startListening().get()
-    catch { case NonFatal(e) => HostLog.warn("client transport failed", e) }
+    try {
+      server.connect(launcher.getRemoteProxy)
+      try launcher.startListening().get()
+      catch { case NonFatal(e) => HostLog.warn("client transport failed", e) }
+    }
     finally server.exit()
   }
 
-  /** A new log file in `directory`, written as entries are logged; the oldest logs beyond [[KeptLogs]] are deleted. */
+  /** Opens a process-lifetime log sink and retains only the newest KeptLogs files. */
   private def openLogFile(directory: Path): Path = {
     Files.createDirectories(directory)
     val name = s"scala-psi-host-${LocalDateTime.now.format(DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"))}-${ProcessHandle.current.pid}.log"

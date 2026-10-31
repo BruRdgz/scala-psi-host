@@ -7,11 +7,12 @@ import org.eclipse.lsp4j.launch.LSPLauncher
 
 import scalapsihost.TestHost
 import scalapsihost.language.{ChangeEngine}
-import scalapsihost.platform.{HostLock}
+import scalapsihost.platform.{HostLock, HostLog}
 import scalapsihost.workspace.{ProjectSession}
 
-import java.io.{ByteArrayInputStream, ByteArrayOutputStream, PipedInputStream, PipedOutputStream}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, OutputStream, PipedInputStream, PipedOutputStream}
 import java.nio.file.{Files, Path}
+import java.time.Instant
 import java.util.{List as JavaList}
 import java.util.concurrent.{CompletableFuture, LinkedBlockingQueue, TimeUnit}
 
@@ -140,6 +141,31 @@ class LanguageServerTest extends munit.FunSuite {
       implementation.exit()
       assert(exited.isEmpty, "exit was called more than once")
     }
+  }
+
+  test("ends if transport linkage fails while forwarding startup logs during connection") {
+    val exited = new LinkedBlockingQueue[Int]()
+    // lsp4j absorbs notification Exceptions; linkage failures propagate and still require server cleanup.
+    val failureToLink = new NoClassDefFoundError("missing transport dependency")
+    val output = new OutputStream {
+      override def write(value: Int): Unit = throw failureToLink
+    }
+    val implementation = new ScalaLanguageServer(TestHost.host, code => { exited.add(code); () },
+      startupLog = Seq(HostLog.Entry(Instant.now(), HostLog.Level.Info, "startup")))
+
+    try {
+      // MUnit's intercept handles only NonFatal; catch the injected linkage failure explicitly.
+      val failure = try {
+        Main.listen(implementation, new ByteArrayInputStream(Array.emptyByteArray), output)
+        None
+      } catch {
+        case error: NoClassDefFoundError => Some(error)
+      }
+      assertEquals(failure, Some(failureToLink))
+      assertEquals(Option(exited.poll(10, TimeUnit.SECONDS)), Some(1))
+      implementation.exit()
+      assert(exited.isEmpty, "exit was called more than once")
+    } finally implementation.exit()
   }
 
   test("ends when the watched client process exits without an exit notification") {

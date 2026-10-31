@@ -24,17 +24,18 @@ import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
 /**
- * The language server: LSP over a [[ProjectSession]] of the workspace's build.
+ * Serves LSP requests over the workspace's imported build session.
  *
  * Document notifications and requests run in order on one thread, so a request sees every change sent
  * before it; the project is opened there first, so `initialize` answers at once. Diagnostics are computed on
  * another thread, a short while after a document's last change: a change cancels a computation in progress (the
  * host's write lock cancels running queries), and a result is published only for the document's current version.
  *
- * What the server does is logged ([[HostLog]]) and sent to the client as log messages; opening and importing the
+ * What the server does is logged ([[scalapsihost.platform.HostLog]]) and sent to the client as log messages; opening and importing the
  * project are reported as progress, and its state (see [[HostProtocol]]) as it changes. Requests are timed: slow ones
  * are logged, and every one at debug level.
  *
+ * @param host process-owned PSI host used by the workspace session
  * @param exitProcess ends the server's process with the given code when the client exits or disappears (0 after a
  *                    `shutdown` request, 1 otherwise, as LSP defines); nothing for a server embedded in another process
  * @param logFile     where the log is written, for messages that point to it
@@ -52,6 +53,10 @@ final class ScalaLanguageServer(
   private val SlowRequestMs = 1000L
   // Allows a short BSP shutdown handshake, but never waits for a full build import when the client has gone.
   private val EndingDeadlineSeconds = 5L
+  // Progress cannot start until the client acknowledges its token; bound that UI handshake separately from import.
+  private val ProgressRegistrationDeadlineSeconds = 30L
+  // Status is a compact report; the full bounded warning/error history remains in HostLog.
+  private val ReportedProblems = 20
 
   @volatile private var client: LanguageClient = scala.compiletime.uninitialized
   private var clientLog: Option[AutoCloseable] = None
@@ -85,7 +90,14 @@ final class ScalaLanguageServer(
     thread
   }
 
-  /** Attaches the LSP client and forwards buffered startup and subsequent host log entries to it. */
+  /**
+   * Attaches the client and begins forwarding host log entries.
+   *
+   * Connect once before initialization. Buffered startup entries are sent before subscribing to subsequent logs;
+   * the subscription is removed during server exit.
+   *
+   * @param client remote LSP client
+   */
   override def connect(client: LanguageClient): Unit = {
     this.client = client
     startupLog.foreach(sendLog)
@@ -117,10 +129,12 @@ final class ScalaLanguageServer(
     if (!reportsProgress) body(_ => ())
     else {
       val token = LspEither.forLeft[String, Integer](s"scala-psi-host-${progressTokens.incrementAndGet()}")
-      // The client must know the token before progress is reported on it.
-      client.createProgress(new WorkDoneProgressCreateParams(token)).get(30, TimeUnit.SECONDS)
-      def send(value: WorkDoneProgressNotification) =
+      /** Sends a progress update after the client has acknowledged the token. */
+      def send(value: WorkDoneProgressNotification): Unit =
         client.notifyProgress(new ProgressParams(token, LspEither.forLeft[WorkDoneProgressNotification, Object](value)))
+
+      // The client must know the token before progress is reported on it.
+      client.createProgress(new WorkDoneProgressCreateParams(token)).get(ProgressRegistrationDeadlineSeconds, TimeUnit.SECONDS)
       val begin = new WorkDoneProgressBegin
       begin.setTitle(title)
       send(begin)
@@ -134,8 +148,9 @@ final class ScalaLanguageServer(
 
   /** Imports the build again (see [[ProjectSession.importBuild]]), as progress and server state. */
   private[lsp] def importAgain(s: ProjectSession, reload: Boolean): Unit = {
-    setState("importing", "importing the build again")
     var importReturned = false
+
+    setState("importing", "importing the build again")
     try {
       withProgress("scala-psi-host: importing the build") { progress =>
         s.importBuild(reload, progress)
@@ -157,14 +172,26 @@ final class ScalaLanguageServer(
     }
   }
 
-  /** Negotiates client features, records the workspace root and returns the LSP capabilities this server implements. */
+  /**
+   * Negotiates client features and advertises the server's LSP capabilities.
+   *
+   * Uses the first workspace folder, falling back to the root URI. Build import begins only after `initialized`,
+   * so this response does not wait for the project to open.
+   *
+   * @param params client capabilities, workspace root and optional client process information
+   * @return an already completed future containing server capabilities and identity
+   * @throws IllegalArgumentException when neither a workspace folder nor a root URI is supplied
+   */
   override def initialize(params: InitializeParams): CompletableFuture[InitializeResult] = {
     val offered = Option(params.getCapabilities)
-    watchesFiles = offered.flatMap(c => Option(c.getWorkspace)).flatMap(w => Option(w.getDidChangeWatchedFiles))
+    val workspaceCapabilities = offered.flatMap(c => Option(c.getWorkspace))
+    val windowCapabilities = offered.flatMap(c => Option(c.getWindow))
+
+    watchesFiles = workspaceCapabilities.flatMap(w => Option(w.getDidChangeWatchedFiles))
       .flatMap(w => Option(w.getDynamicRegistration)).exists(_.booleanValue)
-    reportsProgress = offered.flatMap(c => Option(c.getWindow)).flatMap(w => Option(w.getWorkDoneProgress)).exists(_.booleanValue)
-    appliesEdits = offered.flatMap(c => Option(c.getWorkspace)).flatMap(w => Option(w.getApplyEdit)).exists(_.booleanValue)
-    showsDocuments = offered.flatMap(c => Option(c.getWindow)).flatMap(w => Option(w.getShowDocument))
+    reportsProgress = windowCapabilities.flatMap(w => Option(w.getWorkDoneProgress)).exists(_.booleanValue)
+    appliesEdits = workspaceCapabilities.flatMap(w => Option(w.getApplyEdit)).exists(_.booleanValue)
+    showsDocuments = windowCapabilities.flatMap(w => Option(w.getShowDocument))
       .exists(_.isSupport)
     val folders = Option(params.getWorkspaceFolders).map(_.asScala.toSeq).getOrElse(Seq.empty)
     val rootUri = folders.headOption.map(_.getUri).orElse(Option(params.getRootUri))
@@ -208,8 +235,12 @@ final class ScalaLanguageServer(
   }
 
   /**
-   * Asks the client to report changes to the build's definition (sbt files, `project/`) and created or deleted source
-   * files: either makes the server import the build again (see [[ProjectSession.importBuild]]).
+   * Queues the initial build import and registers supported file watchers.
+   *
+   * Build-definition changes and source creation/deletion trigger reimports. Watchers are registered only when
+   * the client advertises dynamic registration support.
+   *
+   * @param params notification that the client is ready for server-initiated requests
    */
   override def initialized(params: InitializedParams): Unit = {
     workspace.foreach(openProject)
@@ -224,10 +255,7 @@ final class ScalaLanguageServer(
     }
   }
 
-  /**
-   * Opens the project, reporting it as progress. Only after `initialized`: until then the client may not take the
-   * server's requests (VS Code answers the progress request as an unhandled method).
-   */
+  /** Queues project opening after client initialization, reporting progress, readiness or startup failure. */
   private def openProject(root: Path): Unit = {
     projectRequested = true
     documents.execute { () =>
@@ -252,7 +280,14 @@ final class ScalaLanguageServer(
     }
   }
 
-  /** Answers null once the project is closed, also when closing it failed or overran: the client then sends `exit`. */
+  /**
+   * Requests session shutdown and stops request executors.
+   *
+   * Cleanup failures and deadline expiry are logged and converted into a successful null response.
+   * The client is still expected to send `exit` afterward.
+   *
+   * @return a future completing with null after cleanup succeeds, fails or reaches its deadline
+   */
   override def shutdown(): CompletableFuture[AnyRef] = {
     shutdownRequested = true
     closing.exceptionally { e =>
@@ -273,7 +308,12 @@ final class ScalaLanguageServer(
     closed.orTimeout(EndingDeadlineSeconds, TimeUnit.SECONDS)
   }
 
-  /** What closing the project logs still goes to the client, while it listens; only then is its log closed. */
+  /**
+   * Ends the server lifecycle and invokes the configured process-exit callback once.
+   *
+   * Session cleanup is bounded by the shutdown deadline. Logs remain subscribed during cleanup, then detach.
+   * The callback receives 0 after `shutdown`, or 1 when the client disappears without requesting shutdown.
+   */
   override def exit(): Unit = if (ending.compareAndSet(false, true)) {
     HostLog.info(s"exiting (${if (shutdownRequested) "after a shutdown request" else "without a shutdown request"})")
     try closing.get(EndingDeadlineSeconds, TimeUnit.SECONDS)
@@ -289,14 +329,19 @@ final class ScalaLanguageServer(
   }
 
   /**
-   * The server's status: its state, the project, memory, request latencies (since it started), the problems it logged
-   * and the adapter calls outside the host's tables. Answered at once, also while the project opens.
+   * Captures server state, project counts, memory, request latencies and logged problems.
+   *
+   * Answers immediately while import is in progress. Individual counters may continue to change during collection;
+   * the report is an operational snapshot rather than an atomic view of the entire server.
+   *
+   * @return an already completed future containing the host-specific status fields
    */
   override def status(): CompletableFuture[java.util.Map[String, Object]] = {
+    /** Builds an ordered heterogeneous object for lsp4j's JSON serialization. */
     def map(entries: (String, Any)*): java.util.Map[String, Object] = {
-      val m = new java.util.LinkedHashMap[String, Object]()
-      entries.foreach((k, v) => m.put(k, v.asInstanceOf[Object]))
-      m
+      val fields = new java.util.LinkedHashMap[String, Object]()
+      entries.foreach((name, value) => fields.put(name, value.asInstanceOf[Object]))
+      fields
     }
     val heap = Runtime.getRuntime
     val opened = if (session.isDone && !session.isCompletedExceptionally) Some(session.join()) else None
@@ -318,14 +363,22 @@ final class ScalaLanguageServer(
       "logged" -> map("errors" -> java.lang.Long.valueOf(HostLog.count(HostLog.Level.Error)),
         "warnings" -> java.lang.Long.valueOf(HostLog.count(HostLog.Level.Warn))),
       "unsupportedAdapterCalls" -> CallLog.snapshot.map(_._1).filter(_.startsWith("UNSUPPORTED ")).map(_.stripPrefix("UNSUPPORTED ")).asJava,
-      "recentProblems" -> HostLog.recentProblems.takeRight(20).map(_.toString.linesIterator.next()).asJava,
+      "recentProblems" -> HostLog.recentProblems.takeRight(ReportedProblems).map(_.toString.linesIterator.next()).asJava,
     ))
   }
 
-  /** The LSP4J text-document service backed by the ordered documents executor. */
+  /**
+   * Exposes text-document requests and notifications.
+   *
+   * @return the service backed by the ordered documents executor
+   */
   override def getTextDocumentService: TextDocumentService = TextDocuments
 
-  /** The LSP4J workspace service for commands, workspace symbols and watched-file changes. */
+  /**
+   * Exposes workspace commands, symbol queries and watched-file notifications.
+   *
+   * @return the workspace service backed by the ordered documents executor
+   */
   override def getWorkspaceService: WorkspaceService = Workspace
 
   // ---- Documents -------------------------------------------------------------------------------------------------
@@ -369,10 +422,11 @@ final class ScalaLanguageServer(
     val started = System.nanoTime()
     try body
     finally {
-      val (total, waited) = ((System.nanoTime() - submitted) / 1_000_000, (started - submitted) / 1_000_000)
-      requests.record(kind, total)
-      if (total >= SlowRequestMs) HostLog.warn(s"slow: $kind took $total ms ($waited ms waiting for other work)")
-      else HostLog.debug(s"$kind: $total ms ($waited ms waiting)")
+      val totalMs = (System.nanoTime() - submitted) / 1_000_000
+      val waitedMs = (started - submitted) / 1_000_000
+      requests.record(kind, totalMs)
+      if (totalMs >= SlowRequestMs) HostLog.warn(s"slow: $kind took $totalMs ms ($waitedMs ms waiting for other work)")
+      else HostLog.debug(s"$kind: $totalMs ms ($waitedMs ms waiting)")
     }
   }
 
@@ -385,18 +439,15 @@ final class ScalaLanguageServer(
     onDocuments(kind)(s => sourcePath(s, document.getUri).fold(outside)(request(s, _)))
 
   /** Builds the JSON-RPC error used to reject an LSP request with the supplied protocol code. */
-  private def requestError(code: ResponseErrorCode, message: String) =
+  private def requestError(code: ResponseErrorCode, message: String): ResponseErrorException =
     new ResponseErrorException(new ResponseError(code, message, null))
 
-  /**
-   * A request answered with edits the editor applies to the document as it is (formatting): an edit received after
-   * the request would make them apply to text they were not computed for, so the request is answered as cancelled.
-   * Completion is not one: its items are for the position it was asked at, and the editor narrows them down itself
-   * as the user types on.
-   */
+  /** Rejects edit-producing responses if any newer edit has arrived since submission. */
   private def onEditsRequest[T](kind: String, document: TextDocumentIdentifier, outside: => T)
                                (request: (ProjectSession, Path) => T): CompletableFuture[T] = {
     val received = editsReceived.get()
+    // Completion lists use no edit guard: clients filter suggestions as the user continues typing.
+    /** Checks incoming edits even before they reach the ordered documents executor. */
     def checkNoNewerEdit(): Unit = if (editsReceived.get() != received) throw new ProcessCanceledException
     onSource(kind, document, outside) { (s, path) =>
       checkNoNewerEdit()
@@ -592,10 +643,11 @@ final class ScalaLanguageServer(
     override def documentSymbol(params: DocumentSymbolParams)
         : CompletableFuture[java.util.List[LspEither[SymbolInformation, DocumentSymbol]]] =
       onSource("documentSymbol", params.getTextDocument, java.util.List.of[LspEither[SymbolInformation, DocumentSymbol]]()) { (s, path) =>
+        /** Converts an outline declaration and its nested children to LSP document symbols. */
         def symbol(o: OutlineSymbol): DocumentSymbol = {
-          val d = new DocumentSymbol(o.name, lspSymbolKind(o.kind), range(o.range), range(o.nameRange), o.detail)
-          d.setChildren(o.children.map(symbol).asJava)
-          d
+          val converted = new DocumentSymbol(o.name, lspSymbolKind(o.kind), range(o.range), range(o.nameRange), o.detail)
+          converted.setChildren(o.children.map(symbol).asJava)
+          converted
         }
         s.outline(path).map(o => LspEither.forRight[SymbolInformation, DocumentSymbol](symbol(o))).asJava
       }
@@ -653,14 +705,14 @@ final class ScalaLanguageServer(
 
   /** Converts a host diagnostic to LSP severity, range and source fields. */
   private def diagnostic(problem: FileProblem): org.eclipse.lsp4j.Diagnostic = {
-    val d = new org.eclipse.lsp4j.Diagnostic(new Range(position(problem.start), position(problem.end)), problem.message)
-    d.setSeverity(problem.severity match {
+    val converted = new org.eclipse.lsp4j.Diagnostic(new Range(position(problem.start), position(problem.end)), problem.message)
+    converted.setSeverity(problem.severity match {
       case ProblemSeverity.Error => DiagnosticSeverity.Error
       case ProblemSeverity.Warning => DiagnosticSeverity.Warning
       case ProblemSeverity.Information => DiagnosticSeverity.Information
     })
-    d.setSource(problem.source)
-    d
+    converted.setSource(problem.source)
+    converted
   }
 
   /** Converts the LSP's zero-based UTF-16 position to the session's equivalent coordinate. */
@@ -681,6 +733,7 @@ final class ScalaLanguageServer(
   /** Converts a sequence of session edits to the Java list expected by LSP4J. */
   private def textEdits(changes: Seq[TextChange]): java.util.List[TextEdit] = changes.map(textEdit).asJava
 
+  /** Maps protocol-neutral declaration categories to LSP symbol kinds. */
   private def lspSymbolKind(kind: WorkspaceSymbolKind): SymbolKind = kind match {
     case WorkspaceSymbolKind.EnumMember => SymbolKind.EnumMember
     case WorkspaceSymbolKind.Enum => SymbolKind.Enum
@@ -697,6 +750,7 @@ final class ScalaLanguageServer(
     case WorkspaceSymbolKind.Object => SymbolKind.Object
   }
 
+  /** Maps host completion categories to LSP completion-item kinds. */
   private def lspCompletionKind(kind: Completion.Kind): CompletionItemKind = kind match {
     case Completion.Kind.EnumMember => CompletionItemKind.EnumMember
     case Completion.Kind.Enum => CompletionItemKind.Enum
@@ -712,14 +766,12 @@ final class ScalaLanguageServer(
     case Completion.Kind.Keyword => CompletionItemKind.Keyword
   }
 
-  /**
-   * A suggestion as a completion item: its lookup string replaces the prefix. When the suggestion has an insert
-   * handler, the item's command runs it once the user has chosen it, as the IDE does (see CompleteInsertion).
-   */
+  /** Encodes a ranked suggestion and attaches insertion replay when the client can apply follow-up edits. */
   private def completionItem(uri: String, choice: CompletionChoice, rank: Int): CompletionItem = {
     val suggestion = choice.suggestion
     val item = new CompletionItem(suggestion.label)
     val details = new CompletionItemLabelDetails
+
     details.setDetail(suggestion.tail.orNull)
     details.setDescription(suggestion.typeText.orNull)
     item.setLabelDetails(details)
@@ -754,10 +806,7 @@ final class ScalaLanguageServer(
     new SignatureHelp(signatures.asJava, found.active.map(Integer.valueOf).getOrElse(Integer.valueOf(0)), null)
   }
 
-  /**
-   * Applies what a chosen suggestion's insert handler changes, to the document version it was computed for (the
-   * editor refuses it if the user has typed on meanwhile), then moves the caret where the handler left it.
-   */
+  /** Applies a versioned insertion follow-up and moves the caret only after the client accepts its edits. */
   private def applyFollowUp(uri: String, version: Integer, followUp: CompletionFollowUp): Unit =
     if (followUp.changes.nonEmpty) {
       val edit = new TextDocumentEdit(new VersionedTextDocumentIdentifier(uri, version), textEdits(followUp.changes))
@@ -789,7 +838,10 @@ final class ScalaLanguageServer(
           val uri = arguments(0).getAsString
           val start = LineColumn(arguments(1).getAsInt, arguments(2).getAsInt)
           onSource("completion insertion", new TextDocumentIdentifier(uri), null) { (s, path) =>
-            s.insertCompletion(path, start, arguments(3).getAsString, arguments(4).getAsString, arguments(5).getAsString)
+            val prefixText = arguments(3).getAsString
+            val lookup = arguments(4).getAsString
+            val identity = arguments(5).getAsString
+            s.insertCompletion(path, start, prefixText, lookup, identity)
               .foreach(applyFollowUp(uri, versions.get(path), _))
             null
           }
@@ -819,11 +871,7 @@ final class ScalaLanguageServer(
   }
 }
 
-/**
- * The command of a completion item whose suggestion has an insert handler: the editor runs it once the user has
- * chosen the item and its lookup string is in the document. Arguments: the document's URI, the line and column where
- * the lookup string starts, the prefix it replaced, the lookup string, and the suggestion's identity.
- */
+/** Replays insertion after the client has inserted a completion item's lookup text. */
 private val CompleteInsertion = "scalaPsiHost.completeInsertion"
 
 /** Which files define an sbt build: the client watches them, and a change to one reloads the build. */
@@ -848,6 +896,7 @@ private final class RequestStats {
   /** Aggregate count, recent-window percentiles and lifetime maximum for one request kind. */
   final case class Summary(count: Long, p50: Long, p95: Long, max: Long)
 
+  /** Retains one request kind's lifetime totals and bounded latency window. */
   private final class Kind {
     /** Number of requests recorded since startup. */
     var count = 0L
@@ -861,19 +910,20 @@ private final class RequestStats {
 
   /** Adds one duration to the kind's lifetime totals and bounded percentile window. */
   def record(kind: String, ms: Long): Unit = kinds.synchronized {
-    val k = kinds.computeIfAbsent(kind, _ => new Kind)
-    k.count += 1
-    k.max = math.max(k.max, ms)
-    k.recent.addLast(ms)
-    if (k.recent.size > Window) k.recent.removeFirst()
+    val stats = kinds.computeIfAbsent(kind, _ => new Kind)
+    stats.count += 1
+    stats.max = math.max(stats.max, ms)
+    stats.recent.addLast(ms)
+    if (stats.recent.size > Window) stats.recent.removeFirst()
   }
 
   /** Returns per-kind summaries in stable name order. */
   def summary: Seq[(String, Summary)] = kinds.synchronized {
-    kinds.asScala.toSeq.map { (name, k) =>
-      val sorted = k.recent.asScala.toVector.sorted
-      def percentile(p: Double) = sorted(math.min(sorted.size - 1, (p * sorted.size).toInt))
-      name -> Summary(k.count, percentile(0.5), percentile(0.95), k.max)
+    kinds.asScala.toSeq.map { (name, stats) =>
+      val sorted = stats.recent.asScala.toVector.sorted
+      /** Selects the existing window's upper quantile rank, clamped to its final sample. */
+      def percentile(p: Double): Long = sorted(math.min(sorted.size - 1, (p * sorted.size).toInt))
+      name -> Summary(stats.count, percentile(0.5), percentile(0.95), stats.max)
     }
   }
 }
