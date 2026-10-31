@@ -190,6 +190,25 @@ class EditingTest extends munit.FunSuite {
     }
   }
 
+  test("a write listener can inspect PSI before the write starts") {
+    val file = host.openFile(Path.of("/editing/WriteListener.scala"), "object WriteListener\n", module)
+    val listeners = com.intellij.openapi.util.Disposer.newDisposable()
+    val writer = Thread.currentThread()
+    var observed = ""
+    HostLock.addWriteListener(new com.intellij.openapi.application.WriteActionListener {
+      override def beforeWriteActionStart(action: Class[?]): Unit =
+        if (Thread.currentThread() eq writer) observed = host.read(file.getText)
+    }, listeners)
+    try {
+      host.edit(file, 0, 0, "// edited\n")
+      assertEquals(observed, "object WriteListener\n")
+      assertEquals(host.read(file.getText), "// edited\nobject WriteListener\n")
+    } finally {
+      com.intellij.openapi.util.Disposer.dispose(listeners)
+      host.closeSource(file)
+    }
+  }
+
   // The word index follows edits: a usage added to or removed from a file is found, or no longer found.
   test("reference search finds usages in other files and follows edits") {
     val aText = "object Searched { def target: Int = 1 }\n"

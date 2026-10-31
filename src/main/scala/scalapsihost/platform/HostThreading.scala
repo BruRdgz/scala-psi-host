@@ -107,7 +107,8 @@ private[scalapsihost] object HostLock {
           // runProcess starts the indicator, resetting cancellation; only register it after that reset.
           queries.add(indicator)
           try {
-            if (pendingWrites.get() > 0) indicator.cancel()
+            // An intent owner may query PSI while preparing its own write, without taking a read lock.
+            if (!hasWriteIntent && pendingWrites.get() > 0) indicator.cancel()
             indicator.checkCanceled()
             body
           } finally queries.remove(indicator)
