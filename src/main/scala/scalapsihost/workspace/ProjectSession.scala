@@ -14,13 +14,22 @@ import java.util.concurrent.atomic.AtomicReference
 import scala.util.Using
 
 /**
- * An open project: its build (kept connected, to compile on save and to import again after a build change), its
- * modules in the host and every source file of them, loaded from disk and then kept in step with the editor's
- * changes. Positions are 0-based lines and columns in UTF-16 code units, as LSP counts them and as documents index
- * their text. Callers serialize session operations and imports; the LSP does this on its documents executor. The
- * diagnostics executor may call `isSource` and `problems` concurrently, and those methods share a guard with import
- * application so a diagnostic never reads the host while its module snapshot is only partly applied. Raw host PSI
- * queries still use the host's read/write lock.
+ * Owns an imported workspace, its source buffers and its build connection.
+ *
+ * Sources stay registered when editor tabs close. Positions use zero-based lines and UTF-16 columns throughout
+ * this API; edits update in-memory documents rather than saving files to disk. Source requests require a path
+ * registered by the build and fail if a partial import has left the session unavailable.
+ *
+ * Callers serialize session operations and imports, as the LSP documents executor does. Only `isSource` and
+ * `problems` support concurrent diagnostic work: their guard excludes partial host updates. `snapshot` provides
+ * counts from the last completed import without waiting for the current one.
+ *
+ * Close the session to release its BSP connection, formatter and document compiler. The shared host and its
+ * mounted libraries remain owned by the process.
+ *
+ * @param host process-scoped PSI host in which this workspace's modules and sources are registered
+ * @param build BSP connection owned by this session and closed with it
+ * @param root workspace directory used as the boundary for formatter-configuration lookup
  */
 final class ProjectSession private (
   host: ScalaPsiHost,
@@ -42,42 +51,58 @@ final class ProjectSession private (
   @volatile private var unavailable: Option[String] = None
   @volatile private var lastImportedSnapshot = ProjectSession.Snapshot(0, 0)
 
+  /** Captures the validated module graph, affected identities and source inputs for a host update. */
   private final case class ImportPlan(
-    next: Seq[ImportedModule],
-    before: Map[String, ImportedModule],
-    after: Map[String, ImportedModule],
-    replaced: Set[String],
-    sourceText: Map[Path, String],
-    newlyAskedForSources: Set[Path],
-    librarySources: Map[Path, Path],
+    orderedModules: Seq[ImportedModule],
+    previousModulesById: Map[String, ImportedModule],
+    nextModulesById: Map[String, ImportedModule],
+    moduleIdsToRebuild: Set[String],
+    sourceTextByPath: Map[Path, String],
+    classpathJarsToFetchSources: Set[Path],
+    librarySourcesByJar: Map[Path, Path],
   )
 
-  /** A snapshot of the source paths currently open in the session; their order is unspecified. */
+  /**
+   * Lists the sources currently registered in the session.
+   *
+   * This includes sources without an open editor tab. During an import the live registry can change; use
+   * `snapshot` for counts from the last completed import.
+   *
+   * @return `Seq[Path]` containing the registered source paths, in unspecified order
+   */
   def sourceFiles: Seq[Path] = files.keySet.toArray(Array.empty[Path]).toSeq
 
-  /** Whether `path` is a source file of the project (not, say, a library file the editor opened). */
+  /**
+   * Checks whether a path belongs to a registered project source.
+   *
+   * Library files are excluded. The check waits for host updates and rejects an unavailable session.
+   *
+   * @param path source path as registered by the build
+   */
   def isSource(path: Path): Boolean = importSnapshotLock.synchronized {
     ensureUsable()
     files.containsKey(path)
   }
 
-  /** Whether a failed import changed host PSI far enough that this session can no longer answer source requests. */
+  /** Reports whether source requests remain permitted by the import-failure guard. */
   private[scalapsihost] def isUsable: Boolean = unavailable.isEmpty
 
-  /** The reason source requests can no longer be served, if an import failed after host mutations began. */
+  /** Provides the recorded partial-import failure and recovery message, when present. */
   private[scalapsihost] def unavailableMessage: Option[String] = unavailable
 
-  /** Counts from the last fully applied import, safe for the at-once status response during an update. */
+  /** Reads the last completed import's counts without waiting for ongoing updates. */
   private[scalapsihost] def snapshot: ProjectSession.Snapshot = lastImportedSnapshot
 
+  /** Throws the recorded unavailability error after a partial import failure. */
   private def ensureUsable(): Unit = unavailable.foreach(message => throw new ProjectSession.Unavailable(message))
 
+  /** Marks the session unavailable under the caller's import guard and host write lock. */
   private def markUnavailable(error: Throwable): Unit = {
     val detail = Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.getClass.getSimpleName)
     unavailable = Some(s"the project session is unusable after a partial build import ($detail); restart the language server to recover")
   }
 
-  /** Resolves an open project source or reports that the path is not part of this session. */
+  /** Resolves source PSI in a usable session; callers must protect subsequent PSI access. */
   private def file(path: Path): PsiFile = {
     ensureUsable()
     Option(files.get(path)).getOrElse(throw new IllegalArgumentException(s"not a source file of the project: $path"))
@@ -85,269 +110,531 @@ final class ProjectSession private (
 
   private val language = new ProjectLanguageOperations(host, root, documentCompiler, scalafmt, file)
 
-  /** The current in-memory document text, including changes not yet saved to disk. */
+  /**
+   * Reads the current text of a source buffer.
+   *
+   * @param path registered project-source path
+   * @return `String` containing the in-memory text, including unsaved edits
+   */
   def text(path: Path): String = language.text(path)
 
-  /** The completion suggestions at `at`, best first. Only Scala files complete. */
+  /**
+   * Collects completion suggestions at a source position.
+   *
+   * Collecting suggestions does not insert text; a chosen suggestion's handler runs through `insertCompletion`.
+   *
+   * @param path registered project-source path
+   * @param at caret position in zero-based lines and UTF-16 columns
+   * @return `CompletionChoices` in relevance order, with an incomplete flag; empty for non-Scala sources
+   */
   def completion(path: Path, at: LineColumn): CompletionChoices = language.completion(path, at)
 
-  /** The plugin's inline hints within the requested range. Only Scala files have them. */
+  /**
+   * Collects inline hints within a source range.
+   *
+   * @param path registered project-source path
+   * @param start range start in zero-based lines and UTF-16 columns
+   * @param end range end in the same coordinates
+   * @return `Seq[InlineHint]` within the range, or an empty sequence for non-Scala sources
+   */
   def inlayHints(path: Path, start: LineColumn, end: LineColumn): Seq[InlineHint] = language.inlayHints(path, start, end)
 
-  /** The signatures of the call around `at`. Only Scala files have them. */
+  /**
+   * Looks up signatures for the call surrounding a caret.
+   *
+   * @param path registered project-source path
+   * @param at caret position in zero-based lines and UTF-16 columns
+   * @return `Option[SignatureChoices]` with rendered overloads, or `None` when no signature is available
+   */
   def signatures(path: Path, at: LineColumn): Option[SignatureChoices] = language.signatures(path, at)
 
-  /** Each position's Extend Selection chain. An unexpandable caret still has its empty range, as LSP requires. */
+  /**
+   * Builds successive selection expansions for each caret.
+   *
+   * A Scala caret with no expansion keeps its empty range. Non-Scala sources return an empty outer sequence.
+   *
+   * @param path registered project-source path
+   * @param positions carets in zero-based lines and UTF-16 columns, in the desired result order
+   * @return `Seq[Seq[(LineColumn, LineColumn)]]` of start/end ranges, smallest first for each caret
+   */
   def selectionRanges(path: Path, positions: Seq[LineColumn]): Seq[Seq[(LineColumn, LineColumn)]] =
     language.selectionRanges(path, positions)
 
-  /** Runs the insert handler of the chosen completion suggestion. */
+  /**
+   * Previews the insert handler of a chosen completion suggestion.
+   *
+   * The editor must first insert `lookup` in place of `prefixText`. Returned changes describe the follow-up
+   * insertion; the caller applies them and reports the resulting buffer through `change`.
+   *
+   * @param path registered project-source path
+   * @param start start of the inserted lookup text, in zero-based lines and UTF-16 columns
+   * @param prefixText original typed prefix replaced by the lookup text
+   * @param lookup lookup text already inserted by the editor
+   * @param identity suggestion identity returned by `completion`
+   * @return `Option[CompletionFollowUp]` with edits and caret position, or `None` if the suggestion no longer applies
+   */
   def insertCompletion(path: Path, start: LineColumn, prefixText: String, lookup: String, identity: String)
       : Option[CompletionFollowUp] = language.insertCompletion(path, start, prefixText, lookup, identity)
 
-  /** The changes that format `range` of the file (all of it without one). Only Scala files are formatted. */
+  /**
+   * Computes formatting edits for a Scala source.
+   *
+   * The buffer is unchanged. Whole-file requests use scalafmt when a configuration is found; range requests
+   * use the IntelliJ formatter. Formatter failures propagate to the caller.
+   *
+   * @param path registered project-source path
+   * @param range optional start/end positions in zero-based lines and UTF-16 columns; `None` selects the whole file
+   * @param indentSize positive indentation size used by the IntelliJ formatter
+   * @param useTabs whether the IntelliJ formatter should indent with tabs
+   * @return `Seq[TextChange]` against the current buffer, or an empty sequence for non-Scala sources
+   */
   def formatting(path: Path, range: Option[(LineColumn, LineColumn)], indentSize: Int, useTabs: Boolean): Seq[TextChange] =
     language.formatting(path, range, indentSize, useTabs)
 
-  /** Applies an editor change to the current document. */
+  /**
+   * Applies an editor change to a source buffer and its PSI indexes.
+   *
+   * This updates in-memory state without saving to disk and can cancel running host queries.
+   *
+   * @param path registered project-source path
+   * @param range start/end positions in zero-based lines and UTF-16 columns; `None` replaces the entire buffer
+   * @param replacement text to put in place of the selected range
+   */
   def change(path: Path, range: Option[(LineColumn, LineColumn)], replacement: String): Unit =
     language.change(path, range, replacement)
 
-  /** The file's plugin and compiler problems, from a consistent imported workspace snapshot. */
+  /**
+   * Collects plugin and compiler diagnostics for a source.
+   *
+   * This may run concurrently with session operations and waits for import application. Scala 3 compiler
+   * diagnostics use the current buffer when compile settings are available; other compiler diagnostics come
+   * from the last build compile. Java sources return no diagnostics.
+   *
+   * @param path registered project-source path
+   * @return `Seq[FileProblem]` combining the enabled plugin and compiler diagnostics
+   */
   def problems(path: Path): Seq[FileProblem] = importSnapshotLock.synchronized {
     val source = file(path)
     val spec = moduleSpec(source)
     language.problems(path, spec, buildProblems.get.getOrElse(path, Seq.empty))
   }
 
-  /** The build compiler settings for the module that owns this source file. */
+  /** Finds a source's owning module compile settings while the caller holds the import guard. */
   private def moduleSpec(file: PsiFile): Option[CompileSpec] =
     host.modules.ofFile(file.getViewProvider.getVirtualFile).flatMap(m => compileSpecs.get(m.spec.stableId))
 
-  /** Markdown signature and ScalaDoc at the requested position. */
+  /**
+   * Renders a symbol's signature and available ScalaDoc as Markdown.
+   *
+   * Missing documentation can leave a signature-only result.
+   *
+   * @param path registered project-source path
+   * @param at referenced or declared symbol position in zero-based lines and UTF-16 columns
+   * @return `Option[String]` containing Markdown, or `None` when no quick information is available
+   */
   def hover(path: Path, at: LineColumn): Option[String] = language.hover(path, at)
 
-  /** Where the symbol referenced at the requested position is declared in project sources. */
+  /**
+   * Locates the declaration referenced at a source position.
+   *
+   * Library targets are materialized as read-only source or decompiled files under the host's state directory.
+   *
+   * @param path registered project-source path
+   * @param at reference position in zero-based lines and UTF-16 columns
+   * @return `Option[(Path, LineColumn)]` locating the declaration's name, or `None` when no location is available
+   */
   def definition(path: Path, at: LineColumn): Option[(Path, LineColumn)] = language.definition(path, at)
 
-  /** Where the type of the symbol at the requested position is declared. */
+  /**
+   * Locates the type declarations associated with a symbol.
+   *
+   * Library locations use materialized source or decompiled files, as in `definition`.
+   *
+   * @param path registered project-source path
+   * @param at referenced or declared symbol position in zero-based lines and UTF-16 columns
+   * @return `Seq[(Path, LineColumn)]` of declaration-name locations, empty when no type location is available
+   */
   def typeDefinition(path: Path, at: LineColumn): Seq[(Path, LineColumn)] = language.typeDefinition(path, at)
 
-  /** Where the symbol is used in project sources. */
+  /**
+   * Finds a symbol's usages across project sources.
+   *
+   * Results follow the plugin's text-based find-usages support; usages requiring compiler indexes are unavailable.
+   *
+   * @param path registered project-source path
+   * @param at referenced or declared symbol position in zero-based lines and UTF-16 columns
+   * @param includeDeclaration whether to include the target's declaration name when it belongs to a project source
+   * @return `Seq[SourceSpan]` of distinct source occurrences
+   */
   def references(path: Path, at: LineColumn, includeDeclaration: Boolean): Seq[SourceSpan] =
     language.references(path, at, includeDeclaration)
 
-  /** Applicable plugin actions, with edits against the current document. */
+  /**
+   * Previews plugin actions for a source range.
+   *
+   * The buffer is unchanged. Unsupported previews can produce disabled actions with a reason. Organize imports
+   * is included only when `only` explicitly requests its source-action category or an ancestor category.
+   *
+   * @param path registered project-source path
+   * @param start selection start in zero-based lines and UTF-16 columns
+   * @param end selection end in the same coordinates; equal to `start` for a caret request
+   * @param only accepted action kinds and their descendants; empty selects contextual fixes and refactorings
+   * @return `Seq[(CodeActionResult, Seq[TextChange])]` pairing each action with its current-buffer edits
+   */
   def codeActions(path: Path, start: LineColumn, end: LineColumn, only: Seq[String] = Seq.empty)
       : Seq[(CodeActionResult, Seq[TextChange])] = language.codeActions(path, start, end, only)
 
-  /** The range of the name at the requested position that a rename would change. */
+  /**
+   * Validates a rename target and locates its name range.
+   *
+   * Propagates `Rename.Refused` when the position has no renameable project-source target.
+   *
+   * @param path registered project-source path
+   * @param at referenced or declared symbol position in zero-based lines and UTF-16 columns
+   * @return `(LineColumn, LineColumn)` marking the start and end of the name to rename
+   */
   def prepareRename(path: Path, at: LineColumn): (LineColumn, LineColumn) = language.prepareRename(path, at)
 
-  /** The source edits that rename the symbol at the requested position. */
+  /**
+   * Computes project-source edits for renaming a symbol.
+   *
+   * The host restores the original buffers before returning. The caller applies the edits and reports the
+   * resulting text through `change`. Invalid targets, names or conflicts propagate as `Rename.Refused`;
+   * the plugin's text-search limitations also apply to the affected references.
+   *
+   * @param path registered project-source path
+   * @param at referenced or declared symbol position in zero-based lines and UTF-16 columns
+   * @param newName replacement name validated by the plugin's rename processors
+   * @return `Seq[FileChanges]` grouped by affected project-source file
+   */
   def rename(path: Path, at: LineColumn, newName: String): Seq[FileChanges] = language.rename(path, at, newName)
 
-  /** The names of implementations and overriders of the symbol at the requested position. */
+  /**
+   * Locates implementations and overriders in project sources.
+   *
+   * The plugin may include the target itself when invoked on a reference, following its go-to-implementation rules.
+   *
+   * @param path registered project-source path
+   * @param at symbol position in zero-based lines and UTF-16 columns
+   * @return `Seq[SourceSpan]` of distinct declaration-name ranges
+   */
   def implementations(path: Path, at: LineColumn): Seq[SourceSpan] = language.implementations(path, at)
 
-  /** The project's symbols whose names match `query`, best match first. */
+  /**
+   * Searches project symbols by name.
+   *
+   * Uses the plugin's name matching and result limit. Library symbols are excluded; a blank query matches nothing.
+   *
+   * @param query symbol-name query, optionally qualified by package or enclosing type
+   * @return `Seq[WorkspaceSymbolMatch]` in relevance order
+   */
   def workspaceSymbols(query: String): Seq[WorkspaceSymbolMatch] = {
     ensureUsable()
     language.workspaceSymbols(query)
   }
 
-  /** The occurrences in this file of the symbol at the requested position. */
+  /**
+   * Finds a symbol's occurrences within one source file.
+   *
+   * @param path registered project-source path
+   * @param at referenced or declared symbol position in zero-based lines and UTF-16 columns
+   * @return `Seq[Occurrence]` containing declaration and reference ranges, with write-access markers
+   */
   def highlights(path: Path, at: LineColumn): Seq[Occurrence] = language.highlights(path, at)
 
-  /** The file's outline. */
+  /**
+   * Builds the declaration outline shown by the plugin's structure view.
+   *
+   * @param path registered project-source path
+   * @return `Seq[OutlineSymbol]` of nested declarations, empty for non-Scala sources
+   */
   def outline(path: Path): Seq[OutlineSymbol] = language.outline(path)
 
-  /** The file's folding ranges. */
+  /**
+   * Collects foldable code, comments, imports and explicit regions.
+   *
+   * When a range ends at a closing bracket, its last line remains visible.
+   *
+   * @param path registered project-source path
+   * @return `Seq[Fold]` of distinct multiline regions, empty for non-Scala sources
+   */
   def foldingRanges(path: Path): Seq[Fold] = language.foldingRanges(path)
 
-  /** The file's semantic tokens. */
+  /**
+   * Classifies identifiers and soft keywords using the plugin's highlighting.
+   *
+   * Only supported, nonempty, single-line classifications are returned. LSP encoding belongs to the caller.
+   *
+   * @param path registered project-source path
+   * @return `Seq[SemanticToken]` with source positions, kinds and modifiers; empty for non-Scala sources
+   */
   def semanticTokens(path: Path): Seq[SemanticToken] = language.semanticTokens(path)
 
   /**
-   * Imports the build's modules and applies them to the host: on opening, every module and its sources; after a
-   * build change, the difference. Sources the build added are opened (from disk) and those it removed closed; a
-   * module whose definition changed (Scala version, options, classpath, dependencies), and every module that
-   * depends on it, is removed and added again, its files reopened with their current text (unsaved editor changes
-   * are kept). `reload` first reloads the build's definition (after a change to it). Each step is logged, and
-   * reported to `progress` as it starts.
+   * Synchronizes this session's modules and sources with the BSP build.
+   *
+   * The first import registers the imported modules and opens their sources; subsequent imports apply changes.
+   * Changed modules and their transitive dependents are recreated, preserving unsaved text for sources that
+   * remain in the build.
+   *
+   * This call blocks on BSP and filesystem I/O. Callers must serialize it with other session operations;
+   * concurrent diagnostics are synchronized with the host-update phase.
+   *
+   * Preparation gathers module descriptions, source text and library-source attachments before changing host PSI.
+   * A failure during preparation leaves the previous host snapshot usable. A failure after host mutations begin
+   * leaves the session unavailable and requires restarting the language server; partial changes are not rolled
+   * back. Exceptions from `progress` propagate and follow the same distinction between preparation and application.
+   *
+   * @param reload whether to reload the build definition before requesting its modules; pass `true` after changes
+   *               to build-definition files, or `false` to refresh modules and sources without reloading it
+   * @param progress callback invoked synchronously on the calling thread as each stage starts; defaults to a no-op
    */
   def importBuild(reload: Boolean, progress: String => Unit = _ => ()): Unit = {
-    ensureUsable()
     val start = System.nanoTime()
+
+    /** Applies a prepared plan under both locks, recording mutation failures before unlocking. */
+    def applyPreparedImport(preparedPlan: ImportPlan): Unit = {
+      var hostMutationStarted = false
+      importSnapshotLock.synchronized {
+        HostLock.write {
+          try applyImport(preparedPlan, progress, () => hostMutationStarted = true)
+          catch {
+            case error: Throwable =>
+              if (hostMutationStarted) markUnavailable(error)
+              throw error
+          }
+        }
+      }
+    }
+
+    ensureUsable()
     if (reload) {
       progress("reloading the build definition")
       HostLog.timed("build definition reloaded")(build.reload())
     }
     progress("importing the build's modules")
+
     val modules = HostLog.timed("modules described by the build")(build.modules())
     val plan = planImport(modules, progress)
-    importSnapshotLock.synchronized {
-      var hostMutationStarted = false
-      HostLock.write {
-        try applyImport(plan, progress, () => hostMutationStarted = true)
-        catch {
-          case error: Throwable =>
-            if (hostMutationStarted) markUnavailable(error)
-            throw error
-        }
-      }
-    }
-    val readded = plan.replaced.intersect(plan.before.keySet).intersect(plan.after.keySet).size
-    HostLog.info(s"build imported in ${(System.nanoTime() - start) / 1_000_000} ms: ${plan.next.size} modules " +
-      s"(${plan.after.keySet.diff(plan.before.keySet).size} new, $readded added again, " +
-      s"${plan.before.keySet.diff(plan.after.keySet).size} removed), " +
-      s"${plan.next.map(_.sources.size).sum} imported sources, ${files.size} in all")
+
+    applyPreparedImport(plan)
+
+    val existingModulesRebuilt = plan.moduleIdsToRebuild
+      .intersect(plan.previousModulesById.keySet)
+      .intersect(plan.nextModulesById.keySet)
+      .size
+
+    HostLog.info(s"build imported in ${(System.nanoTime() - start) / 1_000_000} ms: ${plan.orderedModules.size} modules " +
+      s"(${plan.nextModulesById.keySet.diff(plan.previousModulesById.keySet).size} new, $existingModulesRebuilt added again, " +
+      s"${plan.previousModulesById.keySet.diff(plan.nextModulesById.keySet).size} removed), " +
+      s"${plan.orderedModules.map(_.sources.size).sum} imported sources, ${files.size} in all")
   }
 
-  /** Validates the imported descriptors and gathers every source/build input before changing host PSI. */
+  /** Validates the next module graph and gathers source inputs without changing host PSI. */
   private def planImport(modules: Seq[ImportedModule], progress: String => Unit): ImportPlan = {
-    val next = BspImport.dependenciesFirst(modules)
-    val before = imported.map(m => m.spec.stableId -> m).toMap
-    val after = next.map(m => m.spec.stableId -> m).toMap
-    val changed = before.keySet.filter(id => !after.get(id).exists(_.spec == before(id).spec))
+    val orderedModules = BspImport.dependenciesFirst(modules)
+    val previousModulesById = imported.map(module => module.spec.stableId -> module).toMap
+    val nextModulesById = orderedModules.map(module => module.spec.stableId -> module).toMap
 
-    /** Includes transitive dependents, which must be rebuilt because their scopes include changed modules. */
-    def dependents(ids: Set[String]): Set[String] = {
-      val more = ids ++ before.values.filter(_.spec.dependsOn.exists(ids)).map(_.spec.stableId)
-      if (more == ids) ids else dependents(more)
+    /** Includes previous dependents whose cached scopes require rebuilding with the affected modules. */
+    def includeDependents(moduleIds: Set[String]): Set[String] = {
+      val expanded = moduleIds ++ previousModulesById.values
+        .filter(_.spec.dependsOn.exists(moduleIds))
+        .map(_.spec.stableId)
+      if (expanded == moduleIds) moduleIds else includeDependents(expanded)
     }
 
-    val oldOwners = imported.flatMap(module => module.sources.map(_ -> module.spec.stableId)).toMap
-    val newOwners = next.flatMap(module => module.sources.map(_ -> module.spec.stableId)).toMap
-    val movedSources = oldOwners.keySet.intersect(newOwners.keySet).filter(path => oldOwners(path) != newOwners(path))
-    val movedModules = movedSources.flatMap(path => Set(oldOwners(path), newOwners(path)))
-    val replaced = dependents(changed ++ movedModules)
+    val changedModuleIds = previousModulesById.keySet.filter { id =>
+      !nextModulesById.get(id).exists(_.spec == previousModulesById(id).spec)
+    }
+    val previousOwnerBySource = imported.flatMap(module => module.sources.map(_ -> module.spec.stableId)).toMap
+    val nextOwnerBySource = orderedModules.flatMap(module => module.sources.map(_ -> module.spec.stableId)).toMap
+    val movedSourcePaths = previousOwnerBySource.keySet.intersect(nextOwnerBySource.keySet)
+      .filter(path => previousOwnerBySource(path) != nextOwnerBySource(path))
+    val movedModuleIds = movedSourcePaths.flatMap { path =>
+      Set(previousOwnerBySource(path), nextOwnerBySource(path))
+    }
+    val moduleIdsToRebuild = includeDependents(changedModuleIds ++ movedModuleIds)
 
-    val paths = next.flatMap(_.sources).distinct
-    val openText = host.read {
-      paths.flatMap(path => Option(files.get(path)).map(file => path -> file.getText))
+    val sourcePaths = orderedModules.flatMap(_.sources).distinct
+    val openTextByPath = host.read {
+      sourcePaths.flatMap(path => Option(files.get(path)).map(file => path -> file.getText))
     }.toMap
-    val sourceText = paths.map(path => path -> openText.getOrElse(path, Files.readString(path))).toMap
+    val sourceTextByPath = sourcePaths.map(path => path -> openTextByPath.getOrElse(path, Files.readString(path))).toMap
 
     // Fetch source attachments before the PSI update, so a build-server failure cannot leave modules half replaced.
-    val newlyAskedForSources = next.flatMap(_.spec.classpath).toSet -- sourcesAskedFor
-    val librarySources = if (newlyAskedForSources.isEmpty) Map.empty
+    val classpathJarsToFetchSources = orderedModules.flatMap(_.spec.classpath).toSet -- sourcesAskedFor
+    val librarySourcesByJar = if (classpathJarsToFetchSources.isEmpty) Map.empty
     else {
-      progress(s"attaching library sources (${newlyAskedForSources.size} jars)")
-      HostLog.timed(s"source jars asked for ${newlyAskedForSources.size} jars") {
-        build.librarySources(newlyAskedForSources)
+      progress(s"attaching library sources (${classpathJarsToFetchSources.size} jars)")
+      HostLog.timed(s"source jars asked for ${classpathJarsToFetchSources.size} jars") {
+        build.librarySources(classpathJarsToFetchSources)
       }
     }
-    ImportPlan(next, before, after, replaced, sourceText, newlyAskedForSources, librarySources)
+    ImportPlan(
+      orderedModules,
+      previousModulesById,
+      nextModulesById,
+      moduleIdsToRebuild,
+      sourceTextByPath,
+      classpathJarsToFetchSources,
+      librarySourcesByJar,
+    )
   }
 
-  /** Applies a validated plan. Any failure after the first host mutation leaves the session unavailable. */
-  private def applyImport(plan: ImportPlan, progress: String => Unit, beforeMutation: () => Unit): Unit = {
-    var closed = 0
-    var opened = 0
+  /** Applies a prepared plan under the caller's import guard and host write lock. */
+  private def applyImport(plan: ImportPlan, progress: String => Unit, beforeHostMutation: () => Unit): Unit = {
+    var closedSourceCount = 0
+    var openedSourceCount = 0
+
+    /** Signals mutation before unregistering and closing a source, preserving partial-failure tracking. */
+    def closeTrackedSource(path: Path): Unit = Option(files.get(path)).foreach { file =>
+      beforeHostMutation()
+      files.remove(path)
+      host.closeSource(file)
+      closedSourceCount += 1
+    }
+
+    /** Opens a source with its planned buffer text and tracks the host mutation. */
+    def openImportedSource(source: Path, hostModule: HostModule): Unit = {
+      beforeHostMutation()
+      files.put(source, host.openFile(source, plan.sourceTextByPath(source), hostModule))
+      openedSourceCount += 1
+    }
+
+    /** Reports progress before registering a module, including modules without sources. */
+    def addImportedModule(nextModule: ImportedModule): HostModule = {
+      val spec = nextModule.spec
+      val moduleId = spec.stableId
+
+      progress(s"module ${spec.name} ($moduleId): ${spec.classpath.size} jars, ${nextModule.sources.size} sources")
+      HostLog.timed(s"module ${spec.name} ($moduleId, Scala ${spec.scalaVersion}, ${spec.classpath.size} jars) added") {
+        beforeHostMutation()
+        host.addModule(spec)
+      }
+    }
 
     // Remove dependents first (reverse of the dependencies-first import order).
-    for (module <- imported.reverse if plan.replaced(module.spec.stableId)) {
-      for (source <- module.sources; file <- Option(files.get(source))) {
-        beforeMutation()
-        files.remove(source)
-        host.closeSource(file)
-        closed += 1
-      }
-      beforeMutation()
-      host.removeModule(module.spec.stableId)
+    for (previousModule <- imported.reverse if plan.moduleIdsToRebuild(previousModule.spec.stableId)) {
+      previousModule.sources.foreach(closeTrackedSource)
+      beforeHostMutation()
+      host.removeModule(previousModule.spec.stableId)
     }
 
-    def openPlanned(source: Path, module: HostModule): Unit = {
-      beforeMutation()
-      files.put(source, host.openFile(source, plan.sourceText(source), module))
-      opened += 1
-    }
+    for (nextModule <- plan.orderedModules) {
+      val moduleId = nextModule.spec.stableId
+      if (!plan.previousModulesById.contains(moduleId) || plan.moduleIdsToRebuild(moduleId)) {
+        val hostModule = addImportedModule(nextModule)
 
-    for (moduleSpec <- plan.next) {
-      val id = moduleSpec.spec.stableId
-      if (!plan.before.contains(id) || plan.replaced(id)) {
-        progress(s"module ${moduleSpec.spec.name} ($id): ${moduleSpec.spec.classpath.size} jars, ${moduleSpec.sources.size} sources")
-        val module = HostLog.timed(
-          s"module ${moduleSpec.spec.name} ($id, Scala ${moduleSpec.spec.scalaVersion}, ${moduleSpec.spec.classpath.size} jars) added") {
-          beforeMutation()
-          host.addModule(moduleSpec.spec)
-        }
-        moduleSpec.sources.foreach(source => openPlanned(source, module))
+        nextModule.sources.foreach(source => openImportedSource(source, hostModule))
       } else {
-        val module = host.modules.byId(id).getOrElse(
-          throw new IllegalStateException(s"host module $id (${moduleSpec.spec.name}) disappeared during import"))
-        val (kept, now) = (plan.before(id).sources.toSet, moduleSpec.sources.toSet)
-        for (source <- kept -- now; file <- Option(files.get(source))) {
-          beforeMutation()
-          files.remove(source)
-          host.closeSource(file)
-          closed += 1
-        }
-        for (source <- now -- kept) openPlanned(source, module)
+        val hostModule = host.modules.byId(moduleId).getOrElse(
+          throw new IllegalStateException(s"host module $moduleId (${nextModule.spec.name}) disappeared during import"))
+        val previousSources = plan.previousModulesById(moduleId).sources.toSet
+        val nextSources = nextModule.sources.toSet
+
+        (previousSources -- nextSources).foreach(closeTrackedSource)
+        (nextSources -- previousSources).foreach(source => openImportedSource(source, hostModule))
       }
     }
 
-    for ((jar, sources) <- plan.librarySources) {
-      beforeMutation()
+    for ((jar, sources) <- plan.librarySourcesByJar) {
+      beforeHostMutation()
       host.addLibrarySources(jar, sources)
     }
-    if (plan.librarySources.nonEmpty)
-      HostLog.info(s"library sources attached to ${plan.librarySources.size} of ${plan.newlyAskedForSources.size} jars")
+    if (plan.librarySourcesByJar.nonEmpty)
+      HostLog.info(s"library sources attached to ${plan.librarySourcesByJar.size} of ${plan.classpathJarsToFetchSources.size} jars")
 
-    imported = plan.next
-    compileSpecs = plan.next.map(module => module.spec.stableId -> module.compile).toMap
-    sourcesAskedFor ++= plan.newlyAskedForSources
+    imported = plan.orderedModules
+    compileSpecs = plan.orderedModules.map(module => module.spec.stableId -> module.compile).toMap
+    sourcesAskedFor ++= plan.classpathJarsToFetchSources
     lastImportedSnapshot = ProjectSession.Snapshot(imported.size, files.size)
-    HostLog.info(s"${opened} sources opened, ${closed} closed, ${files.size} in all")
+    HostLog.info(s"${openedSourceCount} sources opened, ${closedSourceCount} closed, ${files.size} in all")
   }
 
-  /** How many modules the build had at the last successful import. */
+  /**
+   * Counts the modules currently recorded as imported.
+   *
+   * For a consistent pair of counts from one completed import, use `snapshot` instead of combining this value
+   * with the live source registry during an update.
+   */
   def moduleCount: Int = imported.size
 
-  /** Compiles the build, stores its latest compiler problems, and returns open files whose problems changed. */
+  /**
+   * Compiles the build and replaces the stored build diagnostics.
+   *
+   * This blocks on BSP and does not save editor buffers; document compilation is handled separately by `problems`.
+   * The build can report compilation errors without throwing, in which case its diagnostics are still stored.
+   *
+   * @return `Set[Path]` of registered sources whose stored diagnostics changed and may need republishing
+   */
   def compileBuild(): Set[Path] = {
     ensureUsable()
-    val before = buildProblems.get
-    val after = build.compile().diagnostics
-    buildProblems.set(after)
-    (before.keySet ++ after.keySet).filter(p => before.get(p) != after.get(p) && files.containsKey(p))
+
+    val previousProblems = buildProblems.get
+    val compiledProblems = build.compile().diagnostics
+
+    buildProblems.set(compiledProblems)
+    (previousProblems.keySet ++ compiledProblems.keySet)
+      .filter(path => previousProblems.get(path) != compiledProblems.get(path) && files.containsKey(path))
   }
 
-  /** Closes the build connection, formatter resources and cached document-compiler loaders. */
+  /**
+   * Releases the session's compiler, formatter and BSP connection.
+   *
+   * Waits for in-flight document compilations before closing compiler loaders. Every resource is offered for
+   * closure even if another close fails; cleanup failures propagate with suppressed errors as managed by `Using`.
+   * Callers must stop session operations before closing. Host modules, source PSI and mounted libraries remain
+   * in the process-scoped host.
+   */
   override def close(): Unit = Using.resources(build, scalafmt, documentCompiler)((_, _, _) => ())
 }
 
+/** Opens workspaces and defines the session's import-status and failure values. */
 object ProjectSession {
+  /** Captures module and source counts from one completed import for concurrent status reporting. */
   private[scalapsihost] final case class Snapshot(moduleCount: Int, sourceFileCount: Int)
 
-  /** A request cannot use a session whose host PSI was left partial by an import failure. */
+  /** Rejects source requests after a partial import; recovery requires restarting the language server. */
   private[scalapsihost] final class Unavailable(message: String) extends IllegalStateException(message)
 
   /**
-   * Imports the build at `root` over BSP, adds its modules to `host` and opens all their sources from disk. Steps
-   * are logged and reported to `progress` as they start.
+   * Connects to a workspace build and opens its modules and sources in the host.
+   *
+   * This blocks on BSP, library indexing and source-file I/O. It mounts the running JVM's JDK and available JDK
+   * sources, then performs the initial import. The returned session owns its connection, formatter and document
+   * compiler and must be closed by the caller.
+   *
+   * Opening failures close the resources acquired so far, preserving cleanup errors as suppressed exceptions.
+   * Any host mutations already performed remain in the process-scoped host.
+   *
+   * @param host initialized process-scoped host receiving the workspace modules and sources
+   * @param root workspace directory containing the BSP connection definitions
+   * @param connection optional BSP connection-file name without its `.json` suffix; required if several exist
+   * @param progress callback invoked synchronously on the calling thread as each stage starts; defaults to a no-op
+   * @return `ProjectSession` with the initial import completed and its session resources owned by the caller
    */
   def open(host: ScalaPsiHost, root: Path, connection: Option[String] = None, progress: String => Unit = _ => ()): ProjectSession = {
     progress("connecting to the build server")
+
     val build = HostLog.timed(s"build server of $root connected")(BspImport.connect(root, connection))
-    var openedSession = Option.empty[ProjectSession]
+    var cleanupOwner: AutoCloseable = build
+
     try {
       val javaHome = Path.of(System.getProperty("java.home"))
+
       host.addJdk(javaHome)
       // The JDK's sources, as the IDE attaches them to the JDK.
       Some(javaHome.resolve("lib/src.zip")).filter(Files.isRegularFile(_)).foreach(host.addJdkSources)
+
       val session = new ProjectSession(host, build, root)
-      openedSession = Some(session)
+
+      cleanupOwner = session
       session.importBuild(reload = false, progress)
       session
     } catch {
       case error: Throwable =>
-        val resource: AutoCloseable = openedSession match {
-          case Some(session) => session
-          case None => build
-        }
-        try resource.close()
+        try cleanupOwner.close()
         catch { case closeError: Throwable => if (closeError ne error) error.addSuppressed(closeError) }
         throw error
     }
