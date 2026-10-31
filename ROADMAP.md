@@ -44,17 +44,27 @@ The change engine and the formatter (beta 1), completion, signature help, select
 
 ## Beta 1 — changes
 
-- `CodeStyleManager` and the formatter; formatting, range formatting. Oracle: `formatter`. Decide how scalafmt
-  configurations are honoured (the plugin can delegate to scalafmt).
-- The change engine.
-- Code actions from the plugin's intentions and the annotators' quick fixes. **Initial integration:** previewable
+Implementation complete on 2026-10-31 within the preview and search limits documented in README. Release not tagged.
+The complete suite passes 108 tests; the rebuilt distribution also formats through scalafmt over LSP stdio.
+Inspections remain a separate, undecided milestone.
+
+- `CodeStyleManager` and the formatter; formatting, range formatting. **Done:** `FormatterOracle`: 187 agree,
+  0 disagree, 0 skip. Whole-file requests honor the nearest workspace `.scalafmt.conf` through the plugin's dynamic
+  engine; missing formatter artifacts are downloaded from Maven Central and cached under the host's state directory.
+  Range formatting keeps the plugin's IntelliJ default. `ScalafmtOracle`: 8 agree, 0 disagree, using the plugin's
+  3.11.5 and 2.7.5 contracts; the suite also verifies cold-cache download, disk-cache reuse and config failures.
+- The change engine. **Done:** preview copies and minimal edits, shared by formatting, completion handlers and
+  code actions; internal mod-command copies use the same synchronous commit and cleanup lifecycle.
+- Code actions from the plugin's intentions and the annotators' quick fixes. **Done within the preview contract:**
   intentions, annotation fixes and surrounders return versioned LSP edits. `CodeActionsOracle` replays
   `SurroundWithTest`: 48 agree, 0 disagree, 0 skip; selected intention suites: 15 agree, 0 disagree, 12 skip.
   Type-import quick fixes offer each plugin candidate separately. Remaining: global-member/conversion imports
   and broader intention-oracle coverage. `testdata/actions` covers editor key handlers, not these intentions.
 - Organize imports. **Done:** `source.organizeImports` invokes the plugin optimizer on a preview copy;
   `OptimizeImportsOracle`: 53 agree, 1 disagree, 7 skip, with the limits documented in README.
-- Auto-import of types and rename are implemented; their remaining search/preview gaps are in README.
+- Auto-import of types and rename. **Done:** type-import candidates are separate annotation quick fixes and
+  completion insertions (`CompletionOracle` auto-import: 13 agree, 0 disagree). `RenameOracle`: 112 agree,
+  1 disagree, 18 skip; `FindUsagesOracle`: 74 agree, 0 disagree, 3 skip. Search and preview gaps remain in README.
 
 ## Beta 2 — completion and inspections
 

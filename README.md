@@ -1,7 +1,8 @@
 # scala-psi-host
 
-> **Alpha.** Diagnostics, hover, go-to-definition, references, implementations, workspace symbols, completion,
-> signature help, inlay hints, selection ranges, formatting, rename and previewable code actions work.
+> **Beta.** Diagnostics, hover, go-to-definition, references, implementations, workspace symbols, completion,
+> signature help, inlay hints, selection ranges, IntelliJ/scalafmt formatting, rename, organize imports and
+> previewable code actions work.
 > See [ROADMAP.md](ROADMAP.md) and
 > [Known limitations](#known-limitations).
 
