@@ -7,8 +7,9 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.Executor;
 
 /**
- * The host owns threading: a non-blocking read action runs synchronously on the caller's thread, inside the
- * host's read lock. Builder calls are accepted and ignored; any other terminal operation (submit to an
+ * Runs non-blocking read actions synchronously under the host's read lock.
+ *
+ * Builder calls are accepted and ignored; any other terminal operation (submit to an
  * executor, UI continuations) is unsupported.
  */
 public final class HostAsyncExecutionService extends AsyncExecutionService {
@@ -17,6 +18,7 @@ public final class HostAsyncExecutionService extends AsyncExecutionService {
   @Override protected AppUIExecutor createWriteThreadExecutor(ModalityState modality) { return CallLog.unsupported("AsyncExecutionService.createWriteThreadExecutor"); }
 
   @Override
+  // The proxy implements this exact raw interface; the erased result type remains the callable's T.
   @SuppressWarnings("unchecked")
   protected <T> NonBlockingReadAction<T> buildNonBlockingReadAction(Callable<? extends T> callable) {
     CallLog.hit("AsyncExecutionService.buildNonBlockingReadAction");

@@ -67,14 +67,9 @@ import java.util.concurrent.ConcurrentHashMap
 
 import scala.jdk.CollectionConverters.*
 
-/**
- * Installs the IntelliJ core that `ScalaPsiHost` needs. The order is part of the setup: application services and
- * extension points precede project services, and those precede PSI startup activities that resolve Scala's built-ins.
- */
+/** Installs application services, language registries, project services and PSI startup in dependency order. */
 private[scalapsihost] object HostBootstrap {
-  /** Platform ordering anchors from the matching analysis-impl/lang-impl descriptors; statistics stay inert in
-   * BaseCompletionService.
-   */
+  /** Preserves descriptor ordering anchors while leaving completion statistics inert. */
   private val PlatformCompletionWeighers: Seq[ExtensionBean] = Seq(
     ("StatisticsWeigher", "stats", "after prefix"), ("PriorityWeigher", "priority", "first"),
     ("PrefixMatchingWeigher", "prefix", "after priority"), ("GroupingWeigher", "grouping", "last"),
@@ -134,11 +129,14 @@ private[scalapsihost] object HostBootstrap {
       case ("runWriteIntentReadAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) =>
         HostLock.writeIntent(c.compute()).asInstanceOf[AnyRef]
       case ("addReadActionListener", Array(listener: com.intellij.openapi.application.ReadActionListener, parent: Disposable)) =>
-        HostLock.addReadListener(listener, parent); null
+        HostLock.addReadListener(listener, parent)
+        null
       case ("addWriteIntentReadActionListener", Array(listener: com.intellij.openapi.application.WriteIntentReadActionListener, parent: Disposable)) =>
-        HostLock.addIntentListener(listener, parent); null
+        HostLock.addIntentListener(listener, parent)
+        null
       case ("addWriteActionListener", Array(listener: com.intellij.openapi.application.WriteActionListener, parent: Disposable)) =>
-        HostLock.addWriteListener(listener, parent); null
+        HostLock.addWriteListener(listener, parent)
+        null
       // Reads and writes are the host's lock (HostLock): access is allowed where the thread holds it.
       case ("isReadAccessAllowed", _) => java.lang.Boolean.valueOf(HostLock.isReading || HostLock.hasWriteIntent)
       case ("assertReadAccessAllowed", _) =>
@@ -149,17 +147,25 @@ private[scalapsihost] object HostBootstrap {
       // so there is no write pending while a query reads, and nothing to listen for.
       case ("isWriteActionPending", _) => java.lang.Boolean.FALSE
       case ("addApplicationListener", _) => null
-      case ("executeByImpatientReader", Array(r: Runnable)) => r.run(); null
+      case ("executeByImpatientReader", Array(r: Runnable)) =>
+        r.run()
+        null
       // Work for the UI thread runs on the host's dispatch thread.
-      case ("invokeLater", Array(r: Runnable, _*)) => HostDispatchThread.invokeLater(r); null
+      case ("invokeLater", Array(r: Runnable, _*)) =>
+        HostDispatchThread.invokeLater(r)
+        null
       // No modal progress exists: the task runs where it was asked, and is never cancelled by a user.
-      case ("runProcessWithProgressSynchronously", Array(task: Runnable, _*)) => task.run(); java.lang.Boolean.TRUE
+      case ("runProcessWithProgressSynchronously", Array(task: Runnable, _*)) =>
+        task.run()
+        java.lang.Boolean.TRUE
       // No modal dialogs exist in the host.
       case ("getDefaultModalityState", _) => ModalityState.nonModal()
       case ("assertWriteAccessAllowed", _) =>
         if (!HostLock.isWriting) throw new IllegalStateException("write access is allowed inside write actions only")
         null
-      case ("runWriteAction", Array(r: Runnable)) => runWriteAction(r.run()); null
+      case ("runWriteAction", Array(r: Runnable)) =>
+        runWriteAction(r.run())
+        null
       case ("runWriteAction", Array(c: com.intellij.openapi.util.Computable[?])) => runWriteAction(c.compute()).asInstanceOf[AnyRef]
       case ("runWriteAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) => runWriteAction(c.compute()).asInstanceOf[AnyRef]
       case ("assertIsNonDispatchThread" | "assertReadAccessNotAllowed", _) => null
@@ -182,10 +188,16 @@ private[scalapsihost] object HostBootstrap {
         newPrivate(Class.forName(name))
       // Wraps an extension's failure for logging; the IDE adds plugin attribution, which the host does not track.
       case ("createError", Array(t: Throwable, _*)) => new RuntimeException(t)
-      case ("runReadAction", Array(r: Runnable)) => HostLock.readLocked(r.run()); null
-      case ("tryRunReadAction", Array(r: Runnable)) => HostLock.readLocked(r.run()); java.lang.Boolean.TRUE
+      case ("runReadAction", Array(r: Runnable)) =>
+        HostLock.readLocked(r.run())
+        null
+      case ("tryRunReadAction", Array(r: Runnable)) =>
+        HostLock.readLocked(r.run())
+        java.lang.Boolean.TRUE
       // In unit-test mode the plugin runs some startup work on the UI thread: the host's dispatch thread.
-      case ("invokeAndWait", Array(r: Runnable, _*)) if config.unitTestMode => HostDispatchThread.invokeAndWait(r); null
+      case ("invokeAndWait", Array(r: Runnable, _*)) if config.unitTestMode =>
+        HostDispatchThread.invokeAndWait(r)
+        null
       case ("runReadAction", Array(c: com.intellij.openapi.util.Computable[?])) => HostLock.readLocked(c.compute()).asInstanceOf[AnyRef]
       case ("runReadAction", Array(c: com.intellij.openapi.util.ThrowableComputable[?, ?])) => HostLock.readLocked(c.compute()).asInstanceOf[AnyRef]
     }
@@ -198,15 +210,15 @@ private[scalapsihost] object HostBootstrap {
 
     /** Declares a descriptor-backed extension point once and returns its platform registry. */
     private def declare(name: String): ExtensionPointImpl[?] = {
-      val d = epDecls.getOrElse(name, throw new IllegalStateException(s"extension point is not declared on the classpath: $name"))
-      area.registerExtensionPoint(d.name, d.className, d.kind, d.dynamic)
+      val declaration = epDecls.getOrElse(name, throw new IllegalStateException(s"extension point is not declared on the classpath: $name"))
+      area.registerExtensionPoint(declaration.name, declaration.className, declaration.kind, declaration.dynamic)
       area.getExtensionPoint(name).asInstanceOf[ExtensionPointImpl[?]]
     }
 
     private lazy val symbolIndex = new SymbolIndex
     private lazy val libraryFiles = {
       val files = new LibraryFileSystem
-      Disposer.register(root, (() => { files.close(); () }): Disposable)
+      Disposer.register(root, (() => files.close()): Disposable)
       files
     }
     private lazy val librarySources = new ConcurrentHashMap[VirtualFile, VirtualFile]()
@@ -227,11 +239,13 @@ private[scalapsihost] object HostBootstrap {
       case ("isDefault", _) => java.lang.Boolean.FALSE
       case ("getUserData", Array(k: Key[?])) => projectData.getUserData(k).asInstanceOf[AnyRef]
       case ("putUserData", Array(k: Key[?], v)) =>
-        projectData.putUserData(k.asInstanceOf[Key[AnyRef]], v); null
+        projectData.putUserData(k.asInstanceOf[Key[AnyRef]], v)
+        null
     }
     private lazy val wordIndex = new WordIndex(project)
     private lazy val importIndex = new ImportIndex(project)
 
+    /** Runs all four phases before exposing the host to callers. */
     def start(): ScalaPsiHost = {
       installApplication()
       installLanguageRegistries()
@@ -241,6 +255,18 @@ private[scalapsihost] object HostBootstrap {
 
     /** Installs the application object, services, and descriptor-backed extension points. */
     private def installApplication(): Unit = {
+      /** Registers completion descriptor beans while retaining their platform IDs and ordering metadata. */
+      def registerCompletionBeans(epName: String, beans: Seq[ExtensionBean], plugin: com.intellij.openapi.extensions.PluginDescriptor): Unit = {
+        val ep = area.getExtensionPoint(epName).asInstanceOf[ExtensionPointImpl[?]]
+        val descriptors = beans.map { bean =>
+          val attributes = bean.attributes -- (if (epName.endsWith("weigher")) Seq("order") else Seq("id", "order"))
+          new com.intellij.openapi.extensions.ExtensionDescriptor(null, null, bean.attributes.getOrElse("id", null),
+            com.intellij.openapi.extensions.LoadingOrder.readOrder(bean.attributes.getOrElse("order", "")),
+            new com.intellij.util.xml.dom.XmlElement(epName.stripPrefix("com.intellij."), attributes.asJava, java.util.List.of(), null), true)
+        }
+        ep.registerExtensions(descriptors.asJava, plugin, java.util.List.of())
+      }
+
       // ---- 1. Application object -------------------------------------------------------------
       ApplicationManager.setApplication(app, root)
       Extensions.setRootArea(area)
@@ -312,17 +338,6 @@ private[scalapsihost] object HostBootstrap {
         .registerExtension(new com.intellij.psi.impl.search.MethodDeepestSuperSearcher, root)
       // Descriptor beans preserve both the implementation attributes and the platform's id/order semantics.
       val completionPlugin = new DefaultPluginDescriptor(PluginId.getId("org.intellij.scala"))
-      /** Registers completion descriptor beans while retaining their platform IDs and ordering metadata. */
-      def registerCompletionBeans(epName: String, beans: Seq[ExtensionBean], plugin: com.intellij.openapi.extensions.PluginDescriptor): Unit = {
-        val ep = area.getExtensionPoint(epName).asInstanceOf[ExtensionPointImpl[?]]
-        val descriptors = beans.map { bean =>
-          val attributes = bean.attributes -- (if (epName.endsWith("weigher")) Seq("order") else Seq("id", "order"))
-          new com.intellij.openapi.extensions.ExtensionDescriptor(null, null, bean.attributes.getOrElse("id", null),
-            com.intellij.openapi.extensions.LoadingOrder.readOrder(bean.attributes.getOrElse("order", "")),
-            new com.intellij.util.xml.dom.XmlElement(epName.stripPrefix("com.intellij."), attributes.asJava, java.util.List.of(), null), true)
-        }
-        ep.registerExtensions(descriptors.asJava, plugin, java.util.List.of())
-      }
       val weighers = Descriptors.scalaExtensionBeans(config.scalaPluginJars, "com.intellij.weigher").filter { bean =>
         ScalaPsiHost.CompletionWeighers(bean.implementation) && Set("completion", "proximity").contains(bean.attributes.getOrElse("key", ""))
       }
@@ -428,7 +443,7 @@ private[scalapsihost] object HostBootstrap {
       CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.impl.smartPointers.SmartPointerAnchorProvider.EP_NAME,
         classOf[com.intellij.psi.impl.smartPointers.SmartPointerAnchorProvider])
       CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.ide.IconProvider.EXTENSION_POINT_NAME, classOf[com.intellij.ide.IconProvider])
-      // Java class files look for their source mirror through these policies; the host attaches no library sources.
+      // Java class files consult optional navigation policies before the host's attached-source lookup.
       CoreApplicationEnvironment.registerExtensionPoint(area, com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy.EP_NAME,
         classOf[com.intellij.psi.impl.compiled.ClsCustomNavigationPolicy])
 
@@ -444,14 +459,13 @@ private[scalapsihost] object HostBootstrap {
         // thread, and its write action keeps writers apart.
         new com.intellij.mock.MockFileDocumentManagerImpl(null, (text: CharSequence) =>
           new com.intellij.openapi.editor.impl.DocumentImpl(text, /* forUseInNonAWTThread = */ true)))
-      // Library source files are read as the IDE reads files from disk, guessing their charset: UTF-8 by default (the
-      // JDK's default since 18, and the build tools'), none set per file.
       // The sets of files a package scope holds.
       appServices.register(classOf[com.intellij.openapi.vfs.VirtualFileSetFactory])(new com.intellij.openapi.vfs.VirtualFileSetFactory {
         override def createCompactVirtualFileSet(): com.intellij.openapi.vfs.VirtualFileSet = new HostVirtualFileSet
         override def createCompactVirtualFileSet(files: java.util.Collection[? <: VirtualFile]): com.intellij.openapi.vfs.VirtualFileSet =
           new HostVirtualFileSet(new java.util.LinkedHashSet[VirtualFile](files))
       })
+      // Library text defaults to UTF-8, with no per-file charset override.
       appServices.register(classOf[com.intellij.openapi.vfs.encoding.EncodingManager])(new Host_EncodingManager(dispatch {
         case ("EncodingManager.getEncoding", _) => null
         case ("EncodingManager.getDefaultCharset", _) => java.nio.charset.StandardCharsets.UTF_8
@@ -470,7 +484,8 @@ private[scalapsihost] object HostBootstrap {
       appServices.register(classOf[com.intellij.util.concurrency.TransferredWriteActionService])(
         tableProxy(classOf[com.intellij.util.concurrency.TransferredWriteActionService], "TransferredWriteActionService") {
           case ("runOnEdtWithTransferredWriteActionAndWait" | "runOnBackgroundThreadWithTransferredWriteActionAndWait", Array(r: Runnable)) =>
-            r.run(); null
+            r.run()
+            null
         })
       // Document commits: synchronous, on the editing thread.
       appServices.register(classOf[com.intellij.psi.impl.DocumentCommitProcessor])(new HostDocumentCommitProcessor)
@@ -491,9 +506,9 @@ private[scalapsihost] object HostBootstrap {
       val scalaStyleProvider = tableProxy(classOf[com.intellij.psi.codeStyle.LanguageCodeStyleProvider], "ScalaCodeStyleProvider") {
         case ("getLanguage", _) => org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE
         case ("getDefaultCommonSettings", _) =>
+          val ScalaDefaultIndentSize = 2
           val common = new com.intellij.psi.codeStyle.CommonCodeStyleSettings(org.jetbrains.plugins.scala.ScalaLanguage.INSTANCE)
           val indent = common.initIndentOptions()
-          val ScalaDefaultIndentSize = 2
           indent.INDENT_SIZE = ScalaDefaultIndentSize
           indent.TAB_SIZE = ScalaDefaultIndentSize
           indent.CONTINUATION_INDENT_SIZE = ScalaDefaultIndentSize
@@ -586,9 +601,9 @@ private[scalapsihost] object HostBootstrap {
       // no providers, so event logging has nothing to log to and builds no event. The provider map is private platform
       // state; if it changes, this fails at startup.
       locally {
+        type Providers = java.util.Collection[com.intellij.internal.statistic.eventLog.StatisticsEventLoggerProvider]
         val holder = new com.intellij.internal.statistic.eventLog.StatisticsEventLogProvidersHolder(
           kotlinx.coroutines.CoroutineScopeKt.CoroutineScope(kotlin.coroutines.EmptyCoroutineContext.INSTANCE))
-        type Providers = java.util.Collection[com.intellij.internal.statistic.eventLog.StatisticsEventLoggerProvider]
         val noProviders = new java.util.AbstractMap[String, Providers] {
           override def get(recorder: Any): Providers = java.util.List.of()
           override def entrySet(): java.util.Set[java.util.Map.Entry[String, Providers]] = java.util.Set.of()
@@ -628,6 +643,10 @@ private[scalapsihost] object HostBootstrap {
 
     /** Registers language implementations and library/index services after the root extension area exists. */
     private def installLanguageRegistries(): Unit = {
+      /** Converts IntelliJ's wildcard query arguments to the host's typed word-index predicate. */
+      def wordQuery(words: java.util.Collection[?], checker: Condition[? >: Integer]): WordQuery =
+        WordQuery(words.asScala.map(_.asInstanceOf[IdIndexEntry]).toSeq, mask => checker == null || checker.value(mask))
+
       // ---- 2. Language registries and stub schema: explicit extensions only ---------------------
       val parserDefinitions: Seq[ParserDefinition] = Seq(
         new org.jetbrains.plugins.scala.lang.parser.ScalaParserDefinition,
@@ -703,6 +722,13 @@ private[scalapsihost] object HostBootstrap {
 
       // Stub schema (model): the plugin's serializer/factory registrations and language stub definitions.
       val scalaPlugin = new DefaultPluginDescriptor(PluginId.getId("org.intellij.scala"))
+      /** Associates a language stub definition with the Scala plugin that owns its extension. */
+      def stubDefinition(language: String, definition: LanguageStubDefinition): LanguageExtensionPoint[LanguageStubDefinition] = {
+        val bean = new LanguageExtensionPoint[LanguageStubDefinition](language, definition)
+        bean.setPluginDescriptor(scalaPlugin)
+        bean
+      }
+
       val declaredStubRegistry = declare("com.intellij.stubElementRegistryExtension").asInstanceOf[ExtensionPointImpl[StubRegistryExtension]]
       declaredStubRegistry
         .registerExtension(new org.jetbrains.plugins.scala.lang.psi.stubs.ScalaStubRegistryExtension, root)
@@ -712,12 +738,6 @@ private[scalapsihost] object HostBootstrap {
         newPrivate(classOf[com.intellij.psi.impl.java.stubs.JavaStubElementTypePsiElementMappingRegistry]))
       val stubDefinitions = declare("com.intellij.languageStubDefinition")
         .asInstanceOf[ExtensionPointImpl[LanguageExtensionPoint[LanguageStubDefinition]]]
-      /** Associates a language stub definition with the Scala plugin that owns its extension. */
-      def stubDefinition(language: String, definition: LanguageStubDefinition) = {
-        val bean = new LanguageExtensionPoint[LanguageStubDefinition](language, definition)
-        bean.setPluginDescriptor(scalaPlugin)
-        bean
-      }
       stubDefinitions.registerExtension(stubDefinition("Scala", new org.jetbrains.plugins.scala.lang.psi.stubs.ScalaLanguageStubDefinition), scalaPlugin, root)
       stubDefinitions.registerExtension(stubDefinition("Scala 3", new org.jetbrains.plugins.scala.lang.psi.stubs.Scala3LanguageStubDefinition), scalaPlugin, root)
       stubDefinitions.registerExtension(stubDefinition(com.intellij.lang.java.JavaLanguage.INSTANCE.getID, new com.intellij.psi.impl.java.stubs.JavaStubDefinition), scalaPlugin, root)
@@ -785,9 +805,6 @@ private[scalapsihost] object HostBootstrap {
       val librarySources = this.librarySources
       // The platform's file-based indexes: the file-name index, answered from library roots, and the word index of
       // project sources, which the reference search reads to find the files that mention a name.
-      /** Converts IntelliJ's wildcard query arguments to the host's typed word-index predicate. */
-      def wordQuery(words: java.util.Collection[?], checker: Condition[? >: Integer]) =
-        WordQuery(words.asScala.map(_.asInstanceOf[IdIndexEntry]).toSeq, mask => checker == null || checker.value(mask))
       appServices.register(classOf[com.intellij.util.indexing.FileBasedIndex])(new Host_FileBasedIndex(dispatch {
         case ("FileBasedIndex.getValues", Array(id, qualifier: String, scope: GlobalSearchScope))
             if id == org.jetbrains.plugins.scala.autoImport.ImportOrderingIndexer.Id =>
@@ -883,6 +900,10 @@ private[scalapsihost] object HostBootstrap {
 
     /** Registers the project object and its PSI, indexing, search, and module services. */
     private def installProjectServices(): Unit = {
+      /** Resolves a PSI element's original containing file, including synthetic and stub-backed elements. */
+      def contextFile(element: PsiElement): Option[VirtualFile] =
+        Option(FileContextUtil.getContextFile(element)).map(_.getOriginalFile.getViewProvider.getVirtualFile)
+
       // ---- 3. Project object -----------------------------------------------------------------
       // The platform's modification tracker: it counts the tree changes edits produce (see HostPsiManager).
       // The host's file store: view providers of project sources and of library files, keyed by virtual file; sources
@@ -1131,14 +1152,11 @@ private[scalapsihost] object HostBootstrap {
       projectServices.register(classOf[com.intellij.psi.PsiResolveHelper])(new com.intellij.psi.impl.source.resolve.PsiResolveHelperImpl(project))
       // ScalaDocParserDefinition reads TAB_SIZE from code style: one fixed settings object, never the scheme manager.
       projectServices.register(classOf[com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager]) {
-        val m = new com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager(project, /* loadExtensions = */ false)
-        m.USE_PER_PROJECT_SETTINGS = true
-        m.setMainProjectCodeStyle(new com.intellij.psi.codeStyle.CodeStyleSettings)
-        m
+        val settings = new com.intellij.psi.codeStyle.ProjectCodeStyleSettingsManager(project, /* loadExtensions = */ false)
+        settings.USE_PER_PROJECT_SETTINGS = true
+        settings.setMainProjectCodeStyle(new com.intellij.psi.codeStyle.CodeStyleSettings)
+        settings
       }
-      /** Resolves a PSI element's original containing file, including synthetic and stub-backed elements. */
-      def contextFile(e: com.intellij.psi.PsiElement) =
-        Option(FileContextUtil.getContextFile(e)).map(_.getOriginalFile.getViewProvider.getVirtualFile)
       projectServices.register(classOf[com.intellij.psi.impl.ResolveScopeManager])(new Host_ResolveScopeManager(dispatch {
         // Sources resolve in their module, library classes in the modules that have the library, anything else everywhere;
         // sources are used in their module and the modules that depend on it.
@@ -1217,10 +1235,6 @@ private[scalapsihost] object HostBootstrap {
 
     /** Runs the plugin's project startup activity after all services and element finders are registered. */
     private def startProject(): ScalaPsiHost = {
-      // ---- 4. Project startup the PSI depends on -------------------------------------------------
-      // The plugin's own activity registers the synthetic classes (Any, Int, ...) through DumbService.queueTask.
-      new org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.RegisterSyntheticClassesProjectActivity().execute(project)
-
       // A source file was added or removed, or a library mounted: what the IDE's PsiModificationTrackerImpl and the
       // plugin's ScalaPsiChangeListener do for a change under a directory (not a Scala element).
       /** Invalidates source/library PSI caches and the platform's project modification counter. */
@@ -1230,6 +1244,10 @@ private[scalapsihost] object HostBootstrap {
         org.jetbrains.plugins.scala.lang.psi.impl.ScalaPsiManager.instance(project).clearOnNonScalaChange()
       }
 
+      // ---- 4. Project startup the PSI depends on -------------------------------------------------
+      // The plugin's own activity registers the synthetic classes (Any, Int, ...) through DumbService.queueTask.
+      new org.jetbrains.plugins.scala.lang.psi.impl.toplevel.synthetic.RegisterSyntheticClassesProjectActivity().execute(project)
+
       new ScalaPsiHost(config.stateDir, project, symbolIndex, wordIndex, importIndex, libraryFiles, librarySources, moduleModel, () => psiChanged(),
         new CodeActions(Descriptors.scalaExtensions(config.scalaPluginJars, "com.intellij.intentionAction"),
           Descriptors.scalaExtensions(config.scalaPluginJars, "com.intellij.lang.surroundDescriptor")))
@@ -1238,9 +1256,9 @@ private[scalapsihost] object HostBootstrap {
 
   /** Invokes a plugin/platform constructor that the IDE normally instantiates through its service container. */
   private def newPrivate[T](cls: Class[T], args: AnyRef*): T = {
-    val ctor = cls.getDeclaredConstructors.find(_.getParameterCount == args.size)
+    val constructor = cls.getDeclaredConstructors.find(_.getParameterCount == args.size)
       .getOrElse(throw new IllegalStateException(s"no ${args.size}-argument constructor in ${cls.getName}"))
-    ctor.setAccessible(true)
-    cls.cast(ctor.newInstance(args*))
+    constructor.setAccessible(true)
+    cls.cast(constructor.newInstance(args*))
   }
 }

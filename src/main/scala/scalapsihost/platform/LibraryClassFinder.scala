@@ -15,23 +15,36 @@ import org.jetbrains.plugins.scala.lang.psi.stubs.index.{ScPackageObjectFqnIndex
 import scala.jdk.CollectionConverters.*
 
 /**
- * Classes and packages of the library roots, for `JavaPsiFacadeImpl` — the role the IDE's `PsiElementFinderImpl`
- * plays over its Java indexes:
+ * Resolves classes and packages for the platform's Java PSI facade.
  *
- *  - classes the plugin indexed under `JavaStubIndexKeys.CLASS_FQN` (Scala library classes and project sources;
- *    see [[SymbolIndex]]);
- *  - Java class files, looked up by path on demand instead of indexed, because the JDK alone has tens of
- *    thousands of them and resolution only ever asks for qualified names;
- *  - packages, from the class-root directories and indexed Scala package declarations.
+ * Scala classes come from [[SymbolIndex]]. Java binaries are resolved by path on demand to avoid indexing
+ * the entire JDK; packages combine class-root directories with indexed Scala declarations.
+ * Callers must hold the host's PSI read or write access.
+ *
+ * @param project project owning the PSI and stub indexes
+ * @param files mounted class roots used for binary and package lookup
  */
 final class LibraryClassFinder(project: Project, files: LibraryFileSystem) extends PsiElementFinder {
-  private def psiManager = PsiManager.getInstance(project)
+  /** Obtains the project manager after bootstrap has registered its services. */
+  private def psiManager: PsiManager = PsiManager.getInstance(project)
 
-  /** Returns the first class matching `qualifiedName` in `scope`, if any. */
+  /**
+   * Finds the first visible class with a qualified name.
+   *
+   * @param qualifiedName dotted class name, including nested class names
+   * @param scope eligible source and binary files
+   * @return the first match in index/root order, or null if absent
+   */
   override def findClass(qualifiedName: String, scope: GlobalSearchScope): PsiClass =
     findClasses(qualifiedName, scope).headOption.orNull
 
-  /** Finds indexed Scala classes and Java class files resolved from their package paths. */
+  /**
+   * Finds indexed Scala classes and Java binaries with a qualified name.
+   *
+   * @param qualifiedName dotted class name, including nested class names
+   * @param scope eligible source and binary files
+   * @return distinct matches, with indexed classes before binary-path matches
+   */
   override def findClasses(qualifiedName: String, scope: GlobalSearchScope): Array[PsiClass] = {
     val indexed = StubIndex.getElements(JavaStubIndexKeys.CLASS_FQN, qualifiedName, project, scope, classOf[PsiClass]).asScala.toSeq
     (indexed ++ javaClassesByPath(qualifiedName, scope)).distinct.toArray
@@ -68,22 +81,30 @@ final class LibraryClassFinder(project: Project, files: LibraryFileSystem) exten
     files.classRoots.flatMap(root => if (path.isEmpty) Some(root) else Option(root.findFileByRelativePath(path)).filter(_.isDirectory))
   }
 
-  /** Finds a package backed by a class-root directory or a Scala package declaration. */
+  /**
+   * Finds a directory-backed or source-declared package.
+   *
+   * @param qualifiedName dotted package name, or empty for the root package
+   * @return the package, or null if no directory or Scala declaration backs it
+   */
   override def findPackage(qualifiedName: String): PsiPackage =
     if (directoriesOf(qualifiedName).isEmpty && !isDeclaredPackage(qualifiedName)) null
     else new PsiPackageImpl(psiManager.asInstanceOf[PsiManagerEx], qualifiedName)
 
-  /**
-   * A package that Scala sources declare (a `package` clause or a package object), as the IDE's finder sees source
-   * packages: otherwise the plugin's synthetic packages stand in, and they list subpackages of every module.
-   */
+  /** Detects source-declared packages so synthetic packages do not expose subpackages from every module. */
   private def isDeclaredPackage(qualifiedName: String): Boolean = {
     val everywhere = GlobalSearchScope.allScope(project)
     ScPackagingFqnIndex.instance.hasElement(qualifiedName, project, everywhere, classOf[ScPackaging]) ||
       ScPackageObjectFqnIndex.instance.hasElement(qualifiedName, project, everywhere, classOf[PsiClass])
   }
 
-  /** Returns visible directory-backed and source-declared subpackages without duplicates. */
+  /**
+   * Lists visible directory-backed and source-declared subpackages.
+   *
+   * @param psiPackage parent package
+   * @param scope eligible source and binary files
+   * @return distinct immediate subpackages sorted by name
+   */
   override def getSubPackages(psiPackage: PsiPackage, scope: GlobalSearchScope): Array[PsiPackage] = {
     val packageName = psiPackage.getQualifiedName
     val prefix = if (packageName.isEmpty) "" else packageName + "."
@@ -93,9 +114,7 @@ final class LibraryClassFinder(project: Project, files: LibraryFileSystem) exten
       .map(name => new PsiPackageImpl(psiManager.asInstanceOf[PsiManagerEx], prefix + name): PsiPackage).toArray
   }
 
-  /** The names of the subpackages of `packageName` that sources in `scope` declare: nested packagings, package
-   * objects.
-   */
+  /** Finds immediate subpackage names declared by nested packagings and package objects in scope. */
   private def declaredSubPackages(packageName: String, prefix: String, scope: GlobalSearchScope): Seq[String] = {
     // A packaging is indexed under its own name only: the root package's subpackages are those of every name.
     val packageNames =
@@ -109,7 +128,16 @@ final class LibraryClassFinder(project: Project, files: LibraryFileSystem) exten
     }
   }
 
-  /** Visits source files whose declared packages match, including packages that have no backing directory. */
+  /**
+   * Visits source files by declared package, including packages without backing directories.
+   *
+   * Processing stops when the consumer returns false; a source file is visited at most once.
+   *
+   * @param psiPackage package whose files should be visited
+   * @param scope eligible source files
+   * @param includeSubpackages whether to include descendant packages
+   * @param consumer callback receiving each matching virtual file
+   */
   override def processPackageFiles(psiPackage: PsiPackage, scope: GlobalSearchScope, includeSubpackages: Boolean,
                                    consumer: com.intellij.util.Processor[? >: VirtualFile]): Boolean = {
     val name = psiPackage.getQualifiedName
@@ -123,11 +151,19 @@ final class LibraryClassFinder(project: Project, files: LibraryFileSystem) exten
     sources.forall(consumer.process)
   }
 
-  /** Returns classes from class files directly inside visible package directories, as the IDE's finder does. */
+  /**
+   * Lists binary classes directly inside visible package directories.
+   *
+   * @param psiPackage package whose directories should be searched
+   * @param scope eligible class files
+   * @return classes exposed by PSI class owners in those directories
+   */
   override def getClasses(psiPackage: PsiPackage, scope: GlobalSearchScope): Array[PsiClass] =
     directoriesOf(psiPackage.getQualifiedName).flatMap(_.getChildren)
       .filter(f => !f.isDirectory && f.getName.endsWith(".class") && scope.contains(f))
       .flatMap(f => Option(psiManager.findFile(f)))
-      .collect { case owner: PsiClassOwner => owner.getClasses.toSeq }
-      .flatten.toArray
+      .flatMap {
+        case owner: PsiClassOwner => owner.getClasses.toSeq
+        case _ => Seq.empty
+      }.toArray
 }

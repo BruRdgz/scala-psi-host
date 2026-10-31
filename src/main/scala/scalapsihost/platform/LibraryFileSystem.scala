@@ -13,13 +13,11 @@ import scala.util.Using
 import scala.util.control.NonFatal
 
 /**
- * Library roots as read-only VirtualFiles: class roots (jars through the JDK's zip file system, JDK modules through
- * `jrt:`) and source roots (source jars, the JDK's `src.zip`), as the IDE attaches sources to libraries. Files have
- * parents and children, so the plugin's and the platform's library code can navigate from a class file to its
- * directory (inner classes, `.tasty` siblings) and to its sources.
+ * Exposes library archives and JDK modules as read-only virtual files.
  *
- * This is not the IDE's VFS: no persistence, no refresh, no events. Contents never change while mounted.
- * The instance owns the archive and alternate-JDK file systems it opens; the process host closes them with its root.
+ * Mounted contents must remain unchanged: there is no persistence, refresh or event delivery.
+ * The owner must close this instance after use. It owns archives and alternate-JDK file systems it opens,
+ * while borrowing the running JVM's shared `jrt:` file system.
  */
 final class LibraryFileSystem extends DeprecatedVirtualFileSystem with AutoCloseable {
   /** Root name (shown in paths) → root directory. Insertion order is classpath order. */
@@ -29,11 +27,20 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem with AutoClose
   private val ids = new AtomicInteger()
   /** Zip and alternate JDK file systems opened by this instance; the current JDK's shared jrt is borrowed. */
   private val ownedFileSystems = scala.collection.mutable.LinkedHashSet.empty[FileSystem]
+  /** Each source archive is opened once even when several of its directories are mounted. */
+  private val sourceArchives = new ConcurrentHashMap[Path, FileSystem]()
+  /** Filename index across class and source roots, invalidated by mounts and rebuilt on demand. */
+  @volatile private var byName: Map[String, Seq[VirtualFile]] = null
   private var closed = false
 
   override def getProtocol: String = LibraryFileSystem.Protocol
 
-  /** Mounts a jar; returns its root directory. */
+  /**
+   * Opens and mounts a class archive.
+   *
+   * @param jar archive to keep open until this file system is closed
+   * @return the mounted root directory
+   */
   def mountJar(jar: Path): VirtualFile = synchronized {
     ensureOpen()
     val zip = FileSystems.newFileSystem(jar)
@@ -42,8 +49,14 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem with AutoClose
   }
 
   /**
-   * Mounts a source archive (a source jar, or a directory of one such as a JDK module's in `src.zip`) as a source
-   * root; returns its root directory. Mounting an archive twice mounts it once.
+   * Mounts a source archive or a directory within it.
+   *
+   * Repeated requests for the same archive path and directory reuse the mounted root.
+   * Several directories in one archive share its open ZIP file system.
+   *
+   * @param archive source jar or JDK source ZIP to keep open until close
+   * @param directory directory within the archive, or empty for its root
+   * @return the mounted source root
    */
   def mountSources(archive: Path, directory: String = ""): VirtualFile = synchronized {
     ensureOpen()
@@ -58,10 +71,14 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem with AutoClose
     }
   }
 
-  // Each archive's zip file system, opened once however many of its directories are mounted.
-  private val sourceArchives = new ConcurrentHashMap[Path, FileSystem]()
-
-  /** Mounts every module of the JDK at `javaHome` as a class root (as the IDE does); returns the module roots. */
+  /**
+   * Mounts every module of a JDK as a class root.
+   *
+   * The running JVM's JRT file system is borrowed; an alternate JDK's file system is owned until close.
+   *
+   * @param javaHome JDK installation directory
+   * @return module roots sorted by module path
+   */
   def mountJdk(javaHome: Path): Seq[VirtualFile] = synchronized {
     ensureOpen()
     val (jrt, owned) =
@@ -73,7 +90,12 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem with AutoClose
     modules.map(module => mount(s"jrt:$javaHome!/${module.getFileName}", module, sources = false))
   }
 
-  /** Closes archives and alternate JDKs opened by this instance, leaving the JVM's shared jrt file system alone. */
+  /**
+   * Closes owned file systems and clears mounted-file caches.
+   *
+   * Closing is idempotent and leaves the JVM's borrowed JRT file system open. All owned systems are attempted
+   * in reverse acquisition order; later failures are suppressed on the first. Mounted files must no longer be used.
+   */
   override def close(): Unit = synchronized {
     if (!closed) {
       closed = true
@@ -97,27 +119,42 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem with AutoClose
     }
   }
 
+  /** Rejects mounts after this file system has been closed. */
   private def ensureOpen(): Unit =
     if (closed) throw new IllegalStateException("library file system is closed")
 
-  /** Mounted class roots, in mount order; source archives are excluded. */
+  /**
+   * Captures mounted class roots.
+   *
+   * @return class roots in mount order, excluding attached sources
+   */
   def classRoots: Seq[VirtualFile] = roots.synchronized(roots.values().asScala.toVector.filterNot(_.isLibrarySource))
 
-  /** Mounted source roots, including attached library sources and JDK source directories. */
+  /**
+   * Captures mounted source roots.
+   *
+   * @return library and JDK source roots in mount order
+   */
   def sourceRoots: Seq[VirtualFile] = roots.synchronized(roots.values().asScala.toVector.filter(_.isLibrarySource))
 
   /**
-   * File name → files, over every mounted root (classes and sources); rebuilt after a mount. What the IDE's
-   * FilenameIndex holds for libraries.
+   * Finds mounted files by name across class and source roots.
+   *
+   * The filename index is built on first lookup and invalidated by each mount.
+   *
+   * @param name exact filename to look up
+   * @return matching files, or an empty sequence when absent
    */
-  @volatile private var byName: Map[String, Seq[VirtualFile]] = null
-
-  /** All mounted class or source files named `name`; the filename index is rebuilt lazily after a new mount. */
   def filesNamed(name: String): Seq[VirtualFile] = {
     var index = byName
     if (index == null) {
       val all = Vector.newBuilder[VirtualFile]
-      def visit(f: VirtualFile): Unit = { all += f; if (f.isDirectory) f.getChildren.foreach(visit) }
+      /** Collects a file and its descendants. */
+      def visit(file: VirtualFile): Unit = {
+        all += file
+        if (file.isDirectory) file.getChildren.foreach(visit)
+      }
+
       roots.synchronized(roots.values().asScala.toVector).foreach(r => r.getChildren.foreach(visit))
       index = all.result().groupBy(_.getName)
       byName = index
@@ -138,7 +175,12 @@ final class LibraryFileSystem extends DeprecatedVirtualFileSystem with AutoClose
   private[scalapsihost] def child(parent: LibraryFile, path: Path): LibraryFile =
     files.computeIfAbsent(path, p => new LibraryFile(this, ids.incrementAndGet(), p, parent, rootName = null, sourcesRoot = false))
 
-  /** Paths look like `<root name>!/<entry>`, as for the IDE's jar file system. */
+  /**
+   * Resolves a virtual path within a mounted root.
+   *
+   * @param path root name alone or `<root name>!/<entry>`
+   * @return the matching file, or null if the root or entry is absent
+   */
   override def findFileByPath(path: String): VirtualFile = {
     val separator = path.indexOf("!/")
     val (rootName, entry) = if (separator < 0) (path, "") else (path.substring(0, separator), path.substring(separator + 2))
@@ -160,8 +202,17 @@ object LibraryFileSystem {
 }
 
 /**
- * A library file or directory. It carries an id (VirtualFileWithId) because the plugin decompiles only files of
- * an id-carrying file system; the id is unique within this process and never persisted.
+ * A read-only file or directory within a mounted library root.
+ *
+ * The host-assigned ID supports plugin decompilation and is never persisted. Instances and cached children
+ * retain their identity while mounted; the owning file system must remain open during use.
+ *
+ * @param fs owning library file system
+ * @param id identifier assigned by the owning file system
+ * @param nioPath underlying archive or JRT path
+ * @param parent parent directory, or null for a mounted root
+ * @param rootName virtual path name for a root, unused for descendants
+ * @param sourcesRoot whether a mounted root contains attached sources
  */
 final class LibraryFile private[scalapsihost] (
   fs: LibraryFileSystem,
@@ -176,10 +227,18 @@ final class LibraryFile private[scalapsihost] (
   /** Under a source root (library sources), not a class root. */
   val isLibrarySource: Boolean = if (parent == null) sourcesRoot else parent.isLibrarySource
 
-  /** The root this file is under. */
+  /**
+   * Finds the mounted root containing this file.
+   *
+   * @return this file for a root, otherwise its root ancestor
+   */
   def root: LibraryFile = if (parent == null) this else parent.root
 
-  /** The path from the root, `/`-separated (empty for the root). */
+  /**
+   * Computes the path relative to the mounted root.
+   *
+   * @return a slash-separated entry path, empty for the root
+   */
   def entry: String = if (parent == null) "" else root.nioPath.relativize(nioPath).toString.stripSuffix("/")
 
   private lazy val directory = Files.isDirectory(nioPath)
@@ -197,9 +256,7 @@ final class LibraryFile private[scalapsihost] (
   override def isValid: Boolean = true
   override def getParent: VirtualFile = parent
 
-  /**
-   * Cached once because mounted library contents do not change, and package lookup repeatedly asks roots for children.
-   */
+  /** Caches immutable mounted contents for repeated package lookups. */
   private lazy val childrenByName: Map[String, LibraryFile] =
     if (!directory) Map.empty
     else Using.resource(Files.list(nioPath)) { entries =>

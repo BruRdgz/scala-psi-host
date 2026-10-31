@@ -2,24 +2,18 @@ package scalapsihost.platform
 
 import scala.jdk.CollectionConverters.*
 
-/**
- * The host's read/write lock, the IDE's read and write actions: queries and copy changes read concurrently,
- * an editor edit writes alone.
- * An edit first cancels the running queries (their progress indicators), as the IDE cancels background reads for a
- * pending write: the platform's and the plugin's code checks for cancellation as it works, so a query stops with
- * `ProcessCanceledException` and releases the lock. The lock is fair: queries started after a waiting edit wait
- * for it.
- */
+/** Coordinates fair read/write actions, write intent and cancellation of active queries. */
 private[scalapsihost] object HostLock {
   private val lock = new java.util.concurrent.locks.ReentrantReadWriteLock(/* fair = */ true)
   private val queries = java.util.concurrent.ConcurrentHashMap.newKeySet[com.intellij.openapi.progress.ProgressIndicator]()
 
-  /** Whether the current thread holds a host read lock. */
-  def isReading: Boolean = lock.getReadHoldCount > 0
   private val intent = new java.util.concurrent.locks.ReentrantLock(true)
   private val writeListeners = new java.util.concurrent.CopyOnWriteArrayList[com.intellij.openapi.application.WriteActionListener]()
   private val readListeners = new java.util.concurrent.CopyOnWriteArrayList[com.intellij.openapi.application.ReadActionListener]()
   private val intentListeners = new java.util.concurrent.CopyOnWriteArrayList[com.intellij.openapi.application.WriteIntentReadActionListener]()
+
+  /** Whether the current thread holds a host read lock. */
+  def isReading: Boolean = lock.getReadHoldCount > 0
 
   /** Whether the current thread holds the exclusive edit lock. */
   def isWriting: Boolean = lock.isWriteLockedByCurrentThread
@@ -31,28 +25,33 @@ private[scalapsihost] object HostLock {
   def addWriteListener(listener: com.intellij.openapi.application.WriteActionListener,
                        parent: com.intellij.openapi.Disposable): Unit = {
     writeListeners.add(listener)
-    com.intellij.openapi.util.Disposer.register(parent, (() => { writeListeners.remove(listener); () }): com.intellij.openapi.Disposable)
+    com.intellij.openapi.util.Disposer.register(parent, (() => {
+      writeListeners.remove(listener)
+      ()
+    }): com.intellij.openapi.Disposable)
   }
 
   /** Registers a read-action listener and removes it when `parent` is disposed. */
   def addReadListener(listener: com.intellij.openapi.application.ReadActionListener,
                       parent: com.intellij.openapi.Disposable): Unit = {
     readListeners.add(listener)
-    com.intellij.openapi.util.Disposer.register(parent, (() => { readListeners.remove(listener); () }): com.intellij.openapi.Disposable)
+    com.intellij.openapi.util.Disposer.register(parent, (() => {
+      readListeners.remove(listener)
+      ()
+    }): com.intellij.openapi.Disposable)
   }
 
   /** Registers a write-intent listener and removes it when `parent` is disposed. */
   def addIntentListener(listener: com.intellij.openapi.application.WriteIntentReadActionListener,
                         parent: com.intellij.openapi.Disposable): Unit = {
     intentListeners.add(listener)
-    com.intellij.openapi.util.Disposer.register(parent, (() => { intentListeners.remove(listener); () }): com.intellij.openapi.Disposable)
+    com.intellij.openapi.util.Disposer.register(parent, (() => {
+      intentListeners.remove(listener)
+      ()
+    }): com.intellij.openapi.Disposable)
   }
 
-  /**
-   * Serializes potential writers while allowing concurrent readers; reentrant on the owning thread.
-   *
-   * @throws IllegalStateException when entered from a read without an existing write intent
-   */
+  /** Serializes potential writers reentrantly, rejecting upgrades from a read without existing intent. */
   def writeIntent[T](body: => T): T = {
     if (isReading && !hasWriteIntent) throw new IllegalStateException("write intent cannot start inside a read")
     if (hasWriteIntent) body
@@ -96,28 +95,20 @@ private[scalapsihost] object HostLock {
   /** [[readLocked]] for Java callers. */
   def readLocked[T](body: java.util.concurrent.Callable[T]): T = readLocked(body.call())
 
-  /**
-   * Runs a cancellable read. Nested reads share the outer query's indicator and lock.
-   *
-   * @throws com.intellij.openapi.progress.ProcessCanceledException when a pending edit cancels the query
-   */
+  /** Runs a cancellable read, reusing an outer read or write and its cancellation scope. */
   def query[T](body: => T): T =
     if (isReading || isWriting) body
     else {
       val indicator = new com.intellij.openapi.progress.EmptyProgressIndicator
       readLocked {
+        // Platform/plugin cancellation checks observe this indicator and release the read through runProcess.
         queries.add(indicator)
         try com.intellij.openapi.progress.ProgressManager.getInstance.runProcess((() => body): com.intellij.openapi.util.Computable[T], indicator)
         finally queries.remove(indicator)
       }
     }
 
-  /**
-   * Cancels running queries and executes `body` under write intent and the exclusive write lock.
-   * Nested writes reuse the owning thread's locks.
-   *
-   * @throws IllegalStateException when a read attempts to acquire the write lock
-   */
+  /** Cancels active queries and writes exclusively, reusing nested writes and rejecting read-to-write upgrades. */
   def write[T](body: => T): T = {
     // A read lock cannot become a write lock: waiting for it here would wait for this thread's own read forever.
     if (isReading && !isWriting) throw new IllegalStateException("an edit cannot start inside a read")
@@ -142,11 +133,7 @@ private[scalapsihost] object HostLock {
   }
 }
 
-/**
- * The host's event dispatch thread: a thread without UI where work the platform schedules for the IDE's UI thread
- * (`invokeLater`, `invokeAndWait`) runs. It is declared to the platform as its EDT the way the IDE's event queue
- * declares it (`EDT.updateEdt`), so the platform's EDT checks hold there.
- */
+/** Runs platform UI-thread callbacks on a process-owned daemon registered as the platform's EDT. */
 private[scalapsihost] object HostDispatchThread {
   private val executor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable =>
     val thread = new Thread(runnable, "scala-psi-host-dispatch")
@@ -165,9 +152,7 @@ private[scalapsihost] object HostDispatchThread {
   def invokeAndWait(action: Runnable): Unit =
     if (isCurrent) action.run() else executor.submit(action).get()
 
-/** The result of `body` run on the dispatch thread, as the IDE runs the steps of a refactoring; its failure is
- * rethrown here.
- */
+  /** Runs on the dispatch thread and returns the result, rethrowing the operation's failure on the caller. */
   def call[T](body: => T): T =
     if (isCurrent) body
     else

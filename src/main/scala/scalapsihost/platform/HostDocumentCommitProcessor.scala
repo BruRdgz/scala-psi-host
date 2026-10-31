@@ -10,11 +10,22 @@ import com.intellij.psi.impl.{BlockSupportImpl, BooleanRunnable, ChangedPsiRange
 import scala.jdk.CollectionConverters.*
 
 /**
- * Document commits as the IDE's DocumentCommitThread makes them, synchronously only: editor documents commit under
+ * Commits document changes synchronously into existing PSI trees.
+ *
+ * Editor documents commit under
  * the write lock, preview copies under a read. For each PSI file, the range that changed since the last commit
  * is reparsed, and the resulting difference is applied to the existing tree, which sends the tree change events.
  */
 final class HostDocumentCommitProcessor extends DocumentCommitProcessor {
+  /**
+   * Reparses changed ranges and applies their tree changes before completing the commit.
+   *
+   * The caller holds the write lock for physical files or the preview read scope for copies.
+   *
+   * @param document edited document
+   * @param project project owning the document manager
+   * @param psiFile file supplied by the platform; all cached view-provider files are committed
+   */
   override def commitSynchronously(document: Document, project: Project, psiFile: PsiFile): Unit = {
     val documents = PsiDocumentManager.getInstance(project).asInstanceOf[PsiDocumentManagerBase]
     val lastCommitted = documents.getLastCommittedText(document)
@@ -25,7 +36,10 @@ final class HostDocumentCommitProcessor extends DocumentCommitProcessor {
       changed <- Option(ChangedPsiRangeUtil.getChangedPsiRange(file, document, lastCommitted, text))
     } yield {
       val reparsed = BlockSupportImpl.reparse(file, file.getNode, changed, text, new EmptyProgressIndicator, lastCommitted)
-      (() => { reparsed.log.doActualPsiChange(file); true }): BooleanRunnable
+      (() => {
+        reparsed.log.doActualPsiChange(file)
+        true
+      }): BooleanRunnable
     }
     documents.finishCommit(document, applyChanges.asJava, java.util.List.of(), DocumentCommitKind.Synchronous.INSTANCE, "host edit")
   }

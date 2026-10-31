@@ -7,39 +7,66 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.jdk.CollectionConverters.*
 
 /**
- * Ledger of every adapter call. Its distinct entries are the measured adapter surface; an `UNSUPPORTED` entry
- * means the plugin or platform asked the host for something outside its tables.
+ * Records the host's adapter surface and unsupported calls.
+ *
+ * Answered calls are counted only when [[countsAnswered]] is enabled. Unsupported calls and logged errors
+ * are always recorded; counts accumulate for the lifetime of the process.
  */
 object CallLog {
   private val counts = new ConcurrentHashMap[String, AtomicInteger]()
   /**
-   * Whether the calls the host answers are counted too, not only unsupported calls and logged errors: the adapter
-   * surface test needs them. A server does not, and counting each of the platform's calls cost a tenth of its CPU.
+   * Enables counting of answered calls for adapter-surface tests.
+   *
+   * Disabled in normal server use to avoid accounting on every platform call.
    */
   @volatile var countsAnswered = false
 
-  /** Records one adapter call under its diagnostic name. */
+  /**
+   * Records one adapter call.
+   *
+   * @param name diagnostic name used to aggregate calls
+   */
   def hit(name: String): Unit = counts.computeIfAbsent(name, _ => new AtomicInteger()).incrementAndGet()
 
-  /** A call the host answered from its tables; its name is only made when such calls are counted. */
+  /**
+   * Records an answered call when counting is enabled.
+   *
+   * @param name diagnostic name, evaluated only when counting is enabled
+   */
   def answered(name: => String): Unit = if (countsAnswered) hit(name)
 
-  /** Records and throws for a call outside the host's explicit adapter surface. */
+  /**
+   * Records and rejects a call outside the host's adapter surface.
+   *
+   * @tparam T result type expected by the unsupported caller
+   * @param name diagnostic name of the unsupported call
+   * @return never returns normally
+   * @throws UnsupportedOperationException for every call
+   */
   def unsupported[T](name: String): T = {
     hit("UNSUPPORTED " + name)
     throw new UnsupportedOperationException("host adapter does not support: " + name)
   }
 
-  /** The adapter-call counts, sorted by name for stable status output and tests. */
+  /**
+   * Captures adapter-call counts for status output and tests.
+   *
+   * Counts may continue to change while the snapshot is collected.
+   *
+   * @return diagnostic names and counts, sorted by name
+   */
   def snapshot: Seq[(String, Int)] = counts.asScala.toSeq.map((k, v) => (k, v.get)).sortBy(_._1)
 }
 
 /**
- * The platform's and plugin's `Logger`, writing to [[HostLog]]: as in the IDE, `LOG.error` reports and execution
- * continues (the platform's `DefaultLogger` is the unit-test logger and throws instead). Each logged error is recorded
+ * Routes platform and plugin warnings and errors to [[HostLog]].
+ *
+ * As in the IDE, `LOG.error` reports and execution continues. Each logged error is recorded
  * in [[CallLog]], so a run that logs one shows it in the adapter surface. Unsupported adapter calls are recorded
  * before they throw, so a caller that catches and logs one does not hide it. Their info and debug messages are not
  * kept (the IDE's default log level).
+ *
+ * @param category platform logger category included in diagnostics
  */
 final class HostLogger(category: String) extends com.intellij.openapi.diagnostic.DefaultLogger(category) {
   override def error(message: String, t: Throwable, details: String*): Unit = {
@@ -56,8 +83,16 @@ private val NotAnswered = new AnyRef
 private val Unanswered: Any => AnyRef = _ => NotAnswered
 
 /**
- * A fixed-table proxy: identity methods use the proxy itself, declared answers take precedence over interface
+ * Creates an interface proxy backed by explicit answers.
+ *
+ * Identity methods use the proxy itself, declared answers take precedence over interface
  * defaults, and unhandled calls are recorded by [[CallLog]] before throwing `UnsupportedOperationException`.
+ *
+ * @tparam T interface implemented by the proxy
+ * @param iface interface class to implement
+ * @param label diagnostic prefix for calls and the proxy's string representation
+ * @param answer supported method names and arguments, returning boxed results or null
+ * @return a proxy implementing `iface`
  */
 def tableProxy[T](iface: Class[T], label: String)(answer: PartialFunction[(String, Array[AnyRef]), AnyRef]): T = {
   val handler: InvocationHandler = (proxy: AnyRef, m: Method, args0: Array[AnyRef]) => {
@@ -68,21 +103,34 @@ def tableProxy[T](iface: Class[T], label: String)(answer: PartialFunction[(Strin
       case "toString" if args.isEmpty => s"Host$label"
       case name =>
         val answered = answer.applyOrElse((name, args), Unanswered)
-        if (answered ne NotAnswered) { CallLog.answered(s"$label.$name"); answered }
-        else if (m.isDefault) { CallLog.answered(s"$label.$name (default)"); InvocationHandler.invokeDefault(proxy, m, args*) }
-        else CallLog.unsupported(s"$label.$name")
+        if (answered ne NotAnswered) {
+          CallLog.answered(s"$label.$name")
+          answered
+        } else if (m.isDefault) {
+          CallLog.answered(s"$label.$name (default)")
+          InvocationHandler.invokeDefault(proxy, m, args*)
+        } else CallLog.unsupported(s"$label.$name")
     }
   }
   iface.cast(Proxy.newProxyInstance(iface.getClassLoader, Array[Class[?]](iface), handler))
 }
 
-/** Answer table for generated Host_* subclasses (see tools/Gen.java); unanswered abstract methods fail loudly. */
+/**
+ * Creates the dispatch callback used by generated `Host_*` subclasses.
+ *
+ * Unanswered abstract methods are recorded and rejected; see `tools/Gen.java`.
+ *
+ * @param answer supported method names and arguments, returning boxed results or null
+ * @return the generated adapter's dispatch callback
+ */
 def dispatch(answer: PartialFunction[(String, Array[AnyRef]), AnyRef]): Dispatch =
   (method: String, args0: Array[AnyRef]) => {
     val args = if (args0 == null) Array.empty[AnyRef] else args0
     val answered = answer.applyOrElse((method, args), Unanswered)
-    if (answered ne NotAnswered) { CallLog.answered(method); answered }
-    else CallLog.unsupported(method)
+    if (answered ne NotAnswered) {
+      CallLog.answered(method)
+      answered
+    } else CallLog.unsupported(method)
   }
 
 /** The host has no annotation inference engine; declared annotations remain in PSI. */
@@ -98,10 +146,13 @@ private[scalapsihost] final class HostInferredAnnotationsManager extends com.int
 }
 
 /**
- * The fixed service table of one component manager (the Application or the Project object). Only services
- * registered here exist; any other `getService` fails loudly. Instances are created on first request.
+ * Supplies explicitly registered services for one application or project.
+ *
+ * Unregistered services fail loudly. Instances are created on first request.
  * Concurrent first requests may invoke a factory more than once; all callers receive the instance published first.
  * Factories can request other registered services, so creation cannot use a nested `computeIfAbsent`.
+ *
+ * @param label component-manager name included in diagnostics
  */
 final class ServiceTable(label: String) {
   private val factories = new ConcurrentHashMap[Class[?], () => AnyRef]()
@@ -109,16 +160,39 @@ final class ServiceTable(label: String) {
   /** Services the host deliberately answers with null (the caller tolerates it). */
   private val nulls = ConcurrentHashMap.newKeySet[Class[?]]()
 
-  /** Registers a lazy factory for a service class; the factory runs on its first request. */
+  /**
+   * Registers a service factory for lazy creation.
+   *
+   * Register before requesting the service; an already published instance is retained.
+   * Factories must tolerate concurrent first requests constructing more than one candidate.
+   *
+   * @tparam T service type
+   * @param cls service class used as the lookup key
+   * @param make factory expression evaluated when an instance is needed
+   */
   def register[T <: AnyRef](cls: Class[T])(make: => T): Unit = factories.put(cls, () => make)
 
-  /** Registers a service class whose callers explicitly tolerate a `null` service. */
+  /**
+   * Registers an intentionally absent service whose callers tolerate null.
+   *
+   * @param cls service class whose lookups should return null
+   */
   def registerNull(cls: Class[?]): Unit = nulls.add(cls)
 
-  /** Returns or lazily creates the registered service, failing if this component manager does not provide it. */
+  /**
+   * Returns or lazily creates a registered service.
+   *
+   * Explicit null registrations take precedence over factories and cached instances.
+   *
+   * @param cls registered service class
+   * @return the published instance, or null for an explicit null registration
+   * @throws UnsupportedOperationException when the service is unregistered
+   */
   def get(cls: Class[?]): AnyRef =
-    if (nulls.contains(cls)) { CallLog.answered(s"$label.service(null) ${cls.getName}"); null }
-    else {
+    if (nulls.contains(cls)) {
+      CallLog.answered(s"$label.service(null) ${cls.getName}")
+      null
+    } else {
       val make = factories.get(cls)
       if (make == null) CallLog.unsupported(s"$label.getService ${cls.getName}")
       else {
