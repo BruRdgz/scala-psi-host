@@ -7,7 +7,55 @@ provides it, unlocks a group of features.
 A feature is done when an oracle over the plugin's own test data (`scala/scala-impl/testdata` in intellij-scala)
 agrees with the host, and the cases that do not agree are explained in the README, as for type inference today.
 
-## Infrastructure
+## Current state — 2026-10-31
+
+The host already provides Scala 2/3 diagnostics, navigation, project-wide text search, symbols, folding, semantic tokens,
+completion, signature help, inlay hints, selection ranges, IntelliJ/scalafmt formatting, rename, organize imports, and
+previewable code actions. The documented limitations remain in [README.md](README.md#known-limitations): compiler-index
+searches and Java class indexing are incomplete, some UI-dependent actions and hints are unavailable, and inspections
+are not run.
+
+**Verification checkpoint:** before the organization work, `sbt test` passed 108 tests. After the bootstrap,
+resource-lifecycle, stable-module-identity, and package changes, `sbt test` passed 112/112. The final import and
+threading-documentation cleanup then passed `sbt compile "Test / compile"`; those cleanup-only edits were not followed
+by another test run. `sbt dist` passed, and the built distribution completed the fixture smoke journey (diagnostics,
+hover, definition request, shutdown) with exit code 0. Temporary `Host_StubIndex` generation and `javac` compilation
+using the exported compile classpath passed; the checked-in adapter still contains both maintained overloads.
+Beta 1 remains implemented but untagged, and Beta 2 closed without inspections.
+
+### Ownership and lifecycle constraints
+
+- The IntelliJ application and extension area are JVM-wide. One host is created per JVM; replacing or restarting it
+  requires a process restart. Multiple-project support is outside this roadmap.
+- The process root owns platform state and the host library file system. It closes file systems opened for archives or
+  alternate JDKs on JVM shutdown, and leaves the running JVM's shared JDK file system open.
+- Each `ProjectSession` owns its BSP client connection, scalafmt instance, and document compiler. Session close waits
+  for in-flight document compilations before releasing their compiler class loaders; it does not reset the process host.
+- Build target IDs identify modules and their dependencies. Display names remain for presentation and may be
+  ambiguous; existing `ModuleSpec` callers without an ID continue to use the name as the default ID.
+
+### Next milestones
+
+1. Follow the platform/plugin upgrade procedure in [ARCHITECTURE.md](ARCHITECTURE.md#platform-and-plugin-upgrades)
+   before the next dependency upgrade: use a matching platform/plugin pair, review generated adapter diffs, and run
+   the adapter surface plus semantic checks for changed boundaries. The surface test is one gate, not a compatibility
+   verdict on its own.
+2. Decide whether inspections belong in a later milestone. They are not part of Beta 1 or Beta 2.
+
+#### Current package ownership
+
+- `scalapsihost.platform`: IntelliJ bootstrap, adapters, threading, files, and indexes; flat initially.
+- `scalapsihost.build`: BSP, compiler, and scalafmt integration.
+- `scalapsihost.workspace`: project-session and build-import lifecycle.
+- `scalapsihost.language`: language operations and internal result models.
+- `scalapsihost.lsp`: transport and request/response mapping.
+- `scalapsihost`: root `ScalaPsiHost` facade and caller-facing `HostConfig`, `Diagnostic`, `ModuleSpec`, `HostModule`,
+  `ModuleModel`, `LineColumn`, and `LibraryIndexReport` types.
+
+The package map describes the current implementation. The historical milestones below retain their oracle counts and
+limitations as recorded at the time.
+
+## Original infrastructure sequence
 
 - **A. Read-only, one file.** Nothing new: walk the PSI, or capture what the plugin already produces.
 - **B. Project-wide search.** A word index (`IdIndex`) over the sources and a host `PsiSearchHelper`, behind the
@@ -44,9 +92,10 @@ The change engine and the formatter (beta 1), completion, signature help, select
 
 ## Beta 1 — changes
 
-Implementation complete on 2026-10-31 within the preview and search limits documented in README. Release not tagged.
-The complete suite passes 108 tests; the rebuilt distribution also formats through scalafmt over LSP stdio.
-Inspections remain a separate, undecided milestone.
+Implementation completed on 2026-10-31 within the preview and search limits documented in README; the release is not
+tagged. At the pre-organization checkpoint on that date, the complete suite passed 108 tests and a rebuilt distribution
+formatted through scalafmt over LSP stdio. Those checks predate the current organization work. Inspections remain a
+separate, undecided milestone.
 
 - `CodeStyleManager` and the formatter; formatting, range formatting. **Done:** `FormatterOracle`: 187 agree,
   0 disagree, 0 skip. Whole-file requests honor the nearest workspace `.scalafmt.conf` through the plugin's dynamic

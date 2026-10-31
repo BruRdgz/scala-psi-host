@@ -1,366 +1,147 @@
 # scala-psi-host
 
-> **Beta.** Diagnostics, hover, go-to-definition, references, implementations, workspace symbols, completion,
-> signature help, inlay hints, selection ranges, IntelliJ/scalafmt formatting, rename, organize imports and
-> previewable code actions work.
-> See [ROADMAP.md](ROADMAP.md) and
-> [Known limitations](#known-limitations).
+A Scala language server powered by the IntelliJ Scala plugin, running in a standalone process without the IntelliJ
+application container. It provides editor features through the Language Server Protocol (LSP) and imports Scala 2
+and Scala 3 projects through the Build Server Protocol (BSP).
 
-A Scala language server built on the IntelliJ Scala plugin's PSI and type checker, running **without an IntelliJ
-application container**. The plugin source is not modified: the host builds the plugin from intellij-scala and
-answers, through fixed tables, what the plugin and the IntelliJ platform's PSI libraries ask of their environment.
+The project is in beta. Integration tests use sbt builds; mixed Scala/Java projects have partial Java support.
 
-It serves LSP diagnostics, hover, go to definition, type definition and implementation, references, document
-highlights, document and workspace symbols, folding ranges, semantic tokens, completion, signature help, inlay
-hints, selection ranges, formatting, rename and code actions for sbt (or any BSP) builds, Scala 2 and 3, with Java sources in mixed projects.
+## Features
 
-Completion lists the suggestions of the plugin's completion contributors, ordered by its weighers; a suggestion's
-insert handler (parentheses, imports, generated code) runs once the user has chosen it, as in the IDE: the item's
-command asks the server, which applies the handler's edits (`workspace/applyEdit`) and moves the caret
-(`window/showDocument`). Formatting returns minimal edits without changing the source. With no `.scalafmt.conf`,
-it runs the IntelliJ formatter on a preview copy. Whole-file requests use scalafmt when a config exists: the nearest
-config between the file and workspace root wins; sources outside the workspace use the root's config. The config
-must declare a version. The plugin's bundled dynamic engine loads that version, resolving missing dependencies
-from Maven Central into `<state-dir>/scalafmt` and reusing the disk cache on later runs. Configured project exclusion
-filters apply; invalid configurations, source syntax or downloads fail the request and show an error. Range requests
-keep the IntelliJ formatter, matching the plugin's default for ranges.
-
-Rename runs the plugin's rename processors over the project's sources, including companions, overriders and
-references. Package-private use scopes use the packages declared in source text, including child packages.
-A conflict or invalid name refuses the request. The host restores its files before returning the edits;
-the editor applies them and reports the changed text. File names and optional automatic renames stay unchanged.
-The processors' unit-test answers choose base members and matching getters/setters without dialogs, only while
-choosing the target and preparing the related renames on the current thread.
-
-Code actions offer the plugin's available intentions and the quick fixes attached to its annotations, plus
-surrounders for a selection. Each runs on a copy through the change engine and the platform's preview or mod-command
-contract. The response contains versioned text edits; the source is left unchanged until the editor reports the edits.
-Type-import actions query the plugin's candidates synchronously and offer each qualified name separately; the
-plugin's reference binding applies the chosen import on the copy. The plugin's import-order index follows source
-opens, edits and closes. Actions requiring dialogs, other files, or unsupported previews are unavailable.
-Inspections are not run.
-
-Organize imports is the plugin's `ScalaImportOptimizer`: it analyzes usage on a preview copy and returns versioned
-edits through `source.organizeImports`. It is computed only when the client requests source actions; contextual
-quick fixes can be requested alongside it. The original file remains unchanged until the editor applies the edits.
-
-Inlay hints come from the plugin's `ImplicitHintsPass`: inferred definition types, parameter names, implicit and
-`using` arguments, conversions, method chains and type arguments. The plugin's settings and defaults apply (parameter
-names and local/member variable types are off by default); implicit hints are enabled. Only the two range-hint
-options are disabled, since their presentation requires the IDE's concrete editor.
-
-Selection ranges replay Extend Selection through the platform's `SelectWordUtil`, with its base handlers and the
-plugin's handlers and filter registered from descriptors. Each parent is the next IDE step, using the current
-selection, the editor's default settings and the plugin's layered highlighting lexer.
-
-Symbols and folding are the plugin's structure view and folding builder; highlights and type definition, its access
-detector and type-declaration provider; semantic tokens, the colors its highlighting visitor and color-scheme
-annotator give identifiers (the editor's grammar colors keywords, literals and comments).
-
-References and implementations search the whole project, not the open file: the host keeps a word index of the
-sources (the platform's `IdIndex`, updated on every edit), and the platform's reference search runs over it with the
-plugin's searchers. References are what the plugin's find-usages handler reports with its default options (a class
-with its companion, a member with its overriders as the handler decides), for the symbol referenced or declared at the
-position, and with `includeDeclaration` the declaration's name. Implementations are the subclasses, overriders and
-implementations of a class or member, and, as in the IDE, the member itself when asked from a use of one that has none.
-Workspace symbols match a query against the names of the project's classes and members with the IDE's go to symbol
-matching (camel humps and word starts anywhere in a name; `pkg.Name` matches the qualified name) and list the best 100.
-All three answer for the project's sources only, never the libraries'.
-
-## How it works
-
-The host installs three fixed tables before any PSI exists, then only consumes the plugin's PSI:
-
-- an `Application` object (`java.lang.reflect.Proxy`, `ApplicationEx`) with a fixed service table;
-- a root extension area with extension-point *declarations* read from descriptor XML, plus explicit language
-  extensions (parser definitions, view providers, AST factories, stub schema) and the plugin's semantic extensions;
-- a `Project` object with a fixed service table.
-
-Anything the plugin or platform asks for outside those tables throws, and every adapter call is recorded in
-`CallLog`; a platform or plugin upgrade that changes the surface fails `AdapterSurfaceTest`. Plugin XML is read as
-data only. Logged errors (`LOG.error`) are reported and recorded instead of thrown, as in the IDE.
-
-What the host provides instead of the IDE:
-
-- **Project model** from the build, over BSP: one module per Scala build target, with its Scala version (a Scala SDK
-  library), compiler options (a compiler-settings profile), classpath jars and module dependencies, and a resolve
-  scope per module.
-- **Build changes**: the client watches the build's definition (`*.sbt`, `project/`) and created or deleted source
-  files; on a change the server imports the build again (reloading its definition first when it changed) and
-  applies the difference: new sources are opened, removed ones closed, and a module whose definition changed is
-  added again with the modules that depend on it, its files reopened with the editor's text. Requests wait while
-  the build reloads.
-- **Files**: library jars and the JDK as read-only virtual files (`LibraryFileSystem`); project sources as physical
-  files (`SourceFile`) whose text is the editor's. Library PSI is stub-based, as in the IDE (Scala 3 libraries from
-  TASTy); source syntax trees can be dropped and rebuilt under memory pressure.
-- **Library sources**: the build's source jars (BSP `dependencySources`; sbt downloads them on import) and the JDK's
-  `src.zip`, attached to their libraries as in the IDE; source files are parsed when navigated to, never indexed. Go
-  to definition into a library opens its source, found as the IDE finds it (the plugin's navigation elements), or its
-  decompiled class file when it has no sources: either is written, read-only, under
-  `$SCALA_PSI_HOST_STATE/library-files`, since editors open files, not jar entries.
-- **Index**: the plugin's and the Java stub indexers over library and source stubs, in memory (`SymbolIndex`).
-- **Editing**: document changes are committed synchronously in the host's write action; the platform reparses the
-  changed range and the plugin's own PSI listener invalidates its caches.
-- **Threads**: a fair read/write lock as the IDE's read and write actions (`HostLock`): queries read concurrently,
-  an edit cancels them and writes alone. Work the platform schedules for the UI thread runs on a dispatch thread
-  without UI, declared to the platform as its EDT.
-- **Errors**: the plugin's highlighting (`ScalaAnnotator`), and for files whose errors come from the compiler
-  (Scala 3 by default, as in the IDE) the compiler's: the module's own Scala 3 compiler on the document's current
-  text (`DocumentCompiler`), or the build's compile on save.
-- Usage statistics are turned off: building an event would write a device id into the user's Java preferences.
+- Diagnostics from the Scala plugin and compiler, including current-buffer compilation for Scala 3.
+- Hover documentation, definitions, type definitions, references and implementations.
+- Completion with automatic imports and insertion handlers, signature help and inlay hints.
+- Rename, organize imports, previewable quick fixes, intentions and surround actions.
+- Whole-file and range formatting with scalafmt or the IntelliJ formatter.
+- Document highlights, outlines, folding, selection ranges and semantic tokens.
+- Workspace symbol search and module-aware resolution.
+- Navigation into library sources or decompiled class files.
 
 ## Build
 
-Needs JDK 25 for sbt itself (the plugin and platform 263.x are class file 69):
+Requires Git, sbt and **JDK 25** for both the build and the server.
 
-The host is built against one revision of intellij-scala, pinned in `build.sbt` (`scalaPluginRevision`, currently
-`491569803c` on branch `idea263.x`); the build checks that `../intellij-scala` is at it.
+The IntelliJ Platform version and Scala plugin revision are pinned in [build.sbt](build.sbt). From the repository
+root, build the plugin in a sibling checkout, then build the host:
 
 ```sh
-# 1. The Scala plugin, from an intellij-scala checkout next to this repo (~10 min, ~6 GB RSS)
+export JAVA_HOME=/absolute/path/to/jdk-25
+
 git clone https://github.com/JetBrains/intellij-scala ../intellij-scala
 git -C ../intellij-scala checkout 491569803c6c3c2f93a0bda51490425fda237fc0
-(cd ../intellij-scala && sbt --java-home <jdk25> packageArtifactZip)
+(
+  cd ../intellij-scala
+  sbt --java-home "$JAVA_HOME" packageArtifactZip
+)
 
-# 2. The host, its tests and the distribution
-sbt --java-home <jdk25> test dist
+sbt --java-home "$JAVA_HOME" dist
 ```
 
-`SCALA_PLUGIN_LIB` points the build at another build of the plugin's jars (default
-`../intellij-scala/target/plugin/Scala/lib`); its revision is then not checked.
-Platform jars come from the IntelliJ snapshots repository at the version pinned in `build.sbt`. The build resolves
-`ide-impl` only as input to `inlayPlatformJar`: it extracts the hints-filtering package, `TooltipGroup`, `HintRenderer`
-and its companion into a small jar. The full `ide-impl` jar is kept off the host's compile/runtime classpath and out
-of the distribution.
+The distribution is written to `target/dist/`. Its launcher is `target/dist/bin/scala-psi-host`; keep the `bin/` and
+`lib/` directories together when moving it.
 
-The BSP tests use `fixtures/bsp-project`, an sbt build; create its connection file once with `sbt bspConfig` in that
-directory. sbt keeps a build server running per build directory after its clients leave (`sbt shutdown` there
-stops it).
+By default, the build reads plugin jars from `../intellij-scala/target/plugin/Scala/lib` and verifies the checkout's
+revision. Set `SCALA_PLUGIN_LIB` to use another plugin build's `Scala/lib` directory. This skips the revision check;
+the supplied jars must still match the host's platform dependencies.
 
-## Use
+## Usage
 
-`sbt dist` writes the distribution to `target/dist`: `bin/scala-psi-host` and `lib/`. The script speaks LSP on stdin
-and stdout; an editor starts it in a project that has a BSP connection file (`.bsp/`, e.g. from `sbt bspConfig`).
+Your Scala project needs a BSP connection file under `.bsp/`. For sbt, run this from the project's root using the
+JDK required by that build:
 
-- JDK 25: `JAVA_HOME`, or `java` on the `PATH`.
-- `SCALA_PSI_HOST_STATE`: the platform's state directory (default `$XDG_CACHE_HOME/scala-psi-host`).
-- `SCALA_PSI_HOST_HEAP`: maximum heap (default `2g`; a 500-file Scala 3 project fits in 1.5 GB).
-- `SCALA_PSI_HOST_LOG=debug`: log every request, with how long it ran and waited.
+```sh
+sbt bspConfig
+```
 
-### Is it working?
+Configure your editor's LSP client to launch the distribution's `bin/scala-psi-host` over stdio, with `JAVA_HOME`
+pointing to JDK 25. The server currently uses one workspace root and expects one BSP connection file.
 
-- **Log**: what the server does — startup, the build server it starts (and where that server's own output goes),
-  each module imported with its time, library sources, "ready" with the total time and heap, slow requests (over
-  1 s), and the platform's and the plugin's warnings and errors. It is sent to the editor (`window/logMessage`: the
-  VS Code extension's output channel) and written to `$SCALA_PSI_HOST_STATE/logs/scala-psi-host-<start>.log` (the
-  latest ten are kept).
-- **Progress**: opening and importing the project are reported as LSP work-done progress.
-- **Failure**: when the project cannot be opened (no `.bsp/`, the build server fails), the editor shows an error
-  with the reason and the log file.
-- **State**: the notification `scalaPsiHost/state` (`starting`, `importing`, `ready`, `failed`, with a message) as
-  it changes; the VS Code extension shows it in the status bar.
-- **Status**: the request `scalaPsiHost/status` answers the state, the project (modules, source files), the heap,
-  request latencies by kind (count, p50, p95, max), how many warnings and errors were logged and the latest ones,
-  and adapter calls outside the host's tables. The extension's command *scala-psi-host: Show Status* prints it;
-  *Show Log File* opens the log.
+A VS Code client is included in [editors/vscode](editors/vscode). Its configuration is:
 
-`dist/smoke-test.py <bin/scala-psi-host> <project> <file> <line> <column>` talks to a built distribution as an
-editor would (initialize, open, diagnostics, hover, definition, shutdown).
+```json
+{
+  "scalaPsiHost.serverPath": "/absolute/path/to/scala-psi-host/target/dist/bin/scala-psi-host",
+  "scalaPsiHost.javaHome": "/absolute/path/to/jdk-25"
+}
+```
 
-## Layout
+The extension reports import progress and server readiness in the status bar. Its **Show Status** and **Show Log
+File** commands provide troubleshooting information. Set `scalaPsiHost.debugLog` to `true` before starting the
+server for request timing logs.
 
-- `ScalaPsiHost` — bootstrap (the tables, service registrations, startup of synthetic classes) and the host's API:
-  modules, libraries, source files, edits, reads, diagnostics.
-- `ModuleModel` — modules, which module each source belongs to, and their resolve, use, project (sources) and libraries scopes.
-- `ProjectSearch`, `WordIndex` — usages, implementations and symbols by name over the sources; the word index they search by.
-- `LibraryFileSystem`, `SourceFile` — virtual files of libraries and of project sources.
-- `SymbolIndex` — the stub index; `LibraryClassFinder` — classes and packages of the library roots.
-- `BspImport` — the build connection: modules, sources, compile specs, compile with diagnostics.
-- `DocumentCompiler` — a Scala 3 module's compiler on one document.
-- `HostDocumentCommitProcessor` — the IDE's synchronous document commit.
-- `Adapters` — `CallLog`, proxy and dispatch tables, `ServiceTable`, `HostLock`, the dispatch thread, the logger.
-- `lsp/` — `ProjectSession` (an open workspace), `ScalaLanguageServer` (LSP), `Main` (stdio).
-- `src/main/java` — host subclasses of abstract platform classes. `Host_*` files are generated:
-  `java -cp <compile classpath> tools/Gen.java src/main/java/scalapsihost <fqcn>...`. `Host_StubIndex` also has
-  two hand-written overrides (concrete `StubIndex` overloads that delegate to each other); keep them when
-  regenerating it. The LSP services extend Java bases (`LspServices`): implemented in Scala directly, their
-  interfaces' default methods would be registered twice by lsp4j.
+Completion follow-up edits require client support for `workspace/applyEdit`; caret placement also requires
+`window/showDocument`.
 
-## Tests
+## Configuration
 
-- `HostSemanticsTest`, `LibraryIndexTest`, `DiagnosticsTest` — parse, resolve, types, library index, highlighting.
-- `ModuleTest` — per-module classpath, compiler options and dependencies.
-- `EditingTest` — edits reparsed in place and seen by other files; Scala 3 language by module; queries cancelled by
-  an edit.
-- `BspImportTest` — the fixture build imported over BSP, compiled (with diagnostics), highlighted, and a Scala 3
-  document compiled.
-- `lsp.LanguageServerTest` — the server end to end through JSON-RPC (runs in a JVM of its own).
-- `AdapterSurfaceTest` — no call leaves the tables, and the adapter entries equal the reviewed list in
-  `src/test/resources/adapter-surface.txt` (on failure the actual list is in `target/host-state/`).
+| Environment variable | Purpose | Default |
+| --- | --- | --- |
+| `JAVA_HOME` | JDK used to run the server | `java` on `PATH` |
+| `SCALA_PSI_HOST_STATE` | State, logs, formatter cache and library source files | `$XDG_CACHE_HOME/scala-psi-host`, or `~/.cache/scala-psi-host` |
+| `SCALA_PSI_HOST_HEAP` | Maximum JVM heap | `2g` |
+| `SCALA_PSI_HOST_LOG` | Set to `debug` to log every request's timing | Informational logging |
 
-## Oracles
+Logs are sent to the editor and written under `<state-dir>/logs/`. The latest ten log files are retained.
 
-Tools in the test scope, each comparing the host with the plugin's own expectations:
+Whole-file formatting uses the nearest `.scalafmt.conf` between the source file and workspace root. The configuration
+must declare a formatter version; missing dependencies are downloaded from Maven Central and cached locally.
+Project exclusion filters apply. Without a config, and for range requests, the IntelliJ formatter is used.
 
-- `oracle.TypeInferenceOracle <intellij-scala> <report.md>` — the plugin's type-inference test data (Scala 2.12, in
-  unit-test mode as the fixture runs it). **395 of 400 agree.** The rest: `SCL11568` (SAM is enabled from module
-  settings; the oracle's files have no module), `SCL6601` and `SCL7805` (the same type, rendered `X.::[A, B]`
-  instead of `A :: B`), `SCL5475` and `SCL8178` (open).
-- `oracle.LibraryHighlightingOracle <intellij-scala> <report.md>` — highlights the scala-library 2.13 sources and
-  compares with `ScalaLibraryHighlightingTest_2_13`'s known errors. 469 of 546 files agree; most of the rest are
-  references to private members of a source's own companion object, which resolve to the compiled companion.
-- `oracle.ProjectHighlighting <project> <report.md> [--plugin-errors]` — highlights a whole BSP project and reports
-  errors, timings, heap and a class histogram; a file whose highlighting logged errors (a failed annotator) is not
-  counted as clean. On a 522-file Scala 3 project: no errors with compiler errors (the
-  default), 81 with the plugin's type-aware checks (the same the IDE shows in its built-in mode). On korolev v1.5.0
-  (Scala 2.13, 88 modules, 176 files, two versions of zio and cats-effect; its sbt 1.6.2 needs JDK 17) with
-  `--plugin-errors`: the 12 errors of the plugin's `KorolevProjectHighlightingTest`, at the same ranges, and none other.
-
-- `oracle.CompletionOracle <intellij-scala> <report.md>` — the plugin's completion tests: file fixtures, keyword
-  completion, auto-import and the `completion3` test methods (parsed with the host's PSI; the resulting text after
-  the chosen suggestion's handler). completion3: 118 agree, 11 disagree; keywords 70 of 70; Scala 3 fixtures are
-  not replayed yet. Auto-import: **13 agree, 0 disagree**, through the same copy engine.
-- `oracle.FormatterOracle <intellij-scala> <report.md>` — the plugin's file-based formatter tests: 187 of 187 (its
-  inline Scala test methods are not replayed).
-- `oracle.ScalafmtOracle <intellij-scala> <report.md>` — selected whole-file contracts from
-  `ScalaFmtCustomConfigTest_3_11` (including inherited methods) and `ScalaFmtCommonTest_2_7.testCompleteFile`:
-  **8 agree, 0 disagree**. Scala PSI extracts the plugin's expected text and configuration paths; the replay checks
-  rewriting, relative config includes and legacy formatter loading. It does not cover range formatting, the IDE's
-  incomplete-source wrappers or save tasks. Host and JSON-RPC tests additionally cover module config precedence,
-  exclusions, cache reuse, malformed/missing-version configs and the default IntelliJ range formatter.
-- `oracle.ParameterInfoOracle <intellij-scala> <report.md>` — the plugin's parameter info tests: 104 agree,
-  3 disagree (library versions), 35 skip (Scala 3 fixtures).
-- `oracle.InlayHintsOracle <intellij-scala> <report.md> [--only=<name>,...]` — literal cases from the plugin's
-  definition-type, parameter-name, type-argument, implicit-argument and conversion hint tests, with their file wrapper
-  and settings: **152 agree, 0 disagree, 9 skip**. Types: 25 agree; parameters: 13; type arguments: 62; implicit
-  arguments: 38 (Scala 2 and 3); conversions: 14 (Scala 2 and 3). Eight source tests need Java setup, navigation or
-  tooltip assertions; the additional range probe is skipped because range hints require `EditorImpl`.
-- `oracle.FindUsagesOracle <intellij-scala> <report.md> [--only=<name>,...]` — the literal `doTest` cases of the plugin's
-  find-usages tests: the target at the caret, and the usages its find-usages handler reports over the project scope, in
-  Scala 2 and Scala 3 (which also runs the Scala 2 methods): **74 agree, 0 disagree, 3 skip** (29/0/1 and 45/0/2). The
-  skips: the Java base method test (several files, Java among them, and the find-usages action) in both, and the
-  presentation test. The test of the find-usages dialog's type is not replayed.
-- `oracle.ImplementationsOracle <intellij-scala> <report.md> [--only=<name>,...]` — the literal `doTest` cases of the plugin's
-  go-to-implementation tests (`GoToImplementationTest` in Scala 2.13, `GoToImplementationTest_Scala3`): the elements
-  found for the symbol at the caret against the marked ranges: **16 agree, 0 disagree, 1 skip** (12/0/0 and 4/0/1). The
-  skip checks the targets' presentation. `ImplementationSearchTest` is not replayed: it calls the Java overrider
-  searches directly on a Java and a Scala file, not go to implementation.
-- `oracle.WorkspaceSymbolsOracle <intellij-scala> <report.md> [--only=<name>,...]` — the plugin's search-by-name tests
-  (`ChooseClassOrSymbolByNameTest`, for Scala 2.13 and Scala 3): the files each test adds, the symbols found for its
-  query and its expectations: **20 agree, 0 disagree, 2 skip** (10/0/1 each). The skip searches JDK classes, which the
-  host does not list.
-- `oracle.RenameOracle <intellij-scala> <report.md> [--only=<name>,...]` — the plugin's literal rename tests,
-  generated class/parameter fixtures and before/after projects, in Scala 2 and 3: **112 agree, 1 disagree, 18 skip**.
-  The disagreement leaves a Java override of a Scala val unchanged (Java inheritors are not indexed). Skips cover
-  optional automatic renames, Java-only carets, package moves, comments and unsupported test setup. File renames
-  are compared by text only: the host returns source edits, not file operations.
-- `oracle.CodeActionsOracle <intellij-scala> <report.md>` — replays the 48 Scala 2/3 `SurroundWithTest` fixtures
-  through the code-action API: **48 agree, 0 disagree, 0 skip**. Internal mod-command copies retain Scala features
-  and participate in the host's synchronous document commits; their listeners and view providers are released with
-  the preview. The selected Scala 2 intention suites (negate comparison, expand boolean, argument to block) add
-  **15 agree, 0 disagree, 12 skip**: custom setup and Scala 3 intention methods are not replayed. Test texts are
-  extracted with Scala PSI and the same static string evaluator as CompletionOracle. Combined: **63/0/12**.
-  Annotator fixes and conflicting type-import choices have focused host and JSON-RPC tests.
-- `oracle.OptimizeImportsOracle <intellij-scala> <report.md>` — the file fixtures in `testdata/optimize`, with
-  `OptimizeImportsTestBase`'s source/expected extraction and the suites' Scala versions and Unicode-arrow setting:
-  **53 agree, 1 disagree, 7 skip**. Simple/wildcard fixtures see their sibling sources. `simple/ImportChainUsed`
-  reorders a local import chain with colliding top-level `A` declarations in that setup; an isolated local-chain
-  regression preserves the dependency. Six skips use the plugin's scalafmt-specific import path, which this
-  optimizer replay does not reproduce; one needs custom scalastyle grouping. Inline test methods and the IDE's
-  notification text are not replayed.
-- `oracle.SelectionOracle <intellij-scala> <report.md>` — the plugin's selectioner tests, step by step: ScalaDoc
-  2 agree, 1 disagree; interpolated strings 27 agree; ordinary strings 9 agree; no skips. The multiline/single-line
-  helper runs both variants. See the trailing-newline disagreement below.
-- `oracle.SessionBenchmark <project> <report.md>` — latency and memory of a session as the language server runs it:
-  requests at identifiers sampled over the project's files, then rounds of edits with heap samples.
-
-Run them with `sbt "Test/runMain scalapsihost.oracle.<Name> ..."`.
-
-## Measurements
-
-`SessionBenchmark` on a 522-file Scala 3 project (2 GB heap, one thread). Completion: 300 positions,
-2026-10-30; other requests: 2026-10-28.
-
-| Request | p50 ms | p95 ms | p99 ms |
-|---|---|---|---|
-| completion (first pass) | 61 | 261 | 428 |
-| completion (warm positions) | 55 | 186 | 247 |
-| completion import list (40 requests) | 60 | 85 | 131 |
-| hover | 0 | 28 | 83 |
-| definition | 0 | 2 | 8 |
-| document highlights | 1 | 66 | 267 |
-| document symbols, folding ranges (per file) | 0 | 1 | 2 |
-| semantic tokens (per file, first time) | 41 | 775 | 1432 |
-| problems (per file, first time; plugin and Scala 3 compiler) | 261 | 1638 | 4248 |
-| problems after an edit | 142 | 328 | 589 |
-| semantic tokens after an edit | 29 | 64 | 71 |
-
-The first completion of a session takes about 2.5 s. Completion is the plugin's contributors, the ordering of every
-result and the presentation of the items sent (200 at most, as the IDE's lookup renders only what it shows). Repeated
-runs on this machine vary by about 10%.
-
-Opening the project takes 18–24 s (BSP import, library sources, modules, parsing and indexing the sources); the heap
-holds 650 MB after opening and 1.4 GB once every file was highlighted. Editing one file over and over (120 edits,
-2026-10-29), what stays strongly reachable after a full GC does not grow: 778 MB after the first edit, 766 MB after
-the last (measured with `-XX:SoftRefLRUPolicyMSPerMB=0`, so the plugin's soft-referenced caches do not hide growth).
+When the client supports dynamic file watchers, changes to sbt build definitions and source-file creation or deletion
+trigger a reimport. Unsaved source text is preserved.
 
 ## Known limitations
 
-- Requests are answered one at a time, in order: while a file's problems or semantic tokens are computed (seconds
-  for the slowest files) or the build reloads, other requests wait.
+- References and implementations use text-based searches without compiler indexes. Implicit/SAM usages and Java
+  inheritors can be missed. Rename can leave Java overrides unchanged.
+- Java binary short-name lookup is incomplete, workspace symbols list Scala declarations only, and JDK symbols come
+  from the JDK running the server.
+- Inspections, dialog-dependent actions, file/package moves and optional automatic renames are unsupported.
+  Code actions are limited to current-file text previews.
+- Some completion contributors require IDE services that are unavailable. Live templates have no snippet tab stops;
+  completion followed by handler edits takes two undo steps.
+- Inlay hints are text labels without the IDE's interactive presentation or range hints. Project IDE code-style
+  settings are not imported, and range formatting uses the IntelliJ formatter even when scalafmt is configured.
+- One workspace is served per process. Shared sources assigned to multiple BSP targets are rejected as ambiguous;
+  `.sbt` build-definition files are not treated as editable Scala sources.
+- Indexes are in memory. Initial imports and checks can be expensive; document requests run in order, so an import
+  or slow request can delay later requests.
+- A reimport failure before host updates preserves the previous snapshot. A failure after updates begin requires
+  restarting the server.
 
-- References, implementations and workspace symbols use the plugin's text-based searches. Not found: usages the IDE
-  finds from the compiler's indices (implicit arguments and conversions, SAM conversions), since the host has no build
-  server index and the plugin then searches the text only, as the IDE does with compiler indices off. Java
-  declarations have no references, and Java subclasses of a Scala class are not among its implementations (the
-  platform's Java searcher for them reads the compiler indices). Workspace symbols list Scala classes and members;
-  Java declarations and the JDK's and libraries' are not listed.
-- Code actions cover edits to the current file whose preview succeeds. The access-modifier intention requires the
-  desktop rename UI; removing unnecessary parentheses requires an inspection profile; neither is loaded. Type-import
-  quick fixes cover the plugin's candidates for unqualified unresolved references. Global-member and implicit-conversion
-  import fixes are not offered yet; Java short-name imports retain the indexing limitation below.
-  Inspection quick fixes, dialogs, file operations, snippets and post-action caret placement are not supported.
-  Actions are previewed eagerly when requested; no latency budget has been established.
-- Rename shares the search limitations above: a Java override of a Scala member can keep its old name even when
-  references change. File/package moves, optional automatic renames, comments and string occurrences are not offered.
-- Completion misses beta 2's p95 budget of 150 ms (261 ms on the first pass, 186 ms warm, on the project above):
-  what the host added was removed (ordering no longer weighs every item again after a weigher fails; index lookups
-  filter by file without navigating PSI), and the rest is the plugin's own code: its contributors (`ScalaBasicCompletionContributor`,
-  `ScalaGlobalMembersCompletionContributor`, `ExhaustiveMatchCompletionContributor`) and weighers
-  (`ScalaExplicitlyImportedWeigher`, `ScalaByExpectedTypeWeigher`).
-  The override contributor (member bodies come from the IDE's file templates) and the unresolved-name
-  contributor (it reads the IDE daemon's highlights) do not run; handlers that start live templates insert their
-  code without tab stops; a weigher failing on a suggestion whose PSI has no containing file leaves it out (cause
-  open). The order of numeric overloads can differ between two server runs (not within one). Choosing a suggestion with a handler is two edits (undo takes two steps).
-- Inlay hints: range hints are not shown (`RangeInlayHintsPass` builds drawn presentations over `EditorImpl`). Java
-  parameter-name exclusions are unavailable: the real Java provider requires the absent `JavaBundle`, so Java calls
-  can show names the IDE excludes. String labels have no tooltips, navigation, expansion controls or kind; method
-  chains use inline labels without the IDE's column alignment. The plugin suppresses definition-type and method-chain
-  hints in Scala 3 compiler-highlighting mode unless X-Ray mode is enabled, as in the IDE. The oracle uses unit-test
-  mode with compiler highlighting disabled, and reports inherited Scala 2 cases once.
-- IntelliJ formatting uses Scala's default code style; the project's IDE code-style settings are not imported.
-  Scalafmt handles configured whole-file requests; range formatting remains IntelliJ. IDE-specific scalafmt path
-  overrides and incomplete-source wrapping are not implemented. Only Maven Central is used for formatter artifacts;
-  a version missing from the host's cache needs network access. Git-only batch file selection is not applied to
-  explicit document-formatting requests.
-- Selection ranges: `ScalaDocCommentSelectionerTest.testMainContentSelection` expects the multiline class without
-  its final newline, then the whole file. This platform's `WordSelectioner` delegates to
-  `ExtendWordSelectionHandlerBase.expandToWholeLine`, which includes that newline for the multiline class, so the
-  host reaches the whole file one step earlier. Editor settings use the platform defaults (camel words off,
-  whitespace expansion on); client editor preferences are not imported.
-- Scala 2 has no document compilation (its compiler has no stable interface to call); Scala 2 errors come from the
-  plugin, or from the build's compile when compiler errors are enabled for Scala 2.
-- Java sources are parsed at the highest language level, not the build's.
-- Java class files are read by path on demand, not indexed: Java short-name lookups (completion, auto-import) do
-  not see them.
-- The JDK is the one the server runs on.
-- Depends on platform `@Internal` APIs (`Extensions.setRootArea`, `ExtensionsAreaImpl`), constructs a few platform
-  and plugin classes with non-public constructors, as the IDE container does, and sets one private field of the
-  platform's statistics holder (no event providers). Inlay hints also read the pass's private collected buffer and
-  write `ImplicitHints._enabled`: its public setter requires the IDE's keymap API to rebind shortcuts.
+## Development
+
+Generate the fixture's BSP connection once, then run the tests from the repository root:
+
+```sh
+(
+  cd fixtures/bsp-project
+  sbt --java-home "$JAVA_HOME" bspConfig
+)
+sbt --java-home "$JAVA_HOME" test
+```
+
+The suite covers PSI semantics, module resolution, editing, BSP imports, formatting, LSP requests and the reviewed
+platform-adapter surface. Additional tools in [src/test/scala/scalapsihost/oracle](src/test/scala/scalapsihost/oracle)
+compare selected upstream plugin fixtures; their source files document the supported inputs.
+
+To check a built distribution over stdio with Python 3:
+
+```sh
+python3 dist/smoke-test.py \
+  target/dist/bin/scala-psi-host \
+  fixtures/bsp-project \
+  fixtures/bsp-project/app/src/main/scala/app/Main.scala \
+  6 53
+```
+
+This checks initialization, document opening, diagnostics, hover, definition and shutdown. Positions are zero-based.
+
+See [ROADMAP.md](ROADMAP.md) for planned work and [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## License
 
-Apache License 2.0: see [LICENSE](LICENSE) and [NOTICE](NOTICE). scala-psi-host builds on the Scala plugin for
-IntelliJ IDEA and the IntelliJ Platform, both Apache 2.0 by JetBrains. It is not affiliated with or endorsed by
-JetBrains; IntelliJ is a trademark of JetBrains s.r.o.
+Licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for attribution.
+
+scala-psi-host builds on the Scala plugin for IntelliJ IDEA and the IntelliJ Platform by JetBrains. It is not
+affiliated with or endorsed by JetBrains. IntelliJ and IntelliJ IDEA are trademarks of JetBrains s.r.o.
