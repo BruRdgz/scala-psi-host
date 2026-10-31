@@ -24,7 +24,6 @@ import org.jetbrains.plugins.scala.structureView.element.Element
 import scalapsihost.{LineColumn, ScalaPsiHost}
 import scalapsihost.build.{CompileSpec, CompilerDiagnostic, DocumentCompiler, ScalafmtFormatting}
 import scalapsihost.platform.{HostLog, LibraryFile, SourceFile}
-import scalapsihost.*
 
 import java.nio.file.{Files, Path}
 
@@ -58,14 +57,14 @@ private[scalapsihost] final class ProjectLanguageOperations(
 
   /** The completion suggestions at `at`, best first. Only Scala files complete. */
   def completion(path: Path, at: LineColumn): CompletionChoices = file(path) match {
-    case f: ScalaFile =>
+    case sourceFile: ScalaFile =>
       host.read {
-        val text = document(f)
-        val suggestions = host.completion(f, offset(text, at))
+        val sourceDocument = document(sourceFile)
+        val suggestions = host.completion(sourceFile, offset(sourceDocument, at))
         val choices = suggestions.items.map { suggestion =>
           val candidate = CompletionCandidate(suggestion.label, suggestion.tail, suggestion.typeText, suggestion.kind,
             suggestion.deprecated, suggestion.lookup, suggestion.prefixText, suggestion.hasHandler, suggestion.identity)
-          CompletionChoice(candidate, position(text, suggestion.prefix.getStartOffset), position(text, suggestion.prefix.getEndOffset))
+          CompletionChoice(candidate, position(sourceDocument, suggestion.prefix.getStartOffset), position(sourceDocument, suggestion.prefix.getEndOffset))
         }
         CompletionChoices(choices, suggestions.incomplete)
       }
@@ -74,17 +73,17 @@ private[scalapsihost] final class ProjectLanguageOperations(
 
   /** The plugin's inline hints within the requested range. Only Scala files have them. */
   def inlayHints(path: Path, start: LineColumn, end: LineColumn): Seq[InlineHint] = file(path) match {
-    case f: ScalaFile => host.read {
-      val d = document(f)
-      val range = new TextRange(offset(d, start), offset(d, end))
-      host.inlayHints(f).filter(hint => range.contains(hint.offset)).map(hint => InlineHint(position(d, hint.offset), hint.text))
+    case sourceFile: ScalaFile => host.read {
+      val sourceDocument = document(sourceFile)
+      val range = new TextRange(offset(sourceDocument, start), offset(sourceDocument, end))
+      host.inlayHints(sourceFile).filter(hint => range.contains(hint.offset)).map(hint => InlineHint(position(sourceDocument, hint.offset), hint.text))
     }
     case _ => Seq.empty
   }
 
   /** The signatures of the call around `at`. Only Scala files have them. */
   def signatures(path: Path, at: LineColumn): Option[SignatureChoices] = file(path) match {
-    case f: ScalaFile => host.read(host.parameterInfo(f, offset(document(f), at))).map { found =>
+    case sourceFile: ScalaFile => host.read(host.parameterInfo(sourceFile, offset(document(sourceFile), at))).map { found =>
       SignatureChoices(found.items.map { signature =>
         SignatureInfo(signature.text, signature.current.map(r => OffsetRange(r.getStartOffset, r.getEndOffset)),
           signature.applicable, signature.deprecated)
@@ -95,29 +94,26 @@ private[scalapsihost] final class ProjectLanguageOperations(
 
   /** Each position's Extend Selection chain. An unexpandable caret still has its empty range, as LSP requires. */
   def selectionRanges(path: Path, positions: Seq[LineColumn]): Seq[Seq[(LineColumn, LineColumn)]] = file(path) match {
-    case f: ScalaFile => host.read {
-      val d = document(f)
+    case sourceFile: ScalaFile => host.read {
+      val sourceDocument = document(sourceFile)
       positions.map { at =>
-        val cursor = offset(d, at)
-        val ranges = host.selectionRanges(f, cursor)
+        val cursor = offset(sourceDocument, at)
+        val ranges = host.selectionRanges(sourceFile, cursor)
         val chain = if (ranges.isEmpty) Seq(new TextRange(cursor, cursor)) else ranges
-        chain.map(r => position(d, r.getStartOffset) -> position(d, r.getEndOffset))
+        chain.map(r => position(sourceDocument, r.getStartOffset) -> position(sourceDocument, r.getEndOffset))
       }
     }
     case _ => Seq.empty
   }
 
-  /**
-   * Runs the insert handler of the suggestion `identity`, whose lookup string `lookup` the editor has put at `start`
-   * in place of `prefixText` (see [[Completion.insert]]). None when the file no longer has it there.
-   */
+  /** Previews insertion follow-up after the editor has replaced the typed prefix with the chosen lookup text. */
   def insertCompletion(path: Path, start: LineColumn, prefixText: String, lookup: String, identity: String)
       : Option[CompletionFollowUp] =
     file(path) match {
-      case f: ScalaFile =>
-        val startOffset = host.read(offset(document(f), start))
-        host.insertCompletion(f, startOffset, prefixText, lookup, identity).map { inserted =>
-          val changes = host.read(inserted.result.edits.map(textChange(document(f), _)))
+      case sourceFile: ScalaFile =>
+        val startOffset = host.read(offset(document(sourceFile), start))
+        host.insertCompletion(sourceFile, startOffset, prefixText, lookup, identity).map { inserted =>
+          val changes = host.read(inserted.result.edits.map(textChange(document(sourceFile), _)))
           val caret = StringUtil.offsetToLineColumn(inserted.result.text, inserted.caret)
           CompletionFollowUp(changes, LineColumn(caret.line, caret.column))
         }
@@ -127,17 +123,19 @@ private[scalapsihost] final class ProjectLanguageOperations(
   /** The changes that format `range` of the file (all of it without one). Only Scala files are formatted. */
   def formatting(path: Path, range: Option[(LineColumn, LineColumn)], indentSize: Int, useTabs: Boolean): Seq[TextChange] =
     file(path) match {
-      case f: ScalaFile =>
-        val selected = host.read(range.map((start, end) => new TextRange(offset(document(f), start), offset(document(f), end))))
+      case sourceFile: ScalaFile =>
+        val selected = host.read(range.map { (start, end) =>
+          new TextRange(offset(document(sourceFile), start), offset(document(sourceFile), end))
+        })
         // The plugin defaults to the IntelliJ formatter for range requests even when scalafmt is selected.
         val config = if (range.isEmpty) ScalafmtFormatting.configFor(root, path) else None
         val edits = config match {
           case Some(configFile) =>
-            val before = host.read(f.getText)
+            val before = host.read(sourceFile.getText)
             ChangeEngine.diff(before, scalafmt.format(configFile, path, before))
-          case None => host.formatting(f, selected, indentSize, useTabs)
+          case None => host.formatting(sourceFile, selected, indentSize, useTabs)
         }
-        host.read(edits.map(textChange(document(f), _)))
+        host.read(edits.map(textChange(document(sourceFile), _)))
       case _ => Seq.empty
     }
 
@@ -145,32 +143,27 @@ private[scalapsihost] final class ProjectLanguageOperations(
   private def textChange(document: Document, edit: ChangeEngine.Edit): TextChange =
     TextChange(position(document, edit.range.getStartOffset), position(document, edit.range.getEndOffset), edit.text)
 
-  /**
-   * Applies an editor change: the text between `start` and `end` becomes `replacement`; without a range, the whole
-   * text is replaced.
-   */
+  /** Commits a range replacement, or replaces the complete document when no range is supplied. */
   def change(path: Path, range: Option[(LineColumn, LineColumn)], replacement: String): Unit = {
-    val f = file(path)
+    val sourceFile = file(path)
     // Only this thread edits documents, so reading one needs no lock; and an edit must not be cancelled as the
     // queries a newer edit cancels are.
-    val d = document(f)
-    val (start, end) = range.fold((0, d.getTextLength))((from, to) => (offset(d, from), offset(d, to)))
-    host.edit(f, start, end, replacement)
+    val sourceDocument = document(sourceFile)
+    val (start, end) = range.fold((0, sourceDocument.getTextLength))((from, to) => (offset(sourceDocument, from), offset(sourceDocument, to)))
+    host.edit(sourceFile, start, end, replacement)
   }
 
-  /**
-   * The file's problems: the plugin's, and for files whose errors come from the compiler (Scala 3 by default), the
-   * compiler's: of the current text for a Scala 3 module, of the build's last compile otherwise.
-   */
+  /** Combines plugin diagnostics with current-text Scala 3 diagnostics or the build's latest compiler problems. */
   def problems(path: Path, spec: Option[CompileSpec], lastBuildProblems: Seq[CompilerDiagnostic]): Seq[FileProblem] =
     file(path) match {
       case scalaFile: ScalaFile =>
         val (fromPlugin, compilerHighlighted, text) = host.read {
-          val d = document(scalaFile)
+          val sourceDocument = document(scalaFile)
           val plugin = host.diagnostics(scalaFile).filter(_.severity.compareTo(HighlightSeverity.WEAK_WARNING) >= 0).map { p =>
-            FileProblem(problemSeverity(p.severity), position(d, p.range.getStartOffset), position(d, p.range.getEndOffset), p.message, "scala-plugin")
+            FileProblem(problemSeverity(p.severity), position(sourceDocument, p.range.getStartOffset),
+              position(sourceDocument, p.range.getEndOffset), p.message, "scala-plugin")
           }
-          (plugin, host.isCompilerHighlighted(scalaFile), d.getText)
+          (plugin, host.isCompilerHighlighted(scalaFile), sourceDocument.getText)
         }
         val fromCompiler =
           if (!compilerHighlighted) Seq.empty
@@ -186,18 +179,14 @@ private[scalapsihost] final class ProjectLanguageOperations(
       case _ => Seq.empty // Java sources are only there to be resolved against.
     }
 
-  /**
-   * The Markdown the IDE's quick documentation shows for the symbol referenced at `at`: its signature, from the
-   * plugin's quick info without the editor's hint styling (ScalaDocumentationProvider adds that for its Swing popup),
-   * then its ScalaDoc, if it has any.
-   */
+  /** Renders a referenced or declared symbol's quick-info signature and available ScalaDoc as Markdown. */
   def hover(path: Path, at: LineColumn): Option[String] = host.read {
-    val f = file(path)
-    val atOffset = offset(document(f), at)
+    val sourceFile = file(path)
+    val atOffset = offset(document(sourceFile), at)
     // The referenced symbol, or the one declared at `at` when the cursor is on a declaration's name.
-    val subject = Option(f.findReferenceAt(atOffset)) match {
+    val subject = Option(sourceFile.findReferenceAt(atOffset)) match {
       case Some(reference) => Option(reference.resolve()).map(_ -> reference.getElement)
-      case None => declarationNamedAt(f, atOffset).map(declaration => declaration -> declaration)
+      case None => declarationNamedAt(sourceFile, atOffset).map(declaration => declaration -> declaration)
     }
     for {
       (target, original) <- subject
@@ -208,10 +197,7 @@ private[scalapsihost] final class ProjectLanguageOperations(
     }
   }
 
-  /**
-   * The ScalaDoc of `target` as Markdown; none for a symbol without any, or that is not Scala's (a JDK class). A
-   * library symbol's doc is in its attached source: the navigation element, as the IDE documents it.
-   */
+  /** Reads ScalaDoc through navigation to attached sources, logging failures while retaining the hover signature. */
   private def documentation(target: PsiElement, original: PsiElement): Option[String] =
     try Option(new ScalaDocumentationProvider().generateDoc(target.getNavigationElement, original)).flatMap(QuickDoc.toMarkdown)
     catch {
@@ -228,24 +214,21 @@ private[scalapsihost] final class ProjectLanguageOperations(
         .filter(owner => owner.getNameIdentifier != null && owner.getNameIdentifier.getTextRange.contains(at))
     }
 
-  /**
-   * Where the symbol referenced at `at` is declared: its file and the position of its name. Only declarations in
-   * the project's sources; library declarations have no file to open yet.
-   */
+  /** Finds a referenced declaration in project sources or a materialized library file. */
   def definition(path: Path, at: LineColumn): Option[(Path, LineColumn)] = host.read {
-    val f = file(path)
+    val sourceFile = file(path)
     for {
-      reference <- Option(f.findReferenceAt(offset(document(f), at)))
+      reference <- Option(sourceFile.findReferenceAt(offset(document(sourceFile), at)))
       target <- Option(reference.resolve())
       location <- sourceLocation(target)
     } yield location
   }
 
-  /** Where the type of the symbol at `at` is declared, as the IDE's "go to type declaration" (project sources only). */
+  /** Finds type declarations in project sources or materialized library files. */
   def typeDefinition(path: Path, at: LineColumn): Seq[(Path, LineColumn)] = host.read {
-    val f = file(path)
-    val atOffset = offset(document(f), at)
-    val symbol = Option(f.findReferenceAt(atOffset)).flatMap(r => Option(r.resolve())).orElse(declarationNamedAt(f, atOffset))
+    val sourceFile = file(path)
+    val atOffset = offset(document(sourceFile), at)
+    val symbol = Option(sourceFile.findReferenceAt(atOffset)).flatMap(r => Option(r.resolve())).orElse(declarationNamedAt(sourceFile, atOffset))
     val types = symbol.flatMap(s => Option(new org.jetbrains.plugins.scala.annotator.gutter.ScalaGotoTypeDeclarationProvider().getSymbolTypeDeclarations(s)))
     types.toSeq.flatten.flatMap(sourceLocation)
   }
@@ -259,8 +242,8 @@ private[scalapsihost] final class ProjectLanguageOperations(
   /** `range` of `file` as a span, if the file is a project source. */
   private def sourceSpan(file: PsiFile, range: TextRange): Option[SourceSpan] = file.getViewProvider.getVirtualFile match {
     case source: SourceFile =>
-      val d = document(file)
-      Some(SourceSpan(source.path, position(d, range.getStartOffset) -> position(d, range.getEndOffset)))
+      val sourceDocument = document(file)
+      Some(SourceSpan(source.path, position(sourceDocument, range.getStartOffset) -> position(sourceDocument, range.getEndOffset)))
     case _ => None
   }
 
@@ -268,11 +251,7 @@ private[scalapsihost] final class ProjectLanguageOperations(
   private def nameSpan(declaration: PsiElement): Option[SourceSpan] =
     Option(declaration.getContainingFile).flatMap(sourceSpan(_, nameRange(declaration)))
 
-  /**
-   * A declaration's file and the position of its name. A library declaration is in a file of the host's state
-   * directory (see [[libraryFileOnDisk]]): its library's attached source, found as the IDE finds it (the declaration's
-   * navigation element), or else its decompiled class file, as the IDE shows a library without sources.
-   */
+  /** Locates a declaration's navigation target, materializing attached or decompiled library text when needed. */
   private def sourceLocation(declaration: PsiElement): Option[(Path, LineColumn)] = {
     val target = declaration.getNavigationElement
     val nameOffset = nameRange(target).getStartOffset
@@ -289,12 +268,7 @@ private[scalapsihost] final class ProjectLanguageOperations(
     } yield location
   }
 
-  /**
-   * A library file's text written under the state directory, at its path inside its library (by root, so files
-   * of different jars stay apart): editors open plain files, not entries of jars. A class file is written as the
-   * source the IDE decompiles it to (`.scala`, or `.java` for Java classes). Written read-only, and again only when
-   * its text changed (a snapshot jar replaced in place).
-   */
+  /** Materializes library source or decompiled text under its root-specific state directory as a read-only file. */
   private def libraryFileOnDisk(file: LibraryFile, psi: PsiFile, text: String): Path = {
     val rootName = file.root.getName
     val rootDirectory = s"${rootName.substring(rootName.lastIndexOf('/') + 1)}-${Integer.toHexString(rootName.hashCode)}"
@@ -312,13 +286,10 @@ private[scalapsihost] final class ProjectLanguageOperations(
     onDisk
   }
 
-  /**
-   * Where the symbol at `at` is used, in the project's sources: the usages the plugin's find-usages handler reports,
-   * and the declaration's name if `includeDeclaration`.
-   */
+  /** Collects project-source usages and optionally the declaration's name, omitting duplicate spans. */
   def references(path: Path, at: LineColumn, includeDeclaration: Boolean): Seq[SourceSpan] = host.read {
-    val f = file(path)
-    ProjectSearch.usageTarget(f, offset(document(f), at)).toSeq.flatMap { target =>
+    val sourceFile = file(path)
+    ProjectSearch.usageTarget(sourceFile, offset(document(sourceFile), at)).toSeq.flatMap { target =>
       val usages = ProjectSearch.usages(target).flatMap(usage => sourceSpan(usage.getFile, TextRange.create(usage.getNavigationRange)))
       val declaration = if (includeDeclaration) nameSpan(target.getNavigationElement) else None
       (declaration.toSeq ++ usages).distinct
@@ -329,45 +300,41 @@ private[scalapsihost] final class ProjectLanguageOperations(
   def codeActions(path: Path, start: LineColumn, end: LineColumn, only: Seq[String] = Seq.empty)
       : Seq[(CodeActionResult, Seq[TextChange])] = host.read {
     file(path) match {
-      case f: ScalaFile =>
-        val d = document(f)
+      case sourceFile: ScalaFile =>
+        val sourceDocument = document(sourceFile)
+        /** Includes requested action kinds and their descendants. */
         def accepts(kind: String): Boolean = only.isEmpty || only.exists(k => kind == k || kind.startsWith(k + "."))
-        val contextual = if (accepts("quickfix") || accepts("refactor.rewrite"))
-          host.codeActions(f, new TextRange(offset(d, start), offset(d, end))).filter(choice => accepts(choice.kind))
-        else Seq.empty
-        val source = if (only.nonEmpty && accepts("source.organizeImports")) Seq(host.organizeImports(f)) else Seq.empty
+        val contextual =
+          if (accepts("quickfix") || accepts("refactor.rewrite"))
+            host.codeActions(sourceFile, new TextRange(offset(sourceDocument, start), offset(sourceDocument, end)))
+              .filter(choice => accepts(choice.kind))
+          else Seq.empty
+        val source = if (only.nonEmpty && accepts("source.organizeImports")) Seq(host.organizeImports(sourceFile)) else Seq.empty
         val choices = contextual ++ source
         choices.map { choice =>
-          CodeActionResult(choice.title, choice.kind, choice.disabled) -> choice.edits.map(textChange(d, _))
+          CodeActionResult(choice.title, choice.kind, choice.disabled) -> choice.edits.map(textChange(sourceDocument, _))
         }
       case _ => Seq.empty
     }
   }
 
-  /**
-   * The range of the name at `at` that a rename changes: the reference's, or the declaration's name. Refused
-   * ([[Rename.Refused]]) where the IDE would not rename: no symbol, a library symbol, a keyword...
-   */
+  /** Validates the rename target and returns its name range, throwing Rename.Refused when unavailable. */
   def prepareRename(path: Path, at: LineColumn): (LineColumn, LineColumn) = {
-    val f = file(path)
-    val cursor = host.read(offset(document(f), at))
-    host.renameTarget(f, cursor)
+    val sourceFile = file(path)
+    val cursor = host.read(offset(document(sourceFile), at))
+    host.renameTarget(sourceFile, cursor)
     host.read {
-      val reference = Option(f.findReferenceAt(cursor)).map(r => r.getRangeInElement.shiftRight(r.getElement.getTextRange.getStartOffset))
-      val name = reference.orElse(declarationNamedAt(f, cursor).map(_.getNameIdentifier.getTextRange))
+      val reference = Option(sourceFile.findReferenceAt(cursor)).map(r => r.getRangeInElement.shiftRight(r.getElement.getTextRange.getStartOffset))
+      val name = reference.orElse(declarationNamedAt(sourceFile, cursor).map(_.getNameIdentifier.getTextRange))
         .getOrElse(throw new Rename.Refused(Seq("There is no name to rename here.")))
-      position(document(f), name.getStartOffset) -> position(document(f), name.getEndOffset)
+      position(document(sourceFile), name.getStartOffset) -> position(document(sourceFile), name.getEndOffset)
     }
   }
 
-  /**
-   * The changes that rename the symbol at `at` to `newName`, in every project file affected; the files are left as
-   * they are, for the editor to apply the changes to and report back. Refused ([[Rename.Refused]]) for what the IDE
-   * would not rename, an invalid name or a conflict.
-   */
+  /** Previews project-wide rename edits without retaining source changes, refusing invalid names or conflicts. */
   def rename(path: Path, at: LineColumn, newName: String): Seq[FileChanges] = {
-    val f = file(path)
-    val edits = host.rename(f, host.read(offset(document(f), at)), newName)
+    val sourceFile = file(path)
+    val edits = host.rename(sourceFile, host.read(offset(document(sourceFile), at)), newName)
     host.read(edits.flatMap { (changed, fileEdits) =>
       changed.getViewProvider.getVirtualFile match {
         case source: SourceFile => Some(FileChanges(source.path, fileEdits.map(textChange(document(changed), _))))
@@ -378,8 +345,8 @@ private[scalapsihost] final class ProjectLanguageOperations(
 
   /** The names of the implementations and overriders of the symbol at `at` (project sources only). */
   def implementations(path: Path, at: LineColumn): Seq[SourceSpan] = host.read {
-    val f = file(path)
-    ProjectSearch.implementations(f, offset(document(f), at)).flatMap(nameSpan).distinct
+    val sourceFile = file(path)
+    ProjectSearch.implementations(sourceFile, offset(document(sourceFile), at)).flatMap(nameSpan).distinct
   }
 
   /** The project's symbols whose names match `query`, best match first. */
@@ -389,29 +356,28 @@ private[scalapsihost] final class ProjectLanguageOperations(
     }
   }
 
-  /**
-   * The occurrences in this file of the symbol at `at` (referenced or declared there), as the IDE highlights them
-   * under the caret: its declaration and the references to it, read or written as the plugin's access detector says.
-   */
+  /** Finds this document's declaration and references under the caret, classifying writes with the plugin detector. */
   def highlights(path: Path, at: LineColumn): Seq[Occurrence] = host.read {
-    val f = file(path)
-    val d = document(f)
-    val atOffset = offset(d, at)
-    val target = Option(f.findReferenceAt(atOffset)) match {
+    val sourceFile = file(path)
+    val sourceDocument = document(sourceFile)
+    val atOffset = offset(sourceDocument, at)
+    val target = Option(sourceFile.findReferenceAt(atOffset)) match {
       case Some(reference) => Option(reference.resolve())
-      case None => declarationNamedAt(f, atOffset)
+      case None => declarationNamedAt(sourceFile, atOffset)
     }
     target.collect { case named: PsiNamedElement if named.getName != null => named }.toSeq.flatMap { named =>
       val access = new org.jetbrains.plugins.scala.highlighter.readWriteAccess.ScalaReadWriteAccessDetector
-      def span(range: TextRange) = position(d, range.getStartOffset) -> position(d, range.getEndOffset)
+      /** Converts a PSI range within this document to workspace coordinates. */
+      def span(range: TextRange): (LineColumn, LineColumn) =
+        position(sourceDocument, range.getStartOffset) -> position(sourceDocument, range.getEndOffset)
       val declaration = named.getNavigationElement match {
-        case owner: PsiNameIdentifierOwner if owner.getContainingFile == f && owner.getNameIdentifier != null =>
+        case owner: PsiNameIdentifierOwner if owner.getContainingFile == sourceFile && owner.getNameIdentifier != null =>
           Seq(Occurrence(span(owner.getNameIdentifier.getTextRange), write = access.isDeclarationWriteAccess(owner)))
         case _ => Seq.empty
       }
       // Only references whose text names the symbol can refer to it (the IDE's search also looks for the name's
       // occurrences first); resolving every reference of the file would be the whole highlighting pass.
-      val references = SyntaxTraverser.psiTraverser(f).asScala.toSeq.flatMap(_.getReferences.toSeq).filter { reference =>
+      val references = SyntaxTraverser.psiTraverser(sourceFile).asScala.toSeq.flatMap(_.getReferences.toSeq).filter { reference =>
         val text = reference.getRangeInElement.substring(reference.getElement.getText)
         ScalaNamesUtil.equivalent(text, named.getName) && reference.isReferenceTo(named)
       }
@@ -426,8 +392,11 @@ private[scalapsihost] final class ProjectLanguageOperations(
   def outline(path: Path): Seq[OutlineSymbol] = host.read {
     file(path) match {
       case scalaFile: ScalaFile =>
-        val d = document(scalaFile)
-        def span(range: TextRange) = position(d, range.getStartOffset) -> position(d, range.getEndOffset)
+        val sourceDocument = document(scalaFile)
+        /** Converts a PSI range within this document to workspace coordinates. */
+        def span(range: TextRange): (LineColumn, LineColumn) =
+          position(sourceDocument, range.getStartOffset) -> position(sourceDocument, range.getEndOffset)
+        /** Flattens unnamed initializer blocks and retains nested named declarations. */
         def symbols(node: TreeElement): Seq[OutlineSymbol] = node match {
           case element: Element =>
             val children = element.getChildren.toSeq.flatMap(symbols)
@@ -458,19 +427,16 @@ private[scalapsihost] final class ProjectLanguageOperations(
     }
   }
 
-  /**
-   * The file's folding regions, as the plugin's folding builder computes them for the IDE's editor. A region that
-   * ends on a closing bracket leaves that bracket's line unfolded.
-   */
+  /** Computes plugin folding regions while leaving a trailing closing-bracket line visible. */
   def foldingRanges(path: Path): Seq[Fold] = host.read {
     file(path) match {
       case scalaFile: ScalaFile =>
-        val d = document(scalaFile)
-        val text = d.getCharsSequence
-        new ScalaFoldingBuilder().buildFoldRegions(scalaFile, d, /* quick = */ false).toSeq.flatMap { descriptor =>
+        val sourceDocument = document(scalaFile)
+        val text = sourceDocument.getCharsSequence
+        new ScalaFoldingBuilder().buildFoldRegions(scalaFile, sourceDocument, /* quick = */ false).toSeq.flatMap { descriptor =>
           val range = descriptor.getRange
-          val startLine = d.getLineNumber(range.getStartOffset)
-          val lastLine = d.getLineNumber(range.getEndOffset)
+          val startLine = sourceDocument.getLineNumber(range.getStartOffset)
+          val lastLine = sourceDocument.getLineNumber(range.getEndOffset)
           val closes = range.getLength > 0 && "})]".contains(text.charAt(range.getEndOffset - 1))
           val endLine = if (closes && lastLine > startLine) lastLine - 1 else lastLine
           val node = descriptor.getElement
@@ -491,22 +457,24 @@ private[scalapsihost] final class ProjectLanguageOperations(
   def semanticTokens(path: Path): Seq[SemanticToken] = file(path) match {
     case scalaFile: ScalaFile =>
       host.read {
-        val d = document(scalaFile)
+        val sourceDocument = document(scalaFile)
         host.textAttributes(scalaFile).flatMap { (range, key) =>
-          if (range.isEmpty || d.getLineNumber(range.getStartOffset) != d.getLineNumber(range.getEndOffset)) None
+          if (range.isEmpty || sourceDocument.getLineNumber(range.getStartOffset) != sourceDocument.getLineNumber(range.getEndOffset)) None
           else semanticToken(key).map { (kind, modifiers) =>
-            SemanticToken(position(d, range.getStartOffset), range.getLength, kind, modifiers)
+            SemanticToken(position(sourceDocument, range.getStartOffset), range.getLength, kind, modifiers)
           }
         }
       }
     case _ => Seq.empty
   }
 
+  /** Maps platform diagnostic levels to the language model's severity. */
   private def problemSeverity(severity: HighlightSeverity): ProblemSeverity =
     if (severity.compareTo(HighlightSeverity.ERROR) >= 0) ProblemSeverity.Error
     else if (severity.compareTo(HighlightSeverity.WARNING) >= 0) ProblemSeverity.Warning
     else ProblemSeverity.Information
 
+  /** Classifies Scala declarations for workspace symbols and document outlines. */
   private def workspaceSymbolKind(declaration: PsiElement): WorkspaceSymbolKind = declaration match {
     case _: ScEnumCase => WorkspaceSymbolKind.EnumMember
     case _: ScEnum => WorkspaceSymbolKind.Enum
@@ -525,6 +493,7 @@ private[scalapsihost] final class ProjectLanguageOperations(
     case _ => WorkspaceSymbolKind.Object
   }
 
+  /** Maps plugin highlighting keys to protocol-neutral token categories and modifiers. */
   private def semanticToken(key: TextAttributesKey): Option[(SemanticTokenKind, Set[SemanticTokenModifier])] = {
     import SemanticTokenKind.*
     import SemanticTokenModifier.*

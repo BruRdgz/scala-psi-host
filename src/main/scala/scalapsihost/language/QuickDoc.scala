@@ -9,13 +9,21 @@ import java.io.StringReader
 import scala.collection.mutable.ArrayBuffer
 
 /**
- * The IDE's quick documentation as Markdown, which editors render (they do not render the HTML the plugin's
- * documentation generator makes). Only the doc's content and its sections (parameters, return value...) are kept:
- * the signature and the location line are shown by other means.
+ * Converts the plugin's quick-documentation HTML into editor-readable Markdown.
+ *
+ * Only documentation content and sections are retained; signatures and location lines are presented separately.
  */
 object QuickDoc {
 
-  /** The Markdown of the content and the sections in the generator's `html`, if the symbol has any documentation. */
+  /**
+   * Converts documentation content and sections from the plugin's HTML output.
+   *
+   * This expects the generator's `content` and `sections` fragments. IDE-only links are omitted while their labels
+   * remain; HTTP and HTTPS links are retained.
+   *
+   * @param html quick-documentation HTML produced by the plugin
+   * @return Markdown content, or none when the selected fragments contain no text
+   */
   def toMarkdown(html: String): Option[String] = {
     val converter = new Converter
     new ParserDelegator().parse(new StringReader(html), converter, true)
@@ -171,7 +179,10 @@ object QuickDoc {
       val spaced = collapseSpaces(text)
       val atLineStart = out.isEmpty || out.last == '\n' || out.last == ' '
       val trimmed = if (atLineStart) spaced.stripLeading else spaced
-      trimmed.foreach(c => if (MarkdownSignificant.contains(c)) out.append('\\').append(c) else out.append(c))
+      trimmed.foreach { character =>
+        if (MarkdownSignificant.contains(character)) out.append('\\')
+        out.append(character)
+      }
     }
 
     /** Writes the next item marker, indenting it according to the current list nesting. */

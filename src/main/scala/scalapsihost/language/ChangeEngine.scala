@@ -20,10 +20,9 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 /**
- * Runs PSI changes on a nonphysical copy of a file, as the platform's intention preview does, and returns the
- * difference with the original as edits. The original file, its document and the indices are never touched.
+ * Previews PSI changes on nonphysical copies and returns their text edits.
  *
- * As the platform's preview, a change runs in a read with an intention-preview session: queries go on meanwhile, the
+ * The original file, its document and its indexes remain unchanged. A preview runs in a cancellable read: the
  * plugin's write actions on the copy run in place (see the host's `runWriteAction`), and an editor edit cancels it.
  * Changes take turns among themselves: the platform's PSI-to-document synchronizer keeps the document it synchronizes
  * in one slot for the whole project (`PsiToDocumentSynchronizer.mySyncDocument`), copies included.
@@ -32,15 +31,32 @@ object ChangeEngine {
   private val changesInTurn = new Object
   private val copyResources = new ThreadLocal[Using.Manager]
 
-  /** A replacement of `range` of the original text by `text`. */
+  /**
+   * A replacement within an original text snapshot.
+   *
+   * @param range UTF-16 start and exclusive end offsets in the original text
+   * @param text replacement text, empty for a deletion
+   */
   final case class Edit(range: TextRange, text: String)
 
-  /** The changed copy's text, and the edits that turn the original into it: sorted, disjoint and not touching. */
+  /**
+   * The result of a previewed text transformation.
+   *
+   * @param text complete transformed text
+   * @param edits replacements against the original, sorted, disjoint and non-touching
+   */
   final case class Result(text: String, edits: Seq[Edit])
 
   /**
-   * The edits `modify` makes on a copy of `file`, and what it returns (e.g. state that follows the copy's document).
-   * `modify` runs in a preview session whose editor (`IntentionPreviewUtils.getPreviewEditor`) shows the copy.
+   * Applies a transformation to a preview copy and computes its edits.
+   *
+   * `modify` runs in a preview session whose editor shows the copy. Copy listeners and temporary editors are
+   * released before returning; postponed formatting is drained even if the transformation fails or is cancelled.
+   *
+   * @tparam A transformation result type
+   * @param file original Scala file to copy
+   * @param modify transformation allowed to mutate only the preview copy
+   * @return the changed text and edits, paired with the transformation's result
    */
   def run[A](file: ScalaFile)(modify: ScalaFile => A): (Result, A) = HostLock.query {
     changesInTurn.synchronized {
@@ -110,16 +126,14 @@ object ChangeEngine {
     result.getOrElse(throw new IllegalStateException("the preview session did not run the change"))
   }
 
-  /**
-   * `body` on a preview copy of `file`, released afterwards whatever fails. Copies keep copyable user data and the
-   * original file, but Scala features live in plain user data.
-   */
+  /** Runs against a feature-aware preview copy and releases its provider on every exit path. */
   private def withPreviewCopy[A](file: ScalaFile)(body: ScalaFile => A): A = {
     val copy = file.copy() match {
       case f: ScalaFile => f
       case other => throw new IllegalStateException(s"change copy is not a Scala file: ${other.getClass.getName}")
     }
     try {
+      // Copies keep copyable user data, but Scala features live in ordinary user data.
       ScalaFeatures.setAttachedScalaFeatures(copy, ScalaFeatures.forPsiOrDefault(file))
       IntentionPreviewUtils.markAsPreviewCopy(copy, file)
       body(copy)
@@ -127,8 +141,16 @@ object ChangeEngine {
   }
 
   /**
-   * Reformats `range` (the whole file without one) with the IntelliJ formatter, indenting by `indentSize` with spaces
-   * or tabs. The settings are a request-local clone, so the request's indentation never alters the project's.
+   * Previews formatting with the platform's IntelliJ formatter.
+   *
+   * Settings are cloned for this request, leaving project settings unchanged. Configured whole-file scalafmt
+   * requests are handled by the workspace before reaching this entry point.
+   *
+   * @param file Scala file to copy and format
+   * @param range range to format, or none for the whole file
+   * @param indentSize positive indentation width in spaces
+   * @param useTabs whether indentation may use tab characters
+   * @return formatted text and edits against the original
    */
   def format(file: ScalaFile, range: Option[TextRange], indentSize: Int, useTabs: Boolean): Result = HostLock.query {
     require(indentSize > 0, "the indent size must be positive")
@@ -146,10 +168,7 @@ object ChangeEngine {
     }._1)
   }
 
-  /**
-   * The edits from `original` to `changed`: word hunks first, so an added import stays apart from a change in the
-   * body, each refined by characters, so the unchanged whitespace around a change is kept.
-   */
+  /** Refines word hunks into character edits and joins touching changes while retaining unchanged whitespace. */
   private[scalapsihost] def diff(original: String, changed: String): Seq[Edit] = {
     val cancel: CancellationChecker = () => ProgressManager.checkCanceled()
     val edits = for {
@@ -170,7 +189,7 @@ object ChangeEngine {
     case (joined, edit) => joined :+ edit
   }
 
-  /** The file manager keeps a copy's view provider until told otherwise (see commit e098341). */
+  /** Drops the copy's view-provider cache entry after preview use. */
   private def release(copy: ScalaFile): Unit =
     PsiManagerEx.getInstanceEx(copy.getProject).getFileManager.setViewProvider(copy.getViewProvider.getVirtualFile, null)
 }

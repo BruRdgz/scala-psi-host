@@ -19,25 +19,33 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 /**
- * What the IDE searches the whole project for from an editor position or a typed name: the usages of the symbol
- * there (find usages), its implementations (go to implementation) and the symbols whose names match (go to symbol).
- * All over the project's sources (see [[ModuleModel.sourcesScope]]); callers hold the host's read lock.
+ * Finds project usages, implementations and symbols using the plugin's search handlers.
+ *
+ * Searches use the project's source scope (see [[ModuleModel.sourcesScope]]). Callers hold the host's read lock.
  */
 object ProjectSearch {
-/** A symbol found by name, with the qualifier the plugin's go-to contributor gives it (a package or an enclosing
- * class).
- */
+  /**
+   * A named PSI declaration returned by a go-to contributor.
+   *
+   * @param element matched declaration
+   * @param container containing package or class extracted from the contributor's qualified name
+   */
   final case class FoundSymbol(element: PsiNamedElement, container: Option[String])
 
   /**
-   * The most symbols a name query answers. An editor lists a screenful and the user types on to narrow the query, so
-   * the best matches are what counts; the cap also bounds the work of looking items up by name.
+   * Caps symbol results at the best matches an editor can usefully display.
+   *
+   * The cap applies to matched items and bounds further item lookups as the user narrows the query.
    */
   val MaxSymbols = 100
 
-/** The symbol the editor takes `offset` to be about for find usages: the one referenced there, or the one declared
- * there.
- */
+  /**
+   * Resolves the symbol referenced or declared at an editor position.
+   *
+   * @param file source file being queried
+   * @param offset caret offset in UTF-16 code units
+   * @return the find-usages target, or none when no symbol is available
+   */
   def usageTarget(file: PsiFile, offset: Int): Option[PsiElement] =
     targetAt(file, offset, TargetElementUtil.getInstance.getReferenceSearchFlags)
 
@@ -48,9 +56,13 @@ object ProjectSearch {
     }
 
   /**
-   * The usages of `target`, as the plugin's find-usages handler reports them with its default options: those of the
-   * handler's primary and secondary elements. None for a symbol the plugin's handler does not take (a Java
-   * declaration).
+   * Collects usages with the plugin handler's default search options.
+   *
+   * Both primary and secondary elements contribute usages. Unsupported targets, such as Java declarations,
+   * produce no results.
+   *
+   * @param target declaration accepted by the Scala find-usages handler
+   * @return usages reported by the handler
    */
   def usages(target: PsiElement): Seq[UsageInfo] = {
     val factory = new ScalaFindUsagesHandlerFactory(target.getProject)
@@ -65,9 +77,13 @@ object ProjectSearch {
   }
 
   /**
-   * What go to implementation shows for the symbol at `offset`: its implementations and overriders, as the IDE's
-   * handler finds them. From a reference with none (or to a concrete member, which the plugin's evaluator includes),
-   * the symbol itself.
+   * Finds implementations and overriders for an editor position.
+   *
+   * From a reference, the target itself is included when the plugin requests it or no implementation is found.
+   *
+   * @param file source file being queried
+   * @param offset caret offset in UTF-16 code units
+   * @return matching project implementations, possibly including the target itself
    */
   def implementations(file: PsiFile, offset: Int): Seq[PsiElement] = {
     val util = TargetElementUtil.getInstance
@@ -83,11 +99,14 @@ object ProjectSearch {
   }
 
   /**
-   * The project's classes and other symbols whose names match `query`, best match first, at most [[MaxSymbols]]. The
-   * plugin's go-to contributors (and the short-names cache, for classes) list the names and the items of a name; the
-   * query matches names as the IDE's go to symbol does: camel humps and word starts, anywhere in the name. A dotted
-   * query (`pkg.Name`) matches the name by its last part and the item's qualified name by the whole. A blank query
-   * matches nothing.
+   * Finds project symbols matching an editor query.
+   *
+   * Matching follows the IDE's camel-hump and word-start rules. Dotted queries match the final name and the whole
+   * qualified name; blank queries match nothing. Results are capped at [[MaxSymbols]] after resolving items.
+   *
+   * @param project project whose source symbols should be searched
+   * @param query name or qualified-name pattern
+   * @return matches ranked by name relevance, with lexical ordering for equal name scores
    */
   def symbols(project: Project, query: String): Seq[FoundSymbol] =
     if (query.isBlank) Seq.empty

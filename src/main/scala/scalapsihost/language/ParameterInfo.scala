@@ -15,24 +15,44 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 /**
- * Parameter info as the IDE shows it while the caret is in an argument list: the plugin's handlers find the call and
- * its candidate signatures, then render each as text with the current parameter highlighted. The host gives them the
- * contexts the IDE's hint gives them (creating, updating, rendering) and records what they would show.
+ * Renders call signatures using the Scala plugin's parameter-info handlers.
+ *
+ * Handlers receive creation, update and presentation contexts equivalent to the editor hint's lifecycle.
+ * The result contains text and active-parameter ranges without creating a popup.
  */
 object ParameterInfo {
 
-/**
- * A signature as the hint shows it: its text, the current parameter's range in it, and how it is greyed or struck.
- */
+  /**
+   * One signature rendered by a parameter-info handler.
+   *
+   * @param text signature label
+   * @param current active parameter's UTF-16 range within the label
+   * @param applicable whether the handler leaves the signature enabled
+   * @param deprecated whether the handler marks the signature for strikeout
+   */
   final case class Signature(text: String, current: Option[TextRange], applicable: Boolean, deprecated: Boolean)
 
-  /** The signatures, and which one the arguments so far fit (the hint's highlighted one). */
+  /**
+   * The signatures shown for a call.
+   *
+   * @param items rendered signatures in handler order
+   * @param active zero-based index of the highlighted overload, when available
+   */
   final case class Signatures(items: Seq[Signature], active: Option[Int])
 
   // The hint's background, which the handlers only hand back to setupUIComponentPresentation.
   private val Background = Color.WHITE
 
-  /** The signatures of the call around `offset`: the first of the plugin's handlers that finds one answers. */
+  /**
+   * Finds signatures for the call around a document offset.
+   *
+   * The first handler that finds a call supplies the result. Collection runs under a cancellable host read;
+   * the temporary editor is released before returning.
+   *
+   * @param file Scala source being queried
+   * @param offset caret offset in UTF-16 code units
+   * @return rendered signatures, or none when no handler finds a call
+   */
   def at(file: ScalaFile, offset: Int): Option[Signatures] = HostLock.query {
     Using.resource(new RequestEditor(file.getViewProvider.getDocument, file.getProject, offset)) { editor =>
       LanguageParameterInfo.INSTANCE.allForLanguage(file.getLanguage).asScala.iterator
@@ -73,9 +93,15 @@ object ParameterInfo {
       case ("getOffset", _) => Integer.valueOf(offset)
       case ("getEditor", _) => editor
       case ("getParameterOwner", _) => owner
-      case ("setParameterOwner", Array(element: PsiElement)) => owner = element; null
-      case ("setCurrentParameter", Array(index: Integer)) => currentParameter = index; null
-      case ("setHighlightedParameter", Array(item)) => highlighted = item; null
+      case ("setParameterOwner", Array(element: PsiElement)) =>
+        owner = element
+        null
+      case ("setCurrentParameter", Array(index: Integer)) =>
+        currentParameter = index
+        null
+      case ("setHighlightedParameter", Array(item)) =>
+        highlighted = item
+        null
       case ("getHighlightedParameter", _) => highlighted
       case ("getObjectsToView", _) => items.toArray
       // No hint is shown, so none is removed.

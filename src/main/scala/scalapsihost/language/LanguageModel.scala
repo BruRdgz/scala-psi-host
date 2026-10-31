@@ -12,7 +12,15 @@ enum WorkspaceSymbolKind {
   case EnumMember, Enum, Interface, Module, Class, Constructor, Function, Method, Property, Namespace, Variable, Constant, Object
 }
 
-/** A problem in a file, from the Scala plugin or the build compiler. */
+/**
+ * A source problem reported by the Scala plugin or compiler.
+ *
+ * @param severity protocol-neutral diagnostic level
+ * @param start zero-based start line and UTF-16 column
+ * @param end exclusive end line and UTF-16 column
+ * @param message diagnostic text
+ * @param source producer label, such as `scala-plugin` or `scalac`
+ */
 final case class FileProblem(
   severity: ProblemSeverity,
   start: LineColumn,
@@ -21,25 +29,73 @@ final case class FileProblem(
   source: String,
 )
 
-/** An occurrence of a symbol and whether it writes the symbol. */
+/**
+ * A symbol occurrence within one document.
+ *
+ * @param range start and exclusive end positions in zero-based lines and UTF-16 columns
+ * @param write whether the plugin classifies the occurrence as a write
+ */
 final case class Occurrence(range: (LineColumn, LineColumn), write: Boolean)
 
-/** A range in a project source file. */
+/**
+ * A range in a source file.
+ *
+ * @param path source path, including a materialized library source when navigating outside the project
+ * @param range start and exclusive end positions in zero-based lines and UTF-16 columns
+ */
 final case class SourceSpan(path: Path, range: (LineColumn, LineColumn))
 
-/** A project symbol found by name, with its containing package or class and source range. */
+/**
+ * A project symbol found by name.
+ *
+ * @param name symbol name
+ * @param kind declaration category
+ * @param container containing package or class when available
+ * @param location source range of the symbol's name
+ */
 final case class WorkspaceSymbolMatch(name: String, kind: WorkspaceSymbolKind, container: Option[String], location: SourceSpan)
 
-/** The text between `start` and `end` becomes `text`. */
+/**
+ * A replacement within a document snapshot.
+ *
+ * @param start zero-based start line and UTF-16 column
+ * @param end exclusive end line and UTF-16 column
+ * @param text replacement text, empty for a deletion
+ */
 final case class TextChange(start: LineColumn, end: LineColumn, text: String)
 
-/** The changes to a project file. */
+/**
+ * Text changes for one project file.
+ *
+ * @param path file to edit
+ * @param changes replacements expressed against the same document snapshot
+ */
 final case class FileChanges(path: Path, changes: Seq[TextChange])
 
-/** A previewed editor action, with its protocol-neutral outcome and applicable changes. */
+/**
+ * Describes the availability and kind of a previewed editor action.
+ *
+ * @param title user-facing action name
+ * @param kind hierarchical action category, such as `quickfix` or `refactor.rewrite`
+ * @param disabled reason the action cannot be applied, or none when available
+ */
 final case class CodeActionResult(title: String, kind: String, disabled: Option[String])
 
-/** A completion candidate with only the values needed by an editor. */
+/**
+ * A completion candidate detached from plugin lookup objects.
+ *
+ * Retain its lookup, prefix and identity when requesting an insertion follow-up against the same snapshot.
+ *
+ * @param label presentation text
+ * @param tail additional context shown after the label
+ * @param typeText rendered result type when available
+ * @param kind completion category
+ * @param deprecated whether the candidate is deprecated
+ * @param lookup text inserted for the candidate
+ * @param prefixText document prefix used to obtain the candidate
+ * @param hasHandler whether plugin insertion logic can produce additional edits
+ * @param identity opaque key used to find the same candidate during insertion replay
+ */
 final case class CompletionCandidate(
   label: String,
   tail: Option[String],
@@ -52,28 +108,77 @@ final case class CompletionCandidate(
   identity: String,
 )
 
-/** A completion suggestion and the range its lookup text replaces. */
+/**
+ * A completion candidate with its replacement range.
+ *
+ * @param suggestion candidate presentation and insertion identity
+ * @param start zero-based start line and UTF-16 column of the prefix
+ * @param end exclusive end of the prefix
+ */
 final case class CompletionChoice(suggestion: CompletionCandidate, start: LineColumn, end: LineColumn)
 
-/** What a chosen suggestion's insert handler does after its lookup text is inserted. */
+/**
+ * Additional effects of a completion candidate's insert handler.
+ *
+ * @param changes replacements against the document after the lookup text has been inserted
+ * @param caret final zero-based caret line and UTF-16 column
+ */
 final case class CompletionFollowUp(changes: Seq[TextChange], caret: LineColumn)
 
-/** An inline hint at a document position. */
+/**
+ * An inline hint at a document position.
+ *
+ * @param at zero-based line and UTF-16 column at which to show the hint
+ * @param text rendered hint label
+ */
 final case class InlineHint(at: LineColumn, text: String)
 
-/** The best-first completion choices and whether the client can ask for more. */
+/**
+ * Ranked completion choices for one request.
+ *
+ * @param items candidates in plugin relevance order
+ * @param incomplete whether additional suggestions were omitted from the bounded result
+ */
 final case class CompletionChoices(items: Seq[CompletionChoice], incomplete: Boolean)
 
-/** A range in rendered signature text. */
+/**
+ * A range in rendered signature text.
+ *
+ * @param start inclusive UTF-16 offset
+ * @param end exclusive UTF-16 offset
+ */
 final case class OffsetRange(start: Int, end: Int)
 
-/** One rendered call signature, including its current parameter when available. */
+/**
+ * One rendered call signature.
+ *
+ * @param text signature label
+ * @param current range of the active parameter in the label, when known
+ * @param applicable whether the plugin considers this overload applicable
+ * @param deprecated whether the overload is deprecated
+ */
 final case class SignatureInfo(text: String, current: Option[OffsetRange], applicable: Boolean, deprecated: Boolean)
 
-/** Rendered overloads and the active overload index. */
+/**
+ * Rendered overloads for the current call.
+ *
+ * @param items signatures in plugin order
+ * @param active zero-based active overload index, when known
+ */
 final case class SignatureChoices(items: Seq[SignatureInfo], active: Option[Int])
 
-/** A declaration in a file outline, including its ranges and nested declarations. */
+/**
+ * A declaration in a file outline.
+ *
+ * All ranges use zero-based lines and UTF-16 columns, with exclusive ends.
+ *
+ * @param name declaration name
+ * @param detail signature text following the name
+ * @param kind declaration category
+ * @param range complete declaration range
+ * @param nameRange range selecting the declaration's name
+ * @param children nested declarations in structure-view order
+ */
 final case class OutlineSymbol(
   name: String,
   detail: String,
@@ -83,10 +188,18 @@ final case class OutlineSymbol(
   children: Seq[OutlineSymbol],
 )
 
-/** A folding region category and its hidden line range. */
+/**
+ * A line-based folding region.
+ *
+ * @param startLine zero-based first line of the region
+ * @param endLine zero-based last line, inclusive
+ * @param kind folding category
+ */
 final case class Fold(startLine: Int, endLine: Int, kind: Fold.Kind)
 
+/** Folding categories shared by language operations and protocol mapping. */
 object Fold {
+  /** The reason a document region can be folded. */
   enum Kind { case Code, Comment, Imports, Region }
   export Kind.*
 }
@@ -97,9 +210,17 @@ enum SemanticTokenKind {
     Function, Method, Keyword, Decorator
 }
 
+/** Semantic properties that refine a token's category. */
 enum SemanticTokenModifier { case Readonly, Abstract, Declaration }
 
-/** One single-line semantic token. */
+/**
+ * A semantic token contained within one document line.
+ *
+ * @param start zero-based start line and UTF-16 column
+ * @param length token length in UTF-16 code units
+ * @param kind semantic category
+ * @param modifiers additional declaration or mutability properties
+ */
 final case class SemanticToken(
   start: LineColumn,
   length: Int,

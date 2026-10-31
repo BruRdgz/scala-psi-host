@@ -15,11 +15,21 @@ import scala.annotation.tailrec
 import scala.util.Using
 
 /**
- * Successive Extend Selection steps, using SelectWordUtil's registered handlers. As in SelectWordHandler, each
+ * Computes successive Extend Selection steps using the platform's registered handlers.
+ *
+ * As in SelectWordHandler, each
  * step searches from the caret's leaf and stops at the first ancestor offering a strict expansion of the selection.
  */
 object SelectionRanges {
-  /** The successively larger ranges the editor's Extend Selection action would choose from `offset`. */
+  /**
+   * Expands a caret position into successively larger selection ranges.
+   *
+   * Runs under a cancellable host read with a temporary editor, released before returning.
+   *
+   * @param file Scala source being queried
+   * @param offset caret offset in UTF-16 code units
+   * @return strict expansions from innermost to outermost, excluding the initial empty range
+   */
   def at(file: ScalaFile, offset: Int): Seq[TextRange] = HostLock.query {
     Using.resource(new RequestEditor(file.getViewProvider.getDocument, file.getProject, offset)) { request =>
       val editor = request.editor
@@ -43,10 +53,7 @@ object SelectionRanges {
     }
   }
 
-  /**
-   * Where the handlers start, and from which offset: the leaf at the caret (the one before it when the caret ends a
-   * token next to whitespace), or the content after whitespace the selection cannot grow within.
-   */
+  /** Starts at the caret's leaf or preceding token, skipping whitespace that cannot expand. */
   private def startElement(file: ScalaFile, editor: Editor, caret: Caret, offset: Int): Option[(PsiElement, Int)] = {
     val leaf = elementAt(file, offset)
     val element = leaf match {
@@ -74,7 +81,8 @@ object SelectionRanges {
   /** Moves the handler lookup one code unit left at token ends, whitespace boundaries and selection ends. */
   private def adjustedOffset(text: CharSequence, caret: Caret): Int = {
     val offset = caret.getOffset
-    def favoursPrevious = {
+    /** Keeps character access deferred until the caret is known to have a preceding code unit. */
+    def favoursPrevious: Boolean = {
       val previous = text.charAt(offset - 1)
       val identifierEnd = offset < text.length && !Character.isJavaIdentifierPart(text.charAt(offset)) && Character.isJavaIdentifierPart(previous)
       val whitespace = (offset == text.length || Character.isWhitespace(text.charAt(offset))) && !Character.isWhitespace(previous)

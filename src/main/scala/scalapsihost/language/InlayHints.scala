@@ -14,21 +14,24 @@ import scala.jdk.CollectionConverters.*
 import scala.util.Using
 
 /**
- * The inline hints the IDE shows in a Scala file: types of definitions without one, parameter names, implicit and
- * `using` arguments, conversions, method chains and type arguments. They come from the plugin's own hints pass, the
- * one the IDE's daemon runs, read as the hints it collected before an editor would draw them.
+ * Collects inline hints from the Scala plugin's own editor pass.
+ *
+ * Includes inferred types, parameter names, implicit/using arguments, conversions, method chains and type arguments.
+ * Range hints requiring desktop editor presentations are excluded.
  */
 object InlayHints {
 
-  /** A hint at `offset`, between two characters of the file. */
+  /**
+   * A rendered inline hint.
+   *
+   * @param offset UTF-16 document offset between characters
+   * @param text rendered hint label
+   */
   final case class InlayHint(offset: Int, text: String)
 
-  /**
-   * The IDE's settings, but for range hints: RangeInlayHintsPass casts its editor to EditorImpl to build drawn
-   * presentations, which have no text. Lazy: the adapter reads the plugin's settings services, registered after
-   * the host first enables implicit hints.
-   */
+  /** Reads registered plugin settings on demand, excluding range hints that require desktop presentations. */
   private lazy val Settings = new ScalaHintsSettings.CodeInsightSettingsAdapter {
+    // RangeInlayHintsPass requires EditorImpl and produces drawn presentations rather than text.
     override def showRangeHintsForToAndUntil: Boolean = false
     override def showExclusiveRangeHint: Boolean = false
   }
@@ -44,13 +47,23 @@ object InlayHints {
 
   // The public setter rebinds IDE shortcuts and fails without KeymapManager. A field write is smaller than
   // adding the absent keymap API and adapters solely for those shortcuts; the host only needs the enabled flag.
-  private val Enabled = ImplicitHints.getClass.getDeclaredField("_enabled")
-  Enabled.setAccessible(true)
+  private val Enabled = {
+    val field = ImplicitHints.getClass.getDeclaredField("_enabled")
+    field.setAccessible(true)
+    field
+  }
 
   /** Sets the plugin's implicit-hints flag without registering the IDE keymap services it otherwise requires. */
   private[scalapsihost] def setImplicitHintsEnabled(enabled: Boolean): Unit = Enabled.setBoolean(ImplicitHints, enabled)
 
-  /** The hints in document order, preserving collection order when several share an offset. */
+  /**
+   * Collects the plugin's inline hints for a Scala file.
+   *
+   * Collection runs under a cancellable host read with a temporary request editor, released before returning.
+   *
+   * @param file source file to query
+   * @return hints in document order, preserving collection order at equal offsets
+   */
   def in(file: ScalaFile): Seq[InlayHint] = HostLock.query {
     Using.resource(new RequestEditor(file.getViewProvider.getDocument, file.getProject, 0)) { editor =>
       val pass = HostImplicitHintsPass.create(editor.editor, file, Settings)

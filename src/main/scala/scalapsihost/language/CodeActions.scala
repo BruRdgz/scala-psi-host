@@ -30,29 +30,55 @@ object CodeActions {
   /** Lazily created plugin action plus the LSP action kind used for its response. */
   private final case class Candidate(name: String, create: () => IntentionAction, kind: String)
 
-  /** An action's edits, or the reason its preview cannot be applied as a source edit. */
+  /**
+   * A previewed action and its availability.
+   *
+   * @param title user-facing action name
+   * @param kind hierarchical action category
+   * @param edits replacements against the original file
+   * @param disabled reason the preview cannot be applied, or none when available
+   */
   final case class Choice(title: String, kind: String, edits: Seq[ChangeEngine.Edit], disabled: Option[String])
 }
 
-/** Plugin intentions and annotator fixes, applied through the platform's preview contract to a file copy. */
+/**
+ * Previews plugin intentions, annotator fixes and surround actions as source edits.
+ *
+ * Callers hold PSI read access. Actions run against copies through the platform's preview contract;
+ * unsupported previews are disabled with a reason when the action is known to be available.
+ *
+ * @param intentionClasses intention implementation names from plugin descriptors
+ * @param descriptorClasses surround-descriptor implementation names from plugin descriptors
+ */
 final class CodeActions(intentionClasses: Seq[String], descriptorClasses: Seq[String]) {
   import CodeActions.{Candidate, Choice}
 
-  /** The plugin analyzes and rewrites imports on the preview copy, leaving the source unchanged. */
+  /**
+   * Previews the plugin's import optimizer on a file copy.
+   *
+   * @param file Scala file whose imports should be organized
+   * @return the organize-imports action with edits against the original
+   */
   def organizeImports(file: ScalaFile): Choice = {
     val (result, _) = preview(file)(copy => new ScalaImportOptimizer().processFile(copy).run())
     Choice("Organize imports", "source.organizeImports", result.edits, None)
   }
 
   /**
-   * Finds fixes, intentions and surround actions applicable at `range`, returning their previews as edits against
-   * the original file. Actions without a usable preview are returned disabled with a reason.
+   * Collects previewed fixes, intentions and surround actions for a source range.
+   *
+   * Unusable previews are returned disabled when availability was established. Cancellation propagates;
+   * failures inside an action's availability or preview check are logged before continuing with other choices.
+   *
+   * @param file Scala file being queried
+   * @param range selected UTF-16 range, empty for a caret request
+   * @param problems current diagnostics carrying annotator fixes
+   * @return distinct action choices with edits against the original file
    */
   def collect(file: ScalaFile, range: TextRange, problems: Seq[Diagnostic]): Seq[Choice] = {
     val project = file.getProject
     Using.resource(new RequestEditor(file.getViewProvider.getDocument, project, range.getStartOffset)) { request =>
       val editor = request.editor
-      editor.getSelectionModel.setSelection(range.getStartOffset, range.getEndOffset)
       val intentions = intentionClasses.filterNot(CodeActions.UnavailableIntentions).map { name =>
         Candidate(name, () => Class.forName(name).getConstructor().newInstance().asInstanceOf[IntentionAction], "refactor.rewrite")
       }
@@ -60,6 +86,8 @@ final class CodeActions(intentionClasses: Seq[String], descriptorClasses: Seq[St
         case (fixRange, fix) if fixRange.intersects(range) || fixRange.containsOffset(range.getStartOffset) =>
           Candidate(fix.getClass.getName, () => fix, "quickfix")
       }
+
+      editor.getSelectionModel.setSelection(range.getStartOffset, range.getEndOffset)
       val choices = (fixes ++ intentions).flatMap { candidate =>
         var title = candidate.name.split('.').last
         var available = false

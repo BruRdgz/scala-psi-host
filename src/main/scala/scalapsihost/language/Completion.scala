@@ -30,8 +30,7 @@ import scala.util.Using
 import scala.util.control.NonFatal
 
 /**
- * BASIC completion as the IDE runs it: the plugin's contributors complete a copy of the file with a dummy identifier
- * at the caret, and their results are ordered by the plugin's weighers.
+ * Computes BASIC completion using the plugin's contributors and relevance weighers.
  *
  * As in the IDE, a suggestion's insert handler runs only once the user has chosen it ([[insert]]): the list inserts
  * the lookup string, and the handler (parentheses, an import, generated code) then runs on the text that has it,
@@ -43,12 +42,25 @@ object Completion {
     case EnumMember, Enum, Interface, Module, TypeParameter, Class, Constructor, Method, Field, Variable, Value, Keyword
   }
 
-  // Bounds rendering and the response while leaving enough suggestions to narrow down as the user types on.
+  /** Bounds rendering and response size while retaining enough choices for the user to narrow the query. */
   val MaxSuggestions = 200
 
   /**
-   * A suggestion as the IDE's lookup shows it. Choosing it replaces `prefix` (the typed `prefixText`) with `lookup`;
-   * when `hasHandler`, its insert handler then runs ([[insert]]), and `identity` finds it again for that.
+   * A rendered completion suggestion with its insertion identity.
+   *
+   * Choosing it replaces the typed prefix with `lookup`. Retain its prefix text and identity to replay
+   * the insert handler through [[insert]] against that updated document.
+   *
+   * @param label presentation text
+   * @param tail additional context following the label
+   * @param typeText rendered result type when available
+   * @param kind completion category
+   * @param deprecated whether the presentation marks the item as deprecated
+   * @param lookup text inserted when the suggestion is chosen
+   * @param prefix UTF-16 range replaced by the lookup text
+   * @param prefixText original text within the prefix range
+   * @param hasHandler whether choosing the item can do more than insert its lookup text
+   * @param identity opaque key distinguishing rendered candidates during insertion replay
    */
   final case class Suggestion(
     label: String,
@@ -63,10 +75,20 @@ object Completion {
     identity: String,
   )
 
-  /** The suggestions, best first; `incomplete` when some were left out, so the editor asks again as the user types. */
+  /**
+   * Ranked completion results.
+   *
+   * @param items suggestions in relevance order
+   * @param incomplete whether additional renderable suggestions were omitted by the result limit
+   */
   final case class Suggestions(items: Seq[Suggestion], incomplete: Boolean)
 
-  /** What a suggestion's insert handler changed: `result`'s edits, and where it left the caret in `result.text`. */
+  /**
+   * The previewed result of choosing a completion suggestion.
+   *
+   * @param result changed text and edits against the input file snapshot
+   * @param caret final UTF-16 caret offset within `result.text`
+   */
   final case class Inserted(result: ChangeEngine.Result, caret: Int)
 
   /** The platform service keeps the current completion in a field; host requests complete on several threads. */
@@ -80,7 +102,17 @@ object Completion {
     }
   }
 
-  /** The suggestions at `offset`. A read: nothing is inserted until the user chooses. */
+  /**
+   * Computes and renders completion suggestions at a document offset.
+   *
+   * Runs under a cancellable read without changing the source. Temporary editors, PSI copies and offset maps
+   * are released after rendering; the result contains presentation values only.
+   *
+   * @param file Scala source being queried
+   * @param offset caret offset in UTF-16 code units
+   * @param limit maximum number of rendered suggestions to return
+   * @return ranked suggestions and whether more renderable items remain
+   */
   def complete(file: ScalaFile, offset: Int, limit: Int = MaxSuggestions): Suggestions = HostLock.query {
     completionResults(file, file.getText, offset) { results =>
       // The lookup renders visible items lazily. One more successful rendering determines whether the list is incomplete.
@@ -91,9 +123,17 @@ object Completion {
   }
 
   /**
-   * Runs the insert handler of the suggestion `identity`, chosen where `prefixText` was typed at `start` and whose
-   * lookup string `file` now has there, as the IDE does once the user chooses it. Empty when the file no longer has
-   * the lookup string there, or the suggestion is gone.
+   * Previews the insert handler of a previously chosen suggestion.
+   *
+   * The input file must already contain the lookup text in place of the typed prefix. The candidate is found again
+   * using its original prefix and identity; a missing lookup or candidate produces no follow-up.
+   *
+   * @param file Scala file containing the inserted lookup text
+   * @param start UTF-16 start offset of that text
+   * @param prefixText prefix used to obtain the original suggestion
+   * @param lookup inserted lookup string
+   * @param identity suggestion identity returned by [[complete]]
+   * @return previewed follow-up edits and caret, or none when the selection can no longer be replayed
    */
   def insert(file: ScalaFile, start: Int, prefixText: String, lookup: String, identity: String): Option[Inserted] =
     HostLock.query {
@@ -112,10 +152,7 @@ object Completion {
       }
     }
 
-  /**
-   * Chooses, at `offset`, the best suggestion that `lookup` names, as the plugin's completion tests do: its lookup
-   * string replaces the prefix, then its insert handler runs as on `completionChar`.
-   */
+  /** Previews the best matching suggestion and its insert handler, as the plugin's completion tests do. */
   private[scalapsihost] def choose(file: ScalaFile, offset: Int, lookup: String, completionChar: Char): Inserted =
     HostLock.query {
       completionResults(file, file.getText, offset) { results =>
@@ -135,26 +172,23 @@ object Completion {
       val editor = IntentionPreviewUtils.getPreviewEditor
       editor.getCaretModel.moveToOffset(prefix.getStartOffset + element.getLookupString.length)
       runHandler(copy, editor, element, results.map(_.getLookupElement).toArray, prefix.getStartOffset, completionChar)
+      // Keep the caret model until postponed formatting has updated its offset in ChangeEngine.
       editor
     }
     Inserted(changed, editor.getCaretModel.getOffset)
   }
 
-  /**
-   * Runs `element`'s insert handler on `copy`, which has its lookup string at `start`, with the context the IDE's
-   * lookup gives it: the offsets of the inserted string and of the identifier it ends in, the suggestions, and the
-   * character that chose it.
-   */
+  /** Runs an insert handler on the copy using the lookup's offsets, candidates and completion character. */
   private def runHandler(copy: ScalaFile, editor: Editor, element: LookupElement, elements: Array[LookupElement],
                          start: Int, completionChar: Char): Unit = {
     val document = copy.getViewProvider.getDocument
     val tail = editor.getCaretModel.getOffset
     val identifierEnd = CompletionInitializationContext.calcDefaultIdentifierEnd(editor, tail)
     val offsets = new OffsetMap(document)
-    offsets.addOffset(CompletionInitializationContext.START_OFFSET, start)
-    offsets.addOffset(CompletionInitializationContext.SELECTION_END_OFFSET, tail)
-    offsets.addOffset(CompletionInitializationContext.IDENTIFIER_END_OFFSET, identifierEnd)
     try {
+      offsets.addOffset(CompletionInitializationContext.START_OFFSET, start)
+      offsets.addOffset(CompletionInitializationContext.SELECTION_END_OFFSET, tail)
+      offsets.addOffset(CompletionInitializationContext.IDENTIFIER_END_OFFSET, identifierEnd)
       // Replacing (Tab) also removes the rest of the identifier the caret was in.
       if (completionChar == Lookup.REPLACE_SELECT_CHAR && identifierEnd > tail) document.deleteString(tail, identifierEnd)
       val context = new InsertionContext(offsets, completionChar, elements, copy, editor, false)
@@ -179,6 +213,9 @@ object Completion {
 
   /** Converts the plugin's lookup element and presentation into the host's completion value. */
   private def suggestion(result: CompletionResult, offset: Int): Suggestion = {
+    /** Trims optional presentation text and omits values that render empty. */
+    def text(value: String): Option[String] = Option(value).map(_.trim).filter(_.nonEmpty)
+
     val element = result.getLookupElement
     val presentation = new LookupElementPresentation
     element.renderElement(presentation)
@@ -187,8 +224,6 @@ object Completion {
       // The API types the renderer existentially; its contract is to render this very element.
       renderer.asInstanceOf[LookupElementRenderer[LookupElement]].renderElement(element, presentation)
     }
-    /** Trims optional presentation text and omits values that render empty. */
-    def text(value: String) = Option(value).map(_.trim).filter(_.nonEmpty)
     val label = text(presentation.getItemText).getOrElse(element.getLookupString)
     val tail = text(presentation.getTailText)
     val typeText = text(presentation.getTypeText)
@@ -207,9 +242,7 @@ object Completion {
     )
   }
 
-  /** Whether choosing `element` does more than insert its lookup string (ScalaInsertHandler, an import, a keyword's
-   * space...).
-   */
+  /** Whether choosing an item can add parentheses, imports, keyword spacing or other generated text. */
   private def hasHandler(element: LookupElement): Boolean = ScalaLookupItem.delegate(element) match {
     case item: ScalaLookupItem => !insertsLookupOnly(item)
     case builder: LookupElementBuilder => builder.getInsertHandler != null
@@ -232,11 +265,7 @@ object Completion {
     })
   }
 
-  /**
-   * The completion results at `offset` of `text`, the text of `file` or one it had, while the copy they were
-   * computed on (and what it holds) is alive: the contributors run before completion (choosing the dummy
-   * identifier), then complete a copy where it replaces the prefix, as the IDE's CompletionInitializationUtil does.
-   */
+  /** Supplies contributor results while their dummy-identifier copy and offset translations remain alive. */
   private def completionResults[T](file: ScalaFile, text: String, offset: Int)(use: Vector[CompletionResult] => T): T =
     Using.Manager { resources =>
       require(offset >= 0 && offset <= text.length, s"completion offset outside the text: $offset")
@@ -283,10 +312,7 @@ object Completion {
     resources(closeable)
   }
 
-  /**
-   * A non-physical copy of `file` with `text`, for completion's own reading. Unlike PsiFile.copy (which the change
-   * engine uses), it never takes a write: completion only reads.
-   */
+  /** Creates completion-only PSI through the file factory without the write access required by PsiFile.copy. */
   private final class TemporaryCopy(original: ScalaFile, text: String) extends AutoCloseable {
     val file: PsiFile = PsiFileFactory.getInstance(original.getProject)
       .createFileFromText(original.getName, original.getLanguage, text, false, false)
@@ -297,7 +323,7 @@ object Completion {
     // Module scopes come from the original file; Scala features are plain user data, set before the tree is parsed.
     ScalaFeatures.setAttachedScalaFeatures(file, ScalaFeatures.forPsiOrDefault(original))
 
-    /** The file manager keeps a copy's view provider until told otherwise (see commit e098341). */
+    /** Drops the temporary copy's view-provider cache entry. */
     override def close(): Unit =
       PsiManagerEx.getInstanceEx(original.getProject).getFileManager.setViewProvider(file.getViewProvider.getVirtualFile, null)
   }
@@ -314,10 +340,7 @@ object Completion {
     }
   }
 
-  /**
-   * `elements` in the order of `sorter`'s weighers. A failed item is logged and removed through the classifier
-   * chain, as the lookup removes an item: this clears its partial weights without weighing the other items again.
-   */
+  /** Orders items through the classifier chain, removing failed items with their partial weights. */
   private def classified(sorter: CompletionSorterImpl, elements: Vector[LookupElement], context: ProcessingContext): Vector[LookupElement] = {
     val classifier = sorter.buildClassifier(Classifier.empty[LookupElement]())
     val weighed = elements.filter { element =>
