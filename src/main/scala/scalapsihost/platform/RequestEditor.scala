@@ -9,63 +9,83 @@ import com.intellij.openapi.util.{Key, TextRange, UserDataHolderBase}
 import com.intellij.psi.PsiDocumentManager
 import org.jetbrains.plugins.scala.highlighter.ScalaSyntaxHighlighterFactory
 
-/**
- * A request-local editor that tracks caret and selection positions through document and PSI changes.
- * Offsets use UTF-16 code units; selection starts are inclusive and ends exclusive.
- *
- * The caller owns this editor and must close it to detach its document listener. Use it on the thread running
- * the request, under the same read/preview or write action as the document operations.
- */
+/** Provides a request-scoped editor; callers close it to detach document-position tracking. */
 private[scalapsihost] final class RequestEditor(document: Document, project: Project, offset: Int)
     extends AutoCloseable {
+  // State stays on the request thread, under its read/preview or write action. Offsets are UTF-16 code units;
+  // selections include their start and exclude their end.
   private val data = new UserDataHolderBase
   private var caretOffset = offset
   private var selectionStart = offset
   private var selectionEnd = offset
+
   private lazy val settings = tableProxy(classOf[EditorSettings], "SelectionSettings") {
     // AbstractWordSelectioner and ScalaStringLiteralSelectioner read the platform's default camel-word mode.
     case ("isCamelWords", _) => java.lang.Boolean.FALSE
   }
-  // Selection queries do not edit the document; the highlighter lexes its request-local snapshot.
+  /** Builds the layered lexer lazily from the document's PSI and current text snapshot. */
   private lazy val highlighter = {
     val file = PsiDocumentManager.getInstance(project).getPsiFile(document)
     val syntax = ScalaSyntaxHighlighterFactory.createScalaSyntaxHighlighter(project, file.getVirtualFile, file.getLanguage)
-    val result = new LexerEditorHighlighter(syntax, EditorColorsManager.getInstance.getGlobalScheme)
-    result.setText(document.getImmutableCharSequence)
-    result
+    val lexerHighlighter = new LexerEditorHighlighter(syntax, EditorColorsManager.getInstance.getGlobalScheme)
+
+    lexerHighlighter.setText(document.getImmutableCharSequence)
+    lexerHighlighter
   }
+
   private val listener = new DocumentListener {
+    /** Moves tracked positions through a replacement, keeping selection-start and selection-end affinity. */
     override def documentChanged(event: DocumentEvent): Unit = {
-      def shifted(at: Int, right: Boolean): Int =
-        if (at < event.getOffset || at == event.getOffset && !right) at
-        else if (at > event.getOffset + event.getOldLength) at + event.getNewLength - event.getOldLength
-        else event.getOffset + event.getNewLength
+      val changeStart = event.getOffset
+      val oldEnd = changeStart + event.getOldLength
+      val newEnd = changeStart + event.getNewLength
+      val lengthDelta = newEnd - oldEnd
       val hadSelection = selectionStart != selectionEnd
-      caretOffset = shifted(caretOffset, true)
-      selectionStart = shifted(selectionStart, false)
-      selectionEnd = shifted(selectionEnd, true)
+
+      /** Keeps left-biased positions at the change start and moves covered positions after the new text. */
+      def shifted(at: Int, rightBiased: Boolean): Int =
+        if (at < changeStart || (at == changeStart && !rightBiased)) at
+        else if (at > oldEnd) at + lengthDelta
+        else newEnd
+
+      caretOffset = shifted(caretOffset, rightBiased = true)
+      selectionStart = shifted(selectionStart, rightBiased = false)
+      selectionEnd = shifted(selectionEnd, rightBiased = true)
       if (!hadSelection || selectionStart == selectionEnd) removeSelection()
     }
   }
-  document.addDocumentListener(listener)
 
-  private def move(at: Int): Unit = {
+  /** Moves the caret to a valid document offset and collapses its selection. */
+  private def moveCaret(at: Int): Unit = {
     require(at >= 0 && at <= document.getTextLength, s"caret outside document: $at")
+
     caretOffset = at
     removeSelection()
   }
-  private def removeSelection(): Unit = { selectionStart = caretOffset; selectionEnd = caretOffset }
-  private def select(start: Int, end: Int): Unit = {
+
+  /** Collapses both selection bounds to the current caret. */
+  private def removeSelection(): Unit = {
+    selectionStart = caretOffset
+    selectionEnd = caretOffset
+  }
+
+  /** Updates a valid half-open selection without moving the caret. */
+  private def setSelection(start: Int, end: Int): Unit = {
     require(start >= 0 && start <= end && end <= document.getTextLength, "selection outside document")
+
     selectionStart = start
     selectionEnd = end
   }
 
+  /** Stores user data through the reflection boundary where Key's type parameter is erased. */
+  private def putData(key: Key[?], value: AnyRef): Unit = data.putUserData(key.asInstanceOf[Key[AnyRef]], value)
+
+  /** Exposes the lazily connected editor, caret and selection adapters for this request. */
   lazy val editor: Editor = tableProxy(classOf[Editor], "RequestEditor") {
     case ("getDocument", _) => document
     case ("getProject", _) => project
-    case ("getCaretModel", _) => model
-    case ("getSelectionModel", _) => selection
+    case ("getCaretModel", _) => caretModel
+    case ("getSelectionModel", _) => selectionModel
     // Word selection reads isCamelWords; it never changes editor settings.
     case ("getSettings", _) => settings
     // EditorActionUtil's lexeme boundaries and InjectedFileReferenceSelectioner's escapes use the layered lexer.
@@ -74,11 +94,12 @@ private[scalapsihost] final class RequestEditor(document: Document, project: Pro
     case ("isOneLineMode", _) => java.lang.Boolean.FALSE
     // The host has no editor-specific color scheme.
     case ("getColorsScheme", _) => EditorColorsManager.getInstance.getGlobalScheme
-    case ("getUserData", Array(k: Key[?])) => data.getUserData(k).asInstanceOf[AnyRef]
-    case ("putUserData", Array(k: Key[?], value)) => putData(k, value); null
+    case ("getUserData", Array(key: Key[?])) => data.getUserData(key).asInstanceOf[AnyRef]
+    case ("putUserData", Array(key: Key[?], value)) =>
+      putData(key, value)
+      null
   }
-  // Reflection erases Key's type parameter, as in the project's user-data table.
-  private def putData(key: Key[?], value: AnyRef): Unit = data.putUserData(key.asInstanceOf[Key[AnyRef]], value)
+
   private lazy val caret: Caret = tableProxy(classOf[Caret], "CompletionCaret") {
     case ("getEditor", _) => editor
     case ("getOffset", _) => Integer.valueOf(caretOffset)
@@ -87,23 +108,39 @@ private[scalapsihost] final class RequestEditor(document: Document, project: Pro
     case ("hasSelection", _) => java.lang.Boolean.valueOf(selectionStart != selectionEnd)
     // SelectWordUtil checks whether the current selection still fits inside whitespace before expanding it.
     case ("getSelectionRange", _) => new TextRange(selectionStart, selectionEnd)
-    case ("moveToOffset", Array(at: Integer)) => move(at.intValue); null
-    case ("setSelection", Array(start: Integer, end: Integer)) => select(start.intValue, end.intValue); null
-    case ("removeSelection", _) => removeSelection(); null
+    case ("moveToOffset", Array(at: Integer)) =>
+      moveCaret(at.intValue)
+      null
+    case ("setSelection", Array(start: Integer, end: Integer)) =>
+      setSelection(start.intValue, end.intValue)
+      null
+    case ("removeSelection", _) =>
+      removeSelection()
+      null
   }
-  private lazy val model: CaretModel = tableProxy(classOf[CaretModel], "CompletionCaretModel") {
+
+  private lazy val caretModel: CaretModel = tableProxy(classOf[CaretModel], "CompletionCaretModel") {
     case ("getCurrentCaret" | "getPrimaryCaret", _) => caret
     case ("getOffset", _) => Integer.valueOf(caretOffset)
     case ("getAllCarets", _) => java.util.List.of(caret)
-    case ("moveToOffset", Array(at: Integer)) => move(at.intValue); null
+    case ("moveToOffset", Array(at: Integer)) =>
+      moveCaret(at.intValue)
+      null
   }
-  private lazy val selection: SelectionModel = tableProxy(classOf[SelectionModel], "CompletionSelection") {
+
+  private lazy val selectionModel: SelectionModel = tableProxy(classOf[SelectionModel], "CompletionSelection") {
     case ("getSelectionStart", _) => Integer.valueOf(selectionStart)
     case ("getSelectionEnd", _) => Integer.valueOf(selectionEnd)
     case ("hasSelection", _) => java.lang.Boolean.valueOf(selectionStart != selectionEnd)
-    case ("setSelection", Array(start: Integer, end: Integer)) => select(start.intValue, end.intValue); null
-    case ("removeSelection", _) => removeSelection(); null
+    case ("setSelection", Array(start: Integer, end: Integer)) =>
+      setSelection(start.intValue, end.intValue)
+      null
+    case ("removeSelection", _) =>
+      removeSelection()
+      null
   }
+
+  document.addDocumentListener(listener)
 
   /** Detaches position tracking without changing the document or disposing its PSI. */
   override def close(): Unit = document.removeDocumentListener(listener)

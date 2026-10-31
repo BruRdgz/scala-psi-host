@@ -1,6 +1,7 @@
 package scalapsihost
 
 import com.intellij.lang.annotation.HighlightSeverity
+import com.intellij.openapi.editor.impl.DocumentImpl
 import com.intellij.openapi.util.TextRange
 import com.intellij.psi.search.searches.ReferencesSearch
 import com.intellij.psi.util.PsiTreeUtil
@@ -9,7 +10,7 @@ import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunction
 
 import scalapsihost.TestHost.{applyEdits, choose}
 import scalapsihost.language.{ChangeEngine, Completion, ProjectSearch}
-import scalapsihost.platform.{CallLog, HostLock}
+import scalapsihost.platform.{CallLog, HostLock, RequestEditor}
 
 import java.nio.file.Path
 import java.util.concurrent.{CountDownLatch, TimeUnit}
@@ -17,6 +18,7 @@ import java.util.concurrent.{CountDownLatch, TimeUnit}
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters.*
+import scala.util.Using
 
 /**
  * Editing as an editor does it: a change to one file's text is reparsed in place and reaches every query that
@@ -40,6 +42,52 @@ class EditingTest extends munit.FunSuite {
       assertEquals(host.read(file.getLanguage), org.jetbrains.plugins.scala.Scala3Language.INSTANCE)
       assertEquals(errors(file.asInstanceOf[ScalaFile]), Seq.empty)
     } finally host.closeSource(file)
+  }
+
+  test("request editor positions preserve boundary affinity through document edits") {
+    final case class EditCase(
+      name: String,
+      caret: Int,
+      selection: TextRange,
+      edit: ChangeEngine.Edit,
+      expectedCaret: Int,
+      expectedSelection: TextRange,
+    )
+
+    val project = host.project
+    val cases = Seq(
+      EditCase("insertion at an unselected caret", caret = 2, selection = new TextRange(2, 2),
+        edit = ChangeEngine.Edit(new TextRange(2, 2), "XY"),
+        expectedCaret = 4, expectedSelection = new TextRange(4, 4)),
+      EditCase("insertion at the selection start", caret = 4, selection = new TextRange(2, 4),
+        edit = ChangeEngine.Edit(new TextRange(2, 2), "XY"),
+        expectedCaret = 6, expectedSelection = new TextRange(2, 6)),
+      EditCase("insertion at the selection end", caret = 4, selection = new TextRange(2, 4),
+        edit = ChangeEngine.Edit(new TextRange(4, 4), "XY"),
+        expectedCaret = 6, expectedSelection = new TextRange(2, 6)),
+      EditCase("replacement covering the caret and selection start", caret = 3, selection = new TextRange(2, 5),
+        edit = ChangeEngine.Edit(new TextRange(1, 4), "X"),
+        expectedCaret = 2, expectedSelection = new TextRange(2, 3)),
+      EditCase("deletion collapsing the selection onto the caret", caret = 6, selection = new TextRange(2, 4),
+        edit = ChangeEngine.Edit(new TextRange(2, 4), ""),
+        expectedCaret = 4, expectedSelection = new TextRange(4, 4)),
+    )
+
+    for (testCase <- cases) HostLock.write {
+      val document = new DocumentImpl("abcdef", /* forUseInNonAWTThread = */ true)
+
+      Using.resource(new RequestEditor(document, project, testCase.caret)) { request =>
+        val caret = request.editor.getCaretModel
+        val selection = request.editor.getSelectionModel
+        val edit = testCase.edit
+
+        selection.setSelection(testCase.selection.getStartOffset, testCase.selection.getEndOffset)
+        document.replaceString(edit.range.getStartOffset, edit.range.getEndOffset, edit.text)
+
+        assertEquals(caret.getOffset, testCase.expectedCaret, testCase.name)
+        assertEquals(caret.getPrimaryCaret.getSelectionRange, testCase.expectedSelection, testCase.name)
+      }
+    }
   }
 
   // As the IDE's background reads: a query checks for cancellation as it works, and an edit cancels it rather than
