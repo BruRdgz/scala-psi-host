@@ -770,6 +770,51 @@ class LanguageServerTest extends munit.FunSuite {
     }
   }
 
+  test("pending diagnostics for the same version are replaced without starving another source") {
+    val service = implementation.getTextDocumentService
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    def open(path: Path, version: Int, text: String): Unit = service.didOpen(new DidOpenTextDocumentParams(
+      new TextDocumentItem(path.toUri.toString, "scala", version, text)))
+    // This last scheduled source drains earlier work before the diagnostic worker is paused.
+    open(greeting, 49, Files.readString(greeting))
+    diagnosticsOf(greeting, 49)
+    val computing = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
+    val first = new java.util.concurrent.atomic.AtomicBoolean(true)
+    val threshold = HostLog.threshold
+    HostLog.threshold = HostLog.Level.Debug
+    val sink = HostLog.addSink { entry =>
+      if (Thread.currentThread().getName == "scala-psi-host-diagnostics" &&
+          (entry.message.startsWith("problems:") || entry.message.startsWith("slow: problems took")) &&
+          first.compareAndSet(true, false)) {
+        computing.countDown()
+        if (!release.await(30, TimeUnit.SECONDS)) throw new IllegalStateException("diagnostics were not released")
+      }
+    }
+    try {
+      open(main, 50, original)
+      assert(computing.await(30, TimeUnit.SECONDS), "diagnostics did not start")
+      for (_ <- 1 to 10) open(main, 50, original)
+      open(greeting, 50, Files.readString(greeting))
+      service.documentSymbol(new DocumentSymbolParams(document(main))).get(30, TimeUnit.SECONDS)
+      release.countDown()
+      var mainPublications = 0
+      var greetingPublished = false
+      while (!greetingPublished) {
+        val next = Option(Client.published.poll(30, TimeUnit.SECONDS)).getOrElse(fail("diagnostics did not finish"))
+        if (next.getVersion == 50) {
+          if (next.getUri == main.toUri.toString) mainPublications += 1
+          if (next.getUri == greeting.toUri.toString) greetingPublished = true
+        }
+      }
+      assertEquals(mainPublications, 2, "only the running and latest pending diagnostics should publish")
+    } finally {
+      release.countDown()
+      sink.close()
+      HostLog.threshold = threshold
+    }
+  }
+
   test("opens a source file created after the import, and lets it go when it is deleted") {
     val added = fixture.resolve("core/src/main/scala/core/Added.scala")
     Files.writeString(added, "package core\n\nobject Added {\n  val n: Int = Counter.zero.current\n}\n")

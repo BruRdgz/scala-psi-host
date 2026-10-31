@@ -79,7 +79,11 @@ final class ScalaLanguageServer(
   private val builds = Executors.newSingleThreadExecutor(daemon("scala-psi-host-builds"))
   // At most one compile waits behind the running one; every compile includes all Scala targets.
   private val compileQueued = new AtomicBoolean()
-  private val diagnostics = Executors.newSingleThreadScheduledExecutor(daemon("scala-psi-host-diagnostics"))
+  private val diagnostics = new ScheduledThreadPoolExecutor(1, daemon("scala-psi-host-diagnostics"))
+  diagnostics.setRemoveOnCancelPolicy(true)
+  /** Keeps a pending computation's identity together with its cancellable scheduler handle. */
+  private final case class ScheduledDiagnostics(task: Runnable, future: ScheduledFuture[?])
+  private val pendingDiagnostics = scala.collection.mutable.Map.empty[Path, ScheduledDiagnostics]
   private val session = new CompletableFuture[ProjectSession]
   // Each document's latest version, as the client numbers them; diagnostics of older versions are dropped.
   private val versions = new ConcurrentHashMap[Path, Integer]()
@@ -303,7 +307,10 @@ final class ScalaLanguageServer(
   private lazy val closing: CompletableFuture[AnyRef] = {
     documents.shutdownNow()
     builds.shutdownNow()
-    diagnostics.shutdownNow()
+    pendingDiagnostics.synchronized {
+      diagnostics.shutdownNow()
+      pendingDiagnostics.clear()
+    }
     val closed = if (!projectRequested) CompletableFuture.completedFuture[AnyRef](null)
     else session.handleAsync[AnyRef]((opened, error) => {
       if (error == null) opened.close()
@@ -693,14 +700,30 @@ final class ScalaLanguageServer(
 
   // ---- Diagnostics -----------------------------------------------------------------------------------------------
 
-  /** Debounces diagnostics for the document version current when this work is queued. */
-  private def scheduleDiagnostics(path: Path): Unit = {
-    val version = versions.get(path)
-    diagnostics.schedule((() => publishDiagnostics(path, version)): Runnable, DiagnosticsDelayMs, TimeUnit.MILLISECONDS)
+  /** Replaces pending diagnostics for a source, leaving any computation already in progress to its version guard. */
+  private def scheduleDiagnostics(path: Path): Unit = pendingDiagnostics.synchronized {
+    if (!diagnostics.isShutdown) {
+      pendingDiagnostics.remove(path).foreach(_.future.cancel(false))
+      val version = versions.get(path)
+      val task = new Runnable {
+        override def run(): Unit = {
+          // A dequeued task can lose its place to a newer schedule before it enters this guard.
+          val current = pendingDiagnostics.synchronized {
+            if (pendingDiagnostics.get(path).exists(_.task eq this)) {
+              pendingDiagnostics.remove(path)
+              true
+            } else false
+          }
+          if (current) publishDiagnostics(path, version)
+        }
+      }
+      pendingDiagnostics.put(path, ScheduledDiagnostics(task,
+        diagnostics.schedule(task, DiagnosticsDelayMs, TimeUnit.MILLISECONDS)))
+    }
   }
 
   /** Whether the client has not sent a newer version of `path` since this computation was scheduled. */
-  private def isCurrent(path: Path, version: Integer): Boolean = versions.get(path) == version
+  private def isCurrent(path: Path, version: Integer): Boolean = !diagnostics.isShutdown && versions.get(path) == version
 
   /** Computes and publishes diagnostics only while `version` remains the current document version. */
   private def publishDiagnostics(path: Path, version: Integer): Unit =
