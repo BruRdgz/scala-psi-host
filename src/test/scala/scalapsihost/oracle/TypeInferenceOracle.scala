@@ -14,11 +14,13 @@ import org.jetbrains.plugins.scala.lang.psi.types.result.*
 import org.jetbrains.plugins.scala.lang.psi.types.{Context, ScType, ScTypeExt, TypePresentationContext}
 import org.jetbrains.plugins.scala.project.ScalaFeatures
 import org.jetbrains.plugins.scala.{LatestScalaVersions, ScalaVersion}
+
 import scalapsihost.{HostConfig, ScalaPsiHost}
 
 import java.io.File
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 

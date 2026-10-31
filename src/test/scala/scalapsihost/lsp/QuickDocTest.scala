@@ -1,5 +1,7 @@
 package scalapsihost.lsp
 
+import scalapsihost.language.{QuickDoc}
+
 /** The plugin's documentation HTML as Markdown: fragments shaped like the generator's output, and the Markdown expected of them. */
 class QuickDocTest extends munit.FunSuite {
   private def doc(content: String = "", sections: String = ""): String =

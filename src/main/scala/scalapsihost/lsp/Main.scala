@@ -1,12 +1,15 @@
 package scalapsihost.lsp
 
 import org.eclipse.lsp4j.launch.LSPLauncher
-import scalapsihost.{HostConfig, HostLog, ScalaPsiHost}
+
+import scalapsihost.platform.HostLog
+import scalapsihost.{HostConfig, ScalaPsiHost}
 
 import java.io.{File, InputStream, OutputStream}
 import java.nio.file.{Files, Path, StandardOpenOption}
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
@@ -26,6 +29,7 @@ object Main {
   // Child-process hooks only send kill signals; a stuck platform hook must not keep the JVM alive after cleanup.
   private val HaltDelayMs = 1000L
 
+  /** Starts the host, installs its log sinks and serves the language server on standard input and output. */
   def main(args: Array[String]): Unit = {
     // Stdout carries the protocol: anything else printed there would corrupt it, so it goes to stderr.
     val protocolOut = System.out

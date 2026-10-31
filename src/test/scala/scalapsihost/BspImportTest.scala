@@ -3,9 +3,13 @@ package scalapsihost
 import com.google.gson.JsonObject
 import com.intellij.lang.annotation.HighlightSeverity
 
+import scalapsihost.build.{BspImport, CompileSpec, DocumentCompiler, ImportedModule}
+import scalapsihost.platform.{CallLog}
+
 import java.net.{URI, UnixDomainSocketAddress}
 import java.nio.channels.SocketChannel
 import java.nio.file.{Files, Path}
+
 import scala.concurrent.duration.*
 import scala.util.{Try, Using}
 
@@ -48,13 +52,45 @@ class BspImportTest extends munit.FunSuite {
 
   test("imports the build's Scala targets with their settings") {
     val app = module("app")
+    assert(app.spec.identity.exists(_ == app.spec.stableId), app.spec)
+    assert(app.spec.stableId != app.spec.name, app.spec)
     assertEquals(app.spec.scalaVersion, "2.13.18")
-    assertEquals(app.spec.dependsOn, Seq("core"))
+    assertEquals(app.spec.dependsOn, Seq(module("core").spec.stableId))
+    assertEquals(imported.map(_.spec.stableId).distinct.size, imported.size)
     assert(app.spec.scalacOptions.contains("-Xsource:3"), app.spec.scalacOptions)
     assert(app.spec.classpath.exists(_.getFileName.toString == "scala-library-2.13.18.jar"), app.spec.classpath)
     assertEquals(app.sources.map(fixture.relativize(_).toString), Seq("app/src/main/scala/app/Main.scala"))
     assert(!module("core").spec.scalacOptions.contains("-Xsource:3"))
     assert(module("core").sources.map(fixture.relativize(_).toString).contains("core/src/main/java/core/Shout.java"))
+  }
+
+  test("module ordering rejects duplicate identities, unknown dependencies and ambiguous shared sources") {
+    val compile = CompileSpec("2.13.18", Seq.empty, Seq.empty, Path.of("/classes"), Seq.empty)
+    def target(name: String, id: String, dependencies: Seq[String] = Seq.empty, sources: Seq[Path] = Seq.empty) =
+      ImportedModule(ModuleSpec(name, "2.13.18", Seq.empty, Seq.empty, dependsOn = dependencies, identity = Some(id)), sources, compile)
+
+    val duplicate = intercept[IllegalArgumentException] {
+      BspImport.dependenciesFirst(Seq(target("first", "duplicate"), target("second", "duplicate")))
+    }
+    assert(duplicate.getMessage.contains("duplicate module identity"), duplicate.getMessage)
+
+    val missing = intercept[IllegalArgumentException] {
+      BspImport.dependenciesFirst(Seq(target("client", "client", Seq("missing-target"))))
+    }
+    assert(missing.getMessage.contains("missing-target"), missing.getMessage)
+
+    val cycle = intercept[IllegalArgumentException] {
+      BspImport.dependenciesFirst(Seq(target("first", "first", Seq("second")), target("second", "second", Seq("first"))))
+    }
+    assert(cycle.getMessage.contains("first") && cycle.getMessage.contains("second"), cycle.getMessage)
+
+    val shared = Path.of("/shared/Source.scala")
+    val ambiguous = intercept[IllegalArgumentException] {
+      BspImport.dependenciesFirst(Seq(target("first", "target-one", sources = Seq(shared)),
+        target("second", "target-two", sources = Seq(shared))))
+    }
+    assert(ambiguous.getMessage.contains(shared.toString), ambiguous.getMessage)
+    assert(ambiguous.getMessage.contains("target-one") && ambiguous.getMessage.contains("target-two"), ambiguous.getMessage)
   }
 
   // In the fixture itself, with a broken file for the duration of the test, so its build outputs remain reusable.
@@ -74,14 +110,15 @@ class BspImportTest extends munit.FunSuite {
     val core3 = module("core3")
     // The module's class output holds its other files' classes (Greet3), which the document uses.
     Using.resource(BspImport.connect(fixture))(_.compile())
-    val compiler = new DocumentCompiler
-    def errors(text: String) = compiler.compile(core3.compile, "Use.scala", text).filter(_.severity == HighlightSeverity.ERROR)
+    Using.resource(new DocumentCompiler) { compiler =>
+      def errors(text: String) = compiler.compile(core3.compile, "Use.scala", text).filter(_.severity == HighlightSeverity.ERROR)
 
-    assertEquals(errors("package core3\n\nobject Use:\n  val s: String = Greet3.hello(\"x\")\n"), Seq.empty)
-    // The error alone: not the compiler's summary of the run ("1 error found").
-    val mismatch = compiler.compile(core3.compile, "Use.scala", "package core3\n\nobject Use:\n  val n: Int = Greet3.hello(\"x\")\n")
-    assertEquals(mismatch.map(d => (d.severity, d.start.line)), Seq((HighlightSeverity.ERROR, 3)))
-    assert(mismatch.head.message.contains("Required: Int"), mismatch)
+      assertEquals(errors("package core3\n\nobject Use:\n  val s: String = Greet3.hello(\"x\")\n"), Seq.empty)
+      // The error alone: not the compiler's summary of the run ("1 error found").
+      val mismatch = compiler.compile(core3.compile, "Use.scala", "package core3\n\nobject Use:\n  val n: Int = Greet3.hello(\"x\")\n")
+      assertEquals(mismatch.map(d => (d.severity, d.start.line)), Seq((HighlightSeverity.ERROR, 3)))
+      assert(mismatch.head.message.contains("Required: Int"), mismatch)
+    }
   }
 
   test("the imported project highlights without errors") {

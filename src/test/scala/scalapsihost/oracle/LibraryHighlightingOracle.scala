@@ -7,10 +7,12 @@ import org.jetbrains.plugins.scala.LatestScalaVersions
 import org.jetbrains.plugins.scala.lang.psi.api.base.literals.{ScIntegerLiteral, ScStringLiteral}
 import org.jetbrains.plugins.scala.lang.psi.api.expr.{ScInfixExpr, ScTuple}
 import org.jetbrains.plugins.scala.project.ScalaFeatures
+
 import scalapsihost.{Diagnostic, HostConfig, ScalaPsiHost}
 
 import java.io.File
 import java.nio.file.{FileSystems, Files, Path}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 

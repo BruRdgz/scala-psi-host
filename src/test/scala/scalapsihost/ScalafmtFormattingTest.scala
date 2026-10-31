@@ -1,6 +1,10 @@
 package scalapsihost
 
+import scalapsihost.build.{ScalafmtFormatting}
+import scalapsihost.platform.{HostLog}
+
 import java.nio.file.{Files, Path}
+
 import scala.concurrent.duration.*
 
 class ScalafmtFormattingTest extends munit.FunSuite {

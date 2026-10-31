@@ -4,12 +4,17 @@ import com.intellij.psi.PsiManager
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode
 import org.eclipse.lsp4j.launch.LSPLauncher
+
 import scalapsihost.TestHost
+import scalapsihost.language.{ChangeEngine}
+import scalapsihost.platform.{HostLock}
+import scalapsihost.workspace.{ProjectSession}
 
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream, PipedInputStream, PipedOutputStream}
 import java.nio.file.{Files, Path}
 import java.util.{List as JavaList}
 import java.util.concurrent.{CompletableFuture, LinkedBlockingQueue, TimeUnit}
+
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
 
@@ -568,7 +573,7 @@ class LanguageServerTest extends munit.FunSuite {
       val lineStart = text.indexOf('\n') + 1
       val changes = edit.getEdits.asScala.toSeq.map { change =>
         val range = change.getRange
-        scalapsihost.ChangeEngine.Edit(new com.intellij.openapi.util.TextRange(
+        scalapsihost.language.ChangeEngine.Edit(new com.intellij.openapi.util.TextRange(
           lineStart + range.getStart.getCharacter, lineStart + range.getEnd.getCharacter), change.getNewText)
       }
       assertEquals(TestHost.applyEdits(text, changes), text.replace("value: Int", "value: String"))
@@ -594,7 +599,7 @@ class LanguageServerTest extends munit.FunSuite {
   test("completion answers for its position while the user types on, as editors expect") {
     val original = Files.readString(main).replace("val text: String", "val text: Int")
     // The next keystroke arrives before the completion has run.
-    val pending = scalapsihost.HostLock.write {
+    val pending = scalapsihost.platform.HostLock.write {
       val request = implementation.getTextDocumentService.completion(new CompletionParams(document(main), new Position(6, 50)))
       implementation.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
         new VersionedTextDocumentIdentifier(main.toUri.toString, 24),
@@ -634,7 +639,7 @@ class LanguageServerTest extends munit.FunSuite {
 
   test("a newer edit cancels a queued formatting request") {
     val original = Files.readString(main).replace("val text: String", "val text: Int")
-    val pending = scalapsihost.HostLock.write {
+    val pending = scalapsihost.platform.HostLock.write {
       val request = implementation.getTextDocumentService.formatting(new DocumentFormattingParams(document(main), new FormattingOptions(2, true)))
       implementation.getTextDocumentService.didChange(new DidChangeTextDocumentParams(
         new VersionedTextDocumentIdentifier(main.toUri.toString, 32), java.util.List.of(new TextDocumentContentChangeEvent(original))))
@@ -763,13 +768,76 @@ class LanguageServerTest extends munit.FunSuite {
     }
   }
 
+  test("reimport failures report recovery and stop requests after a partial host update") {
+    val buildFile = fixture.resolve("build.sbt")
+    val originalBuild = Files.readString(buildFile)
+    val host = TestHost.host
+    val client = new RecordingClient
+    val implementation = new ScalaLanguageServer(host)
+    val protocol = connect(client, implementation)
+    var project: Option[ProjectSession] = None
+
+    def nextState(): HostProtocol.ServerState =
+      Option(client.states.poll(5, TimeUnit.MINUTES)).getOrElse(fail("the server did not report an import state"))
+
+    try {
+      val session = ProjectSession.open(host, fixture)
+      project = Some(session)
+      val unsaved = Files.readString(main) + "\n// unsaved buffer\n"
+      session.change(main, None, unsaved)
+
+      Files.writeString(buildFile, originalBuild + "\nval malformed: Int = \"not an integer\"\n")
+      intercept[Exception](implementation.importAgain(session, reload = true))
+      assertEquals(nextState().state, "importing")
+      val recoverable = nextState()
+      assertEquals(recoverable.state, "ready")
+      assert(recoverable.message.contains("last imported snapshot remains active"), recoverable.message)
+      assert(session.isUsable)
+      assertEquals(session.text(main), unsaved)
+
+      Files.writeString(buildFile, originalBuild)
+      client.states.clear()
+      implementation.importAgain(session, reload = true)
+      assertEquals(nextState().state, "importing")
+      assertEquals(nextState().state, "ready")
+      assertEquals(session.text(main), unsaved)
+
+      val changedBuild = originalBuild.replace(
+        "scalacOptions += \"-Xsource:3\"", "scalacOptions += \"-deprecation\"")
+      assert(changedBuild != originalBuild, "the build option replacement did not change the fixture")
+      Files.writeString(buildFile, changedBuild)
+      intercept[RuntimeException] {
+        session.importBuild(reload = true, message =>
+          if (message.startsWith("module ")) throw new RuntimeException("injected failure after host removal"))
+      }
+      assert(!session.isUsable)
+      assert(session.unavailableMessage.exists(_.contains("restart the language server")))
+      intercept[ProjectSession.Unavailable](session.isSource(main))
+      intercept[ProjectSession.Unavailable](session.problems(main))
+      intercept[ProjectSession.Unavailable](session.text(main))
+
+      client.states.clear()
+      intercept[ProjectSession.Unavailable](implementation.importAgain(session, reload = false))
+      assertEquals(nextState().state, "importing")
+      val failed = nextState()
+      assertEquals(failed.state, "failed")
+      assert(failed.message.contains("restart the language server"), failed.message)
+    } finally {
+      Files.writeString(buildFile, originalBuild)
+      project.foreach(_.close())
+      protocol.shutdown().get(30, TimeUnit.SECONDS)
+      protocol.exit()
+      releaseModules()
+    }
+  }
+
   /** A fresh client session imports the same module names into this JVM's one host. */
   private def releaseModules(): Unit = {
     val host = TestHost.host
     for (module <- host.modules.all.reverse) {
       val files = host.read(module.sources.asScala.toSeq.map(PsiManager.getInstance(host.project).findFile))
       files.foreach(host.closeSource)
-      host.removeModule(module.spec.name)
+      host.removeModule(module.spec.stableId)
     }
   }
 }

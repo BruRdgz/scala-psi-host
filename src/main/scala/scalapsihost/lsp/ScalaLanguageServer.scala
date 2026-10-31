@@ -1,20 +1,25 @@
 package scalapsihost.lsp
 
 import com.intellij.diff.comparison.DiffTooBigException
-import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.google.gson.JsonPrimitive
 import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException
 import org.eclipse.lsp4j.jsonrpc.messages.{Either as LspEither, Either3 as LspEither3, ResponseError, ResponseErrorCode, Tuple}
 import org.eclipse.lsp4j.services.*
-import scalapsihost.{CallLog, ChangeEngine, HostLog, LineColumn, ParameterInfo, Rename, ScalafmtFormatting, ScalaPsiHost}
+
+import scalapsihost.{LineColumn, ScalaPsiHost}
+import scalapsihost.build.ScalafmtFormatting
+import scalapsihost.language.{Completion, CompletionChoice, CompletionFollowUp, FileProblem, Fold, OutlineSymbol, ProblemSeverity, Rename, SignatureChoices, SourceSpan, TextChange, WorkspaceSymbolKind}
+import scalapsihost.platform.{CallLog, HostLog}
+import scalapsihost.workspace.ProjectSession
 
 import java.net.URI
 import java.nio.file.Path
 import java.util.{List as JavaList}
 import java.util.concurrent.*
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 
@@ -73,18 +78,21 @@ final class ScalaLanguageServer(
   // Edits counted as they arrive, before their turn on the documents thread (see onEditsRequest).
   private val editsReceived = new AtomicLong()
 
+  /** Creates a daemon-thread factory for server work that must not keep the process alive. */
   private def daemon(name: String): ThreadFactory = runnable => {
     val thread = new Thread(runnable, name)
     thread.setDaemon(true)
     thread
   }
 
+  /** Attaches the LSP client and forwards buffered startup and subsequent host log entries to it. */
   override def connect(client: LanguageClient): Unit = {
     this.client = client
     startupLog.foreach(sendLog)
     clientLog = Some(HostLog.addSink(sendLog))
   }
 
+  /** Converts a host log entry to the matching LSP message type. */
   private def sendLog(entry: HostLog.Entry): Unit = {
     val kind = entry.level match {
       case HostLog.Level.Error => MessageType.Error
@@ -95,6 +103,7 @@ final class ScalaLanguageServer(
     client.logMessage(new MessageParams(kind, entry.toString))
   }
 
+  /** Updates the reported server state and sends the extension notification when the client supports it. */
   private def setState(name: String, message: String): Unit = {
     state = new HostProtocol.ServerState(name, message)
     client match {
@@ -124,12 +133,31 @@ final class ScalaLanguageServer(
     }
 
   /** Imports the build again (see [[ProjectSession.importBuild]]), as progress and server state. */
-  private def importAgain(s: ProjectSession, reload: Boolean): Unit = {
+  private[lsp] def importAgain(s: ProjectSession, reload: Boolean): Unit = {
     setState("importing", "importing the build again")
-    try withProgress("scala-psi-host: importing the build")(progress => s.importBuild(reload, progress))
-    finally setState("ready", s"${s.moduleCount} modules, ${s.sourceFiles.size} source files")
+    var importReturned = false
+    try {
+      withProgress("scala-psi-host: importing the build") { progress =>
+        s.importBuild(reload, progress)
+        importReturned = true
+      }
+      val snapshot = s.snapshot
+      setState("ready", s"${snapshot.moduleCount} modules, ${snapshot.sourceFileCount} source files")
+    } catch {
+      case error: Throwable =>
+        val detail = Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.getClass.getSimpleName)
+        if (!s.isUsable) setState("failed", s.unavailableMessage.getOrElse(detail))
+        else if (importReturned) {
+          val snapshot = s.snapshot
+          setState("ready", s"${snapshot.moduleCount} modules, ${snapshot.sourceFileCount} source files; build imported, but progress reporting failed: $detail")
+        }
+        else
+          setState("ready", s"reimport failed before host updates; the last imported snapshot remains active and can be retried: $detail")
+        throw error
+    }
   }
 
+  /** Negotiates client features, records the workspace root and returns the LSP capabilities this server implements. */
   override def initialize(params: InitializeParams): CompletableFuture[InitializeResult] = {
     val offered = Option(params.getCapabilities)
     watchesFiles = offered.flatMap(c => Option(c.getWorkspace)).flatMap(w => Option(w.getDidChangeWatchedFiles))
@@ -207,10 +235,11 @@ final class ScalaLanguageServer(
       try {
         val opened = withProgress("scala-psi-host: opening the project")(progress => ProjectSession.open(host, root, progress = progress))
         val heap = Runtime.getRuntime
+        val snapshot = opened.snapshot
         HostLog.info(s"ready in ${(System.nanoTime() - startedAt) / 1_000_000} ms since the server started: " +
-          s"${opened.moduleCount} modules, ${opened.sourceFiles.size} source files, " +
+          s"${snapshot.moduleCount} modules, ${snapshot.sourceFileCount} source files, " +
           s"heap ${(heap.totalMemory - heap.freeMemory) / (1024 * 1024)} of ${heap.maxMemory / (1024 * 1024)} MB")
-        setState("ready", s"${opened.moduleCount} modules, ${opened.sourceFiles.size} source files")
+        setState("ready", s"${snapshot.moduleCount} modules, ${snapshot.sourceFileCount} source files")
         session.complete(opened)
       } catch {
         case e: Throwable =>
@@ -232,6 +261,7 @@ final class ScalaLanguageServer(
     }
   }
 
+  /** Stops request executors and closes a session already being opened, with the server's shutdown deadline. */
   private lazy val closing: CompletableFuture[AnyRef] = {
     documents.shutdownNow()
     diagnostics.shutdownNow()
@@ -270,8 +300,10 @@ final class ScalaLanguageServer(
     }
     val heap = Runtime.getRuntime
     val opened = if (session.isDone && !session.isCompletedExceptionally) Some(session.join()) else None
-    val project = opened.map(s =>
-      map("modules" -> Integer.valueOf(s.moduleCount), "sourceFiles" -> Integer.valueOf(s.sourceFiles.size)))
+    val project = opened.map { s =>
+      val snapshot = s.snapshot
+      map("modules" -> Integer.valueOf(snapshot.moduleCount), "sourceFiles" -> Integer.valueOf(snapshot.sourceFileCount))
+    }
     CompletableFuture.completedFuture(map(
       "state" -> state.state,
       "message" -> state.message,
@@ -290,11 +322,15 @@ final class ScalaLanguageServer(
     ))
   }
 
+  /** The LSP4J text-document service backed by the ordered documents executor. */
   override def getTextDocumentService: TextDocumentService = TextDocuments
+
+  /** The LSP4J workspace service for commands, workspace symbols and watched-file changes. */
   override def getWorkspaceService: WorkspaceService = Workspace
 
   // ---- Documents -------------------------------------------------------------------------------------------------
 
+  /** Converts a client file URI to its local filesystem path. */
   private def pathOf(uri: String): Path = Path.of(URI.create(uri))
 
   /** A notification: handled in order on the documents thread; a failure is logged (a notification has no answer). */
@@ -318,6 +354,9 @@ final class ScalaLanguageServer(
         case e: ScalafmtFormatting.Failed =>
           client.showMessage(new MessageParams(MessageType.Error, e.getMessage))
           throw requestError(ResponseErrorCode.RequestFailed, e.getMessage)
+        case e: ProjectSession.Unavailable =>
+          HostLog.error(s"$kind rejected because the project session is unavailable", e)
+          throw requestError(ResponseErrorCode.RequestFailed, e.getMessage)
         // A class the plugin needs and the host does not have is a LinkageError, not a NonFatal one: logged too.
         case e @ (NonFatal(_) | _: LinkageError) =>
           HostLog.error(s"$kind failed", e)
@@ -325,7 +364,7 @@ final class ScalaLanguageServer(
       }, documents)
   }
 
-  // Times `body`, from `submitted` (waiting behind other work included, as the editor waits) and on its own.
+  /** Times `body` from submission, recording both queue wait and execution latency. */
   private def timed[T](kind: String, submitted: Long)(body: => T): T = {
     val started = System.nanoTime()
     try body
@@ -337,7 +376,7 @@ final class ScalaLanguageServer(
     }
   }
 
-  // A project source file's path; none for other documents (a library file the editor opened, an unsaved buffer).
+  /** Resolves only a URI currently tracked as a project source; other open documents are outside the session. */
   private def sourcePath(s: ProjectSession, uri: String): Option[Path] =
     Option.when(uri.startsWith("file:"))(pathOf(uri)).filter(s.isSource)
 
@@ -345,6 +384,7 @@ final class ScalaLanguageServer(
   private def onSource[T](kind: String, document: TextDocumentIdentifier, outside: => T)(request: (ProjectSession, Path) => T): CompletableFuture[T] =
     onDocuments(kind)(s => sourcePath(s, document.getUri).fold(outside)(request(s, _)))
 
+  /** Builds the JSON-RPC error used to reject an LSP request with the supplied protocol code. */
   private def requestError(code: ResponseErrorCode, message: String) =
     new ResponseErrorException(new ResponseError(code, message, null))
 
@@ -366,9 +406,11 @@ final class ScalaLanguageServer(
     }
   }
 
+  /** Text-document notifications and requests, executed in document order. */
   private object TextDocuments extends LspServices.TextDocuments {
     // Documents that are not project sources are not tracked. A Scala or Java file that is not one yet may have just
     // been created (the editor may open it before reporting its creation): the build is imported again first.
+    /** Tracks versions, syncs unsaved text and schedules diagnostics for project sources. */
     override def didOpen(params: DidOpenTextDocumentParams): Unit = onDocuments("didOpen") { s =>
       val uri = params.getTextDocument.getUri
       if (uri.startsWith("file:") && sourcePath(s, uri).isEmpty) {
@@ -384,6 +426,7 @@ final class ScalaLanguageServer(
       }
     }
 
+    /** Applies the client's incremental edits in order and replaces diagnostics for the new version. */
     override def didChange(params: DidChangeTextDocumentParams): Unit = {
       editsReceived.incrementAndGet()
       onDocuments("didChange") { s =>
@@ -398,19 +441,22 @@ final class ScalaLanguageServer(
       }
     }
 
+    /** Keeps project sources open until a build reimport or session shutdown, even after editor tabs close. */
     override def didClose(params: DidCloseTextDocumentParams): Unit = ()
 
-    // A save compiles the build: other files' compiler problems may change with it.
+    /** Compiles the imported build after a save, then refreshes diagnostics that may have changed in other sources. */
     override def didSave(params: DidSaveTextDocumentParams): Unit = onDocuments("compile on save") { s =>
       s.compileBuild().foreach(scheduleDiagnostics)
     }
 
+    /** Returns the documentation at the requested project-source position as Markdown. */
     override def hover(params: HoverParams): CompletableFuture[Hover] = onSource("hover", params.getTextDocument, null) { (s, path) =>
       s.hover(path, lineColumn(params.getPosition)).map { markdown =>
         new Hover(new MarkupContent(MarkupKind.MARKDOWN, markdown))
       }.orNull
     }
 
+    /** Returns completion choices and whether more choices may be requested as the user types. */
     override def completion(params: CompletionParams): CompletableFuture[LspEither[java.util.List[CompletionItem], CompletionList]] =
       onSource("completion", params.getTextDocument, LspEither.forRight(new CompletionList())) { (s, path) =>
         val choices = s.completion(path, lineColumn(params.getPosition))
@@ -418,6 +464,7 @@ final class ScalaLanguageServer(
         LspEither.forRight(new CompletionList(choices.incomplete, items.asJava))
       }
 
+    /** Returns parameter and other inline hints within the requested source range. */
     override def inlayHint(params: InlayHintParams): CompletableFuture[JavaList[InlayHint]] =
       onSource("inlayHint", params.getTextDocument, JavaList.of[InlayHint]()) { (s, path) =>
         val range = params.getRange
@@ -426,11 +473,13 @@ final class ScalaLanguageServer(
         }.asJava
       }
 
+    /** Returns the signatures and active parameter at the requested call position. */
     override def signatureHelp(params: SignatureHelpParams): CompletableFuture[SignatureHelp] =
       onSource("signatureHelp", params.getTextDocument, null) { (s, path) =>
         s.signatures(path, lineColumn(params.getPosition)).filter(_.items.nonEmpty).map(signatureHelpOf).orNull
       }
 
+    /** Returns the nested syntax selections available at each requested position. */
     override def selectionRange(params: SelectionRangeParams): CompletableFuture[JavaList[SelectionRange]] =
       onSource("selectionRange", params.getTextDocument, JavaList.of[SelectionRange]()) { (s, path) =>
         s.selectionRanges(path, params.getPositions.asScala.toSeq.map(lineColumn)).map { chain =>
@@ -445,11 +494,13 @@ final class ScalaLanguageServer(
         }.asJava
       }
 
+    /** Formats a whole project source using the editor's indentation options. */
     override def formatting(params: DocumentFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
       onEditsRequest("formatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
         textEdits(s.formatting(path, None, params.getOptions.getTabSize, !params.getOptions.isInsertSpaces))
       }
 
+    /** Formats only the requested range using the editor's indentation options. */
     override def rangeFormatting(params: DocumentRangeFormattingParams): CompletableFuture[java.util.List[? <: TextEdit]] =
       onEditsRequest("rangeFormatting", params.getTextDocument, java.util.List.of[TextEdit]()) { (s, path) =>
         val range = params.getRange
@@ -458,29 +509,34 @@ final class ScalaLanguageServer(
           !options.isInsertSpaces))
       }
 
+    /** Returns declaration locations for the symbol at the requested position. */
     override def definition(params: DefinitionParams)
         : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
       onSource("definition", params.getTextDocument, locations(Seq.empty)) { (s, path) =>
         locations(s.definition(path, lineColumn(params.getPosition)).toSeq)
       }
 
+    /** Returns type-declaration locations for the symbol at the requested position. */
     override def typeDefinition(params: TypeDefinitionParams)
         : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
       onSource("typeDefinition", params.getTextDocument, locations(Seq.empty)) { (s, path) =>
         locations(s.typeDefinition(path, lineColumn(params.getPosition)))
       }
 
+    /** Returns the source locations that reference the symbol at the requested position. */
     override def references(params: ReferenceParams): CompletableFuture[java.util.List[? <: Location]] =
       onSource("references", params.getTextDocument, java.util.List.of[Location]()) { (s, path) =>
         s.references(path, lineColumn(params.getPosition), params.getContext.isIncludeDeclaration).map(location).asJava
       }
 
+    /** Returns source spans for the implementations of the symbol at the requested position. */
     override def implementation(params: ImplementationParams)
         : CompletableFuture[LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]]] =
       onSource("implementation", params.getTextDocument, spanLocations(Seq.empty)) { (s, path) =>
         spanLocations(s.implementations(path, lineColumn(params.getPosition)))
       }
 
+    /** Returns applicable code actions, with versioned edits for actions that can be applied immediately. */
     override def codeAction(params: CodeActionParams): CompletableFuture[java.util.List[LspEither[Command, CodeAction]]] =
       onEditsRequest("codeAction", params.getTextDocument, java.util.List.of[LspEither[Command, CodeAction]]()) { (s, path) =>
         val requested = Option(params.getContext.getOnly).map(_.asScala.toSeq).getOrElse(Seq.empty)
@@ -499,13 +555,14 @@ final class ScalaLanguageServer(
           }.asJava
       }
 
+    /** Returns the symbol-name range that a following rename request may edit. */
     override def prepareRename(params: PrepareRenameParams)
         : CompletableFuture[LspEither3[Range, PrepareRenameResult, PrepareRenameDefaultBehavior]] =
       onSource("prepareRename", params.getTextDocument, null) { (s, path) =>
         LspEither3.forFirst[Range, PrepareRenameResult, PrepareRenameDefaultBehavior](range(s.prepareRename(path, lineColumn(params.getPosition))))
       }
 
-    // Answered like formatting: the changes are for the documents as they are, and an edit after the request outdates them.
+    /** Returns workspace edits for a rename, cancelling if the source changes while they are computed. */
     override def rename(params: RenameParams): CompletableFuture[WorkspaceEdit] =
       onEditsRequest("rename", params.getTextDocument, new WorkspaceEdit()) { (s, path) =>
         val edits = s.rename(path, lineColumn(params.getPosition), params.getNewName).map { file =>
@@ -515,12 +572,15 @@ final class ScalaLanguageServer(
         new WorkspaceEdit(edits.asJava)
       }
 
+    /** Encodes declaration locations as the LSP `Location` response variant. */
     private def locations(found: Seq[(Path, LineColumn)]): LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]] =
       LspEither.forLeft(found.map { case (path, at) => new Location(path.toUri.toString, new Range(position(at), position(at))) }.asJava)
 
+    /** Encodes source spans as the LSP `Location` response variant. */
     private def spanLocations(found: Seq[SourceSpan]): LspEither[java.util.List[? <: Location], java.util.List[? <: LocationLink]] =
       LspEither.forLeft(found.map(location).asJava)
 
+    /** Returns occurrences of the symbol at the position, marking writes separately from reads. */
     override def documentHighlight(params: DocumentHighlightParams): CompletableFuture[java.util.List[? <: DocumentHighlight]] =
       onSource("documentHighlight", params.getTextDocument, java.util.List.of[DocumentHighlight]()) { (s, path) =>
         s.highlights(path, lineColumn(params.getPosition)).map { o =>
@@ -528,23 +588,26 @@ final class ScalaLanguageServer(
         }.asJava
       }
 
+    /** Returns the nested declarations displayed in the document outline. */
     override def documentSymbol(params: DocumentSymbolParams)
         : CompletableFuture[java.util.List[LspEither[SymbolInformation, DocumentSymbol]]] =
       onSource("documentSymbol", params.getTextDocument, java.util.List.of[LspEither[SymbolInformation, DocumentSymbol]]()) { (s, path) =>
         def symbol(o: OutlineSymbol): DocumentSymbol = {
-          val d = new DocumentSymbol(o.name, o.kind, range(o.range), range(o.nameRange), o.detail)
+          val d = new DocumentSymbol(o.name, lspSymbolKind(o.kind), range(o.range), range(o.nameRange), o.detail)
           d.setChildren(o.children.map(symbol).asJava)
           d
         }
         s.outline(path).map(o => LspEither.forRight[SymbolInformation, DocumentSymbol](symbol(o))).asJava
       }
 
+    /** Returns the full semantic-token stream for a project source. */
     override def semanticTokensFull(params: SemanticTokensParams): CompletableFuture[SemanticTokens] =
       onSource("semanticTokens", params.getTextDocument, new SemanticTokens(java.util.List.of[Integer]())) { (s, path) =>
         val data = SemanticColoring.encode(s.semanticTokens(path))
         new SemanticTokens(data.map(Integer.valueOf).asJava)
       }
 
+    /** Returns foldable code, comments, imports and regions in a project source. */
     override def foldingRange(params: FoldingRangeRequestParams): CompletableFuture[java.util.List[FoldingRange]] =
       onSource("foldingRange", params.getTextDocument, java.util.List.of[FoldingRange]()) { (s, path) =>
         s.foldingRanges(path).map { fold =>
@@ -562,13 +625,16 @@ final class ScalaLanguageServer(
 
   // ---- Diagnostics -----------------------------------------------------------------------------------------------
 
+  /** Debounces diagnostics for the document version current when this work is queued. */
   private def scheduleDiagnostics(path: Path): Unit = {
     val version = versions.get(path)
     diagnostics.schedule((() => publishDiagnostics(path, version)): Runnable, DiagnosticsDelayMs, TimeUnit.MILLISECONDS)
   }
 
+  /** Whether the client has not sent a newer version of `path` since this computation was scheduled. */
   private def isCurrent(path: Path, version: Integer): Boolean = versions.get(path) == version
 
+  /** Computes and publishes diagnostics only while `version` remains the current document version. */
   private def publishDiagnostics(path: Path, version: Integer): Unit =
     if (isCurrent(path, version)) {
       try {
@@ -585,23 +651,66 @@ final class ScalaLanguageServer(
       }
     }
 
-  private def diagnostic(problem: FileProblem): Diagnostic = {
-    val d = new Diagnostic(new Range(position(problem.start), position(problem.end)), problem.message)
+  /** Converts a host diagnostic to LSP severity, range and source fields. */
+  private def diagnostic(problem: FileProblem): org.eclipse.lsp4j.Diagnostic = {
+    val d = new org.eclipse.lsp4j.Diagnostic(new Range(position(problem.start), position(problem.end)), problem.message)
     d.setSeverity(problem.severity match {
-      case s if s.compareTo(HighlightSeverity.ERROR) >= 0 => DiagnosticSeverity.Error
-      case s if s.compareTo(HighlightSeverity.WARNING) >= 0 => DiagnosticSeverity.Warning
-      case _ => DiagnosticSeverity.Information
+      case ProblemSeverity.Error => DiagnosticSeverity.Error
+      case ProblemSeverity.Warning => DiagnosticSeverity.Warning
+      case ProblemSeverity.Information => DiagnosticSeverity.Information
     })
     d.setSource(problem.source)
     d
   }
 
+  /** Converts the LSP's zero-based UTF-16 position to the session's equivalent coordinate. */
   private def lineColumn(p: Position): LineColumn = LineColumn(p.getLine, p.getCharacter)
+
+  /** Converts a session line and UTF-16 column to an LSP position. */
   private def position(at: LineColumn): Position = new Position(at.line, at.column)
+
+  /** Converts a pair of session positions to an LSP range. */
   private def range(span: (LineColumn, LineColumn)): Range = new Range(position(span._1), position(span._2))
+
+  /** Converts a project source span to a URI-backed LSP location. */
   private def location(span: SourceSpan): Location = new Location(span.path.toUri.toString, range(span.range))
+
+  /** Converts a session text change to an LSP text edit. */
   private def textEdit(change: TextChange): TextEdit = new TextEdit(range(change.start -> change.end), change.text)
+
+  /** Converts a sequence of session edits to the Java list expected by LSP4J. */
   private def textEdits(changes: Seq[TextChange]): java.util.List[TextEdit] = changes.map(textEdit).asJava
+
+  private def lspSymbolKind(kind: WorkspaceSymbolKind): SymbolKind = kind match {
+    case WorkspaceSymbolKind.EnumMember => SymbolKind.EnumMember
+    case WorkspaceSymbolKind.Enum => SymbolKind.Enum
+    case WorkspaceSymbolKind.Interface => SymbolKind.Interface
+    case WorkspaceSymbolKind.Module => SymbolKind.Module
+    case WorkspaceSymbolKind.Class => SymbolKind.Class
+    case WorkspaceSymbolKind.Constructor => SymbolKind.Constructor
+    case WorkspaceSymbolKind.Function => SymbolKind.Function
+    case WorkspaceSymbolKind.Method => SymbolKind.Method
+    case WorkspaceSymbolKind.Property => SymbolKind.Property
+    case WorkspaceSymbolKind.Namespace => SymbolKind.Namespace
+    case WorkspaceSymbolKind.Variable => SymbolKind.Variable
+    case WorkspaceSymbolKind.Constant => SymbolKind.Constant
+    case WorkspaceSymbolKind.Object => SymbolKind.Object
+  }
+
+  private def lspCompletionKind(kind: Completion.Kind): CompletionItemKind = kind match {
+    case Completion.Kind.EnumMember => CompletionItemKind.EnumMember
+    case Completion.Kind.Enum => CompletionItemKind.Enum
+    case Completion.Kind.Interface => CompletionItemKind.Interface
+    case Completion.Kind.Module => CompletionItemKind.Module
+    case Completion.Kind.TypeParameter => CompletionItemKind.TypeParameter
+    case Completion.Kind.Class => CompletionItemKind.Class
+    case Completion.Kind.Constructor => CompletionItemKind.Constructor
+    case Completion.Kind.Method => CompletionItemKind.Method
+    case Completion.Kind.Field => CompletionItemKind.Field
+    case Completion.Kind.Variable => CompletionItemKind.Variable
+    case Completion.Kind.Value => CompletionItemKind.Value
+    case Completion.Kind.Keyword => CompletionItemKind.Keyword
+  }
 
   /**
    * A suggestion as a completion item: its lookup string replaces the prefix. When the suggestion has an insert
@@ -615,7 +724,7 @@ final class ScalaLanguageServer(
     details.setDescription(suggestion.typeText.orNull)
     item.setLabelDetails(details)
     item.setDetail(Seq(suggestion.tail, suggestion.typeText).flatten.mkString(" "))
-    item.setKind(suggestion.kind)
+    item.setKind(lspCompletionKind(suggestion.kind))
     if (suggestion.deprecated) item.setTags(java.util.List.of(CompletionItemTag.Deprecated))
     // The suggestions come ordered: by rank, the editor keeps that order instead of sorting them by label.
     item.setSortText(f"$rank%06d")
@@ -629,13 +738,14 @@ final class ScalaLanguageServer(
     item
   }
 
-  private def signatureHelpOf(found: ParameterInfo.Signatures): SignatureHelp = {
+  /** Converts rendered parameter signatures and the selected overload into LSP signature help. */
+  private def signatureHelpOf(found: SignatureChoices): SignatureHelp = {
     val signatures = found.items.map { signature =>
       val information = new SignatureInformation(signature.text)
       // The plugin renders the current parameter only, by its range in the text: it is the signature's one parameter.
-      signature.current.foreach { range =>
+      signature.current.foreach { current =>
         val parameter = new ParameterInformation()
-        parameter.setLabel(LspEither.forRight(new Tuple.Two[Integer, Integer](range.getStartOffset, range.getEndOffset)))
+        parameter.setLabel(LspEither.forRight(new Tuple.Two[Integer, Integer](current.start, current.end)))
         information.setParameters(java.util.List.of(parameter))
         information.setActiveParameter(0)
       }
@@ -664,9 +774,12 @@ final class ScalaLanguageServer(
 
   // ---- Workspace -------------------------------------------------------------------------------------------------
 
+  /** Workspace-level commands, symbol queries and build/source watch notifications. */
   private object Workspace extends LspServices.Workspace {
+    /** Configuration changes are not applied; module settings come from the imported build. */
     override def didChangeConfiguration(params: DidChangeConfigurationParams): Unit = ()
 
+    /** Applies a completion insert handler or rejects an unknown command as invalid parameters. */
     override def executeCommand(params: ExecuteCommandParams): CompletableFuture[AnyRef] = params.getCommand match {
       case CompleteInsertion =>
         // lsp4j hands the arguments over as JSON: the ones completionItem gave.
@@ -684,18 +797,18 @@ final class ScalaLanguageServer(
       case other => CompletableFuture.failedFuture(requestError(ResponseErrorCode.InvalidParams, s"unknown command: $other"))
     }
 
+    /** Searches project-wide symbols matching the client's query. */
     override def symbol(params: WorkspaceSymbolParams): CompletableFuture[LspEither[java.util.List[? <: SymbolInformation], java.util.List[? <: WorkspaceSymbol]]] =
       onDocuments("workspaceSymbol") { s =>
         val symbols = s.workspaceSymbols(params.getQuery).map { found =>
-          val symbol = new WorkspaceSymbol(found.name, found.kind, LspEither.forLeft[Location, WorkspaceSymbolLocation](location(found.location)))
+          val symbol = new WorkspaceSymbol(found.name, lspSymbolKind(found.kind), LspEither.forLeft[Location, WorkspaceSymbolLocation](location(found.location)))
           found.container.foreach(symbol.setContainerName)
           symbol
         }
         LspEither.forRight[java.util.List[? <: SymbolInformation], java.util.List[? <: WorkspaceSymbol]](symbols.asJava)
       }
 
-    // The build's definition changed (reload it), or source files were created or deleted: import the build again.
-    // Every open document's problems may change with it.
+    /** Reimports after build or source-file changes, then refreshes diagnostics for tracked files. */
     override def didChangeWatchedFiles(params: DidChangeWatchedFilesParams): Unit = onDocuments("build change") { s =>
       val paths = params.getChanges.asScala.toSeq.map(_.getUri).filter(_.startsWith("file:")).map(pathOf)
       val buildChanged = paths.exists(BuildDefinition.isPart)
@@ -719,6 +832,7 @@ private object BuildDefinition {
   val ProjectFiles = "**/project/*.scala"
   val BuildProperties = "**/project/build.properties"
 
+  /** Whether `path` can change sbt's build definition and therefore requires a BSP workspace reload. */
   def isPart(path: Path): Boolean = {
     val name = path.getFileName.toString
     val inProject = Option(path.getParent).exists(_.getFileName.toString == "project")
@@ -731,16 +845,21 @@ private final class RequestStats {
   // Enough recent requests of a kind for stable percentiles, few enough that memory stays flat.
   private val Window = 512
 
+  /** Aggregate count, recent-window percentiles and lifetime maximum for one request kind. */
   final case class Summary(count: Long, p50: Long, p95: Long, max: Long)
 
   private final class Kind {
+    /** Number of requests recorded since startup. */
     var count = 0L
+    /** Longest request duration since startup. */
     var max = 0L
+    /** Durations retained for percentile summaries. */
     val recent = new java.util.ArrayDeque[Long]()
   }
 
   private val kinds = new java.util.TreeMap[String, Kind]()
 
+  /** Adds one duration to the kind's lifetime totals and bounded percentile window. */
   def record(kind: String, ms: Long): Unit = kinds.synchronized {
     val k = kinds.computeIfAbsent(kind, _ => new Kind)
     k.count += 1
@@ -749,6 +868,7 @@ private final class RequestStats {
     if (k.recent.size > Window) k.recent.removeFirst()
   }
 
+  /** Returns per-kind summaries in stable name order. */
   def summary: Seq[(String, Summary)] = kinds.synchronized {
     kinds.asScala.toSeq.map { (name, k) =>
       val sorted = k.recent.asScala.toVector.sorted

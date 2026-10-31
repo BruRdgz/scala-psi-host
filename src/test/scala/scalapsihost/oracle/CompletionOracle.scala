@@ -2,7 +2,6 @@ package scalapsihost.oracle
 
 import com.intellij.codeInsight.intention.preview.IntentionPreviewUtils
 import com.intellij.psi.util.PsiTreeUtil
-import org.eclipse.lsp4j.CompletionItemKind
 import org.jetbrains.plugins.scala.LatestScalaVersions
 import org.jetbrains.plugins.scala.autoImport.quickFix.ScalaImportTypeFix
 import org.jetbrains.plugins.scala.lang.psi.api.base.{ScInterpolatedStringLiteral, ScLiteral, ScReference}
@@ -12,11 +11,16 @@ import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScTypeDefinition
 import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunctionDefinition
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScClass
-import scalapsihost.{CallLog, ChangeEngine, Completion, HostConfig, HostDispatchThread, HostLog, HostModule, ModuleSpec, ScalaPsiHost, TestHost}
+import org.jetbrains.plugins.scala.lang.lexer.ScalaTokenTypes.*
+
+import scalapsihost.{HostConfig, HostModule, ModuleSpec, ScalaPsiHost, TestHost}
+import scalapsihost.platform.{CallLog, HostDispatchThread, HostLog}
+import scalapsihost.language.{ChangeEngine, Completion}
 
 import java.io.File
 import java.nio.file.{Files, Path}
 import java.util.concurrent.FutureTask
+
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal
@@ -140,7 +144,6 @@ object CompletionOracle {
   /** Only PSI-recognized expressions are evaluated; arbitrary test code is never executed. */
   private[oracle] def staticString(expression: ScExpression, values: Map[String, String]): Option[String] = expression match {
     case literal: ScInterpolatedStringLiteral if literal.referenceName == "s" =>
-      import org.jetbrains.plugins.scala.lang.lexer.ScalaTokenTypes.*
       val injections = literal.getInjections.toSet
       var firstPart = true
       val pieces = literal.getNode.getChildren(null).toVector.map { node =>
@@ -345,7 +348,7 @@ object CompletionOracle {
           case Some(comment) =>
             val expected = Expected.forVersion(comment, LatestScalaVersions.Scala_2_13).trim.linesIterator.filter(_.nonEmpty).toVector.sorted
             val completed = Completion.complete(file, offset, limit = Int.MaxValue)
-            val items = completed.items.filter(i => c.suite != "keywordCompletion" || i.kind == CompletionItemKind.Keyword)
+            val items = completed.items.filter(i => c.suite != "keywordCompletion" || i.kind == Completion.Kind.Keyword)
             val actual = items.map { i =>
               i.lookup + (if (i.deprecated && c.suite == "completion") " (strikeout)" else "")
             }.toVector.sorted

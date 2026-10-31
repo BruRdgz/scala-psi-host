@@ -3,9 +3,12 @@ package scalapsihost.oracle
 import com.intellij.psi.PsiComment
 import org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
-import scalapsihost.{HostLog, ModuleSpec, TestHost}
+
+import scalapsihost.{ModuleSpec, TestHost}
+import scalapsihost.platform.{HostLog}
 
 import java.nio.file.{Files, Path}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal

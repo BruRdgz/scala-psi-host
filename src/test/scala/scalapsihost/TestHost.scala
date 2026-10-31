@@ -5,8 +5,12 @@ import org.jetbrains.plugins.scala.lang.psi.api.expr.ScReferenceExpression
 import org.jetbrains.plugins.scala.lang.psi.api.statements.{ScFunction, ScPatternDefinition}
 import com.intellij.psi.util.PsiTreeUtil
 
+import scalapsihost.language.{ChangeEngine}
+import scalapsihost.platform.{CallLog}
+
 import java.io.File
 import java.nio.file.Path
+
 import scala.jdk.CollectionConverters.*
 
 /** The one host of the test JVM (see `Test / fork` in build.sbt), with the scala-library fixture indexed. */

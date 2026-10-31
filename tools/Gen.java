@@ -2,11 +2,13 @@ import java.lang.reflect.*;
 import java.util.*;
 
 /**
- * Generates `scalapsihost.Host_<Simple>` subclasses of abstract platform classes: every abstract method
- * forwards to `scalapsihost.Dispatch.call("<Simple>.<method>", args)`. Uses erased signatures.
+ * Generates `scalapsihost.platform.Host_<Simple>` subclasses of abstract platform classes: every abstract method
+ * forwards to `scalapsihost.platform.Dispatch.call("<Simple>.<method>", args)`. Uses erased signatures.
  * Usage: java -cp <classpath> Gen.java <outDir> <fqcn>...
  */
 public class Gen {
+  private static final String PACKAGE = "scalapsihost.platform";
+
   // Methods that are not abstract but throw in the base class, and that the host answers: forwarded like the abstract ones.
   static final Map<String, Set<String>> FORWARDED_CONCRETE = Map.of(
     "com.intellij.util.indexing.FileBasedIndex", Set.of("processFilesContainingAllKeys"));
@@ -58,7 +60,7 @@ public class Gen {
     }
     String simple = base.getSimpleName();
     StringBuilder sb = new StringBuilder();
-    sb.append("package scalapsihost;\n\n@SuppressWarnings({\"unchecked\", \"rawtypes\", \"deprecation\"})\n");
+    sb.append("package ").append(PACKAGE).append(";\n\n@SuppressWarnings({\"unchecked\", \"rawtypes\", \"deprecation\"})\n");
     sb.append("public final class Host_").append(simple).append(" extends ").append(typeName(base)).append(" {\n");
     sb.append("  private final Dispatch d;\n");
     // Forward the parameters of the base class's shortest non-private constructor (e.g. FileIndexFacade(Project)).

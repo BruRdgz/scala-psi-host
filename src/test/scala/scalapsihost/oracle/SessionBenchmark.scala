@@ -1,10 +1,12 @@
 package scalapsihost.oracle
 
-import scalapsihost.lsp.ProjectSession
-import scalapsihost.{CallLog, HostConfig, LineColumn, ScalaPsiHost}
+import scalapsihost.{HostConfig, LineColumn, ScalaPsiHost}
+import scalapsihost.platform.{CallLog}
+import scalapsihost.workspace.{ProjectSession}
 
 import java.io.File
 import java.nio.file.{Files, Path}
+
 import scala.jdk.CollectionConverters.*
 
 /**

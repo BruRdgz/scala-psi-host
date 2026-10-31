@@ -1,6 +1,9 @@
 package scalapsihost
 
+import scalapsihost.platform.{CallLog}
+
 import java.nio.file.{Files, Path}
+
 import scala.io.Source
 import scala.jdk.CollectionConverters.*
 import scala.util.Using

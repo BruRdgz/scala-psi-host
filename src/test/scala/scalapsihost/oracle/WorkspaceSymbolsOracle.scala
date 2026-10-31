@@ -4,10 +4,14 @@ import com.intellij.psi.{PsiClass, PsiElement, PsiNamedElement}
 import org.jetbrains.plugins.scala.extensions.{PsiClassExt, PsiMemberExt, PsiNamedElementExt}
 import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunction
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.{ScClass, ScMember, ScObject, ScTrait, ScTypeDefinition}
-import scalapsihost.{CallLog, HostConfig, HostLog, HostModule, ModuleSpec, ProjectSearch, ScalaPsiHost}
+
+import scalapsihost.{HostConfig, HostModule, ModuleSpec, ScalaPsiHost}
+import scalapsihost.platform.{CallLog, HostLog}
+import scalapsihost.language.{ProjectSearch}
 
 import java.io.File
 import java.nio.file.{Files, Path}
+
 import scala.deriving.Mirror
 import scala.jdk.CollectionConverters.*
 import scala.reflect.ClassTag

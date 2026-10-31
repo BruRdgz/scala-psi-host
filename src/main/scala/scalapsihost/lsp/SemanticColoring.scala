@@ -1,16 +1,13 @@
 package scalapsihost.lsp
 
-import com.intellij.openapi.editor.colors.TextAttributesKey
 import org.eclipse.lsp4j.{SemanticTokenModifiers, SemanticTokenTypes, SemanticTokensLegend}
-import org.jetbrains.plugins.scala.highlighter.DefaultHighlighter as H
+
+import scalapsihost.language.{SemanticToken, SemanticTokenKind, SemanticTokenModifier}
 import scalapsihost.LineColumn
 
 import scala.jdk.CollectionConverters.*
 
-/**
- * The plugin's highlighting keys as LSP semantic tokens. Keys with no counterpart in LSP's vocabulary (collections,
- * `Predef`, implicit conversions, ScalaDoc markup) are not sent: the editor's own grammar colors the rest.
- */
+/** The LSP semantic-token legend and relative integer encoding for workspace semantic categories. */
 object SemanticColoring {
   private val types = Seq(
     SemanticTokenTypes.Namespace, SemanticTokenTypes.Type, SemanticTokenTypes.Class, SemanticTokenTypes.Enum,
@@ -20,69 +17,51 @@ object SemanticColoring {
   )
   private val modifiers = Seq(SemanticTokenModifiers.Readonly, SemanticTokenModifiers.Abstract, SemanticTokenModifiers.Declaration)
 
+  /** The token types and modifiers whose indexes are used by [[encode]]. */
   val legend: SemanticTokensLegend = new SemanticTokensLegend(types.asJava, modifiers.asJava)
 
-  private val byKey: Map[TextAttributesKey, (String, Set[String])] = {
-    import SemanticTokenModifiers.{Abstract, Declaration, Readonly}
-    import SemanticTokenTypes.*
-    Map(
-      H.KEYWORD -> (Keyword, Set()),
-      H.PACKAGE -> (Namespace, Set()),
-      H.CLASS -> (Class, Set()),
-      H.ABSTRACT_CLASS -> (Class, Set(Abstract)),
-      H.OBJECT -> (Class, Set(Readonly)),
-      H.TRAIT -> (Interface, Set()),
-      H.ENUM -> (Enum, Set()),
-      H.ENUM_SINGLETON_CASE -> (EnumMember, Set()),
-      H.ENUM_CLASS_CASE -> (EnumMember, Set()),
-      H.TYPEPARAM -> (TypeParameter, Set()),
-      H.TYPE_ALIAS -> (Type, Set()),
-      H.LOCAL_VALUES -> (Variable, Set(Readonly)),
-      H.LOCAL_LAZY -> (Variable, Set(Readonly)),
-      H.VALUES -> (Variable, Set(Readonly)),
-      H.LAZY -> (Variable, Set(Readonly)),
-      H.PATTERN -> (Variable, Set(Readonly)),
-      H.GENERATOR -> (Variable, Set(Readonly)),
-      H.GIVEN -> (Variable, Set(Readonly)),
-      H.LOCAL_VARIABLES -> (Variable, Set()),
-      H.VARIABLES -> (Variable, Set()),
-      H.CASE_CLASS_FIELD -> (Property, Set(Readonly)),
-      H.CASE_CLASS_VAR_FIELD -> (Property, Set()),
-      H.PARAMETER -> (Parameter, Set()),
-      H.PARAMETER_OF_ANONIMOUS_FUNCTION -> (Parameter, Set()),
-      H.NAMED_ARGUMENT -> (Parameter, Set()),
-      H.METHOD_CALL -> (Method, Set()),
-      H.OBJECT_METHOD_CALL -> (Method, Set()),
-      H.LOCAL_METHOD_CALL -> (Function, Set()),
-      H.METHOD_DECLARATION -> (Method, Set(Declaration)),
-      H.ANNOTATION -> (Decorator, Set()),
-      H.ANNOTATION_ATTRIBUTE -> (Property, Set()),
-    )
-  }
+  private val kindType: Map[SemanticTokenKind, String] = Map(
+    SemanticTokenKind.Namespace -> SemanticTokenTypes.Namespace,
+    SemanticTokenKind.Type -> SemanticTokenTypes.Type,
+    SemanticTokenKind.Class -> SemanticTokenTypes.Class,
+    SemanticTokenKind.Enum -> SemanticTokenTypes.Enum,
+    SemanticTokenKind.Interface -> SemanticTokenTypes.Interface,
+    SemanticTokenKind.TypeParameter -> SemanticTokenTypes.TypeParameter,
+    SemanticTokenKind.Parameter -> SemanticTokenTypes.Parameter,
+    SemanticTokenKind.Variable -> SemanticTokenTypes.Variable,
+    SemanticTokenKind.Property -> SemanticTokenTypes.Property,
+    SemanticTokenKind.EnumMember -> SemanticTokenTypes.EnumMember,
+    SemanticTokenKind.Function -> SemanticTokenTypes.Function,
+    SemanticTokenKind.Method -> SemanticTokenTypes.Method,
+    SemanticTokenKind.Keyword -> SemanticTokenTypes.Keyword,
+    SemanticTokenKind.Decorator -> SemanticTokenTypes.Decorator,
+  )
 
-  /** A colored range of one line. */
-  final case class Token(start: LineColumn, length: Int, key: TextAttributesKey)
+  private val modifierName: Map[SemanticTokenModifier, String] = Map(
+    SemanticTokenModifier.Readonly -> SemanticTokenModifiers.Readonly,
+    SemanticTokenModifier.Abstract -> SemanticTokenModifiers.Abstract,
+    SemanticTokenModifier.Declaration -> SemanticTokenModifiers.Declaration,
+  )
 
   /**
-   * The tokens in LSP's relative encoding. Tokens may not overlap: of tokens on the same range the last wins (the
-   * annotator's, which comes after the visitor's); a token that overlaps an earlier, different range is dropped.
+   * Encodes workspace tokens for LSP. Tokens may not overlap: among equal ranges the last wins, and an overlapping
+   * later range is dropped.
    */
-  def encode(tokens: Seq[Token]): Seq[Int] = {
-    val mapped = tokens.flatMap(t => byKey.get(t.key).map(t -> _))
-    val lastPerRange = mapped.groupMapReduce(m => (m._1.start, m._1.length))(identity)((_, later) => later).values
-    val ordered = lastPerRange.toSeq.sortBy(m => (m._1.start.line, m._1.start.column))
-    val kept = ordered.foldLeft(Vector.empty[(Token, (String, Set[String]))]) { (acc, next) =>
+  def encode(tokens: Seq[SemanticToken]): Seq[Int] = {
+    val lastPerRange = tokens.groupMapReduce(token => (token.start, token.length))(identity)((_, later) => later).values
+    val ordered = lastPerRange.toSeq.sortBy(token => (token.start.line, token.start.column))
+    val kept = ordered.foldLeft(Vector.empty[SemanticToken]) { (acc, next) =>
       acc.lastOption match {
-        case Some((last, _)) if last.start.line == next._1.start.line && next._1.start.column < last.start.column + last.length => acc
+        case Some(last) if last.start.line == next.start.line && next.start.column < last.start.column + last.length => acc
         case _ => acc :+ next
       }
     }
-    kept.zipWithIndex.flatMap { case ((token, (tokenType, tokenModifiers)), i) =>
-      val previous = if (i == 0) LineColumn(0, 0) else kept(i - 1)._1.start
+    kept.zipWithIndex.flatMap { (token, i) =>
+      val previous = if (i == 0) LineColumn(0, 0) else kept(i - 1).start
       val deltaLine = token.start.line - previous.line
       val deltaColumn = if (deltaLine == 0) token.start.column - previous.column else token.start.column
-      val modifierBits = tokenModifiers.map(m => 1 << modifiers.indexOf(m)).sum
-      Seq(deltaLine, deltaColumn, token.length, types.indexOf(tokenType), modifierBits)
+      val modifierBits = token.modifiers.map(m => 1 << modifiers.indexOf(modifierName(m))).sum
+      Seq(deltaLine, deltaColumn, token.length, types.indexOf(kindType(token.kind)), modifierBits)
     }
   }
 }

@@ -5,8 +5,11 @@ import com.intellij.openapi.project.Project
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.psi.search.GlobalSearchScope
 
+import scalapsihost.platform.LibraryFile
+
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
+
 import scala.jdk.CollectionConverters.*
 
 /**
@@ -19,7 +22,11 @@ final case class ModuleSpec(
   scalacOptions: Seq[String],
   classpath: Seq[Path],
   dependsOn: Seq[String] = Seq.empty,
-)
+  identity: Option[String] = None,
+) {
+  /** A stable build identity, or the display name for existing callers without one. */
+  def stableId: String = identity.getOrElse(name)
+}
 
 /**
  * One module of the host's project: the IDE `Module` object the plugin sees, the library roots of its classpath and
@@ -40,46 +47,69 @@ final class ModuleModel(project: Project) {
   private val moduleOfFile = new ConcurrentHashMap[VirtualFile, HostModule]()
   @volatile private var jdkRoots: Set[VirtualFile] = Set.empty
 
+  /** All modules currently in the project, in their insertion order. */
   def all: Seq[HostModule] = modules.synchronized(modules.values().asScala.toVector)
-  def named(name: String): Option[HostModule] = Option(modules.get(name))
+
+  /** The module registered under its stable identity, if present. */
+  def byId(id: String): Option[HostModule] = Option(modules.get(id))
+
+  /** The unique module with this display name, if exactly one exists. */
+  def named(name: String): Option[HostModule] = all.filter(_.spec.name == name) match {
+    case Seq(module) => Some(module)
+    case _ => None
+  }
+
+  /** The module that owns `file` as a project source, if any. */
   def ofFile(file: VirtualFile): Option[HostModule] = Option(moduleOfFile.get(file))
+
+  /** The host module represented by an IntelliJ `Module` object, if it belongs to this project. */
   def ofModule(module: Module): Option[HostModule] = all.find(_.module eq module)
 
+  /** Replaces the JDK roots visible to every module's resolve scope. */
   private[scalapsihost] def setJdkRoots(roots: Seq[VirtualFile]): Unit = jdkRoots = roots.toSet
 
   /** The mounted JDK's module roots. */
   private[scalapsihost] def jdkModuleRoots: Set[VirtualFile] = jdkRoots
 
+  /** Adds a module after its dependencies have been added; duplicate identities and missing dependencies are rejected. */
   private[scalapsihost] def add(hostModule: HostModule): Unit = {
+    val id = hostModule.spec.stableId
+    if (id == null || id.isBlank) throw new IllegalArgumentException(s"module ${hostModule.spec.name} has an empty stable identity")
     val missing = hostModule.spec.dependsOn.filterNot(modules.containsKey)
-    if (missing.nonEmpty) throw new IllegalArgumentException(s"module ${hostModule.spec.name} depends on unknown modules: ${missing.mkString(", ")}")
-    if (modules.putIfAbsent(hostModule.spec.name, hostModule) != null)
-      throw new IllegalArgumentException(s"module ${hostModule.spec.name} already exists")
+    if (missing.nonEmpty) throw new IllegalArgumentException(s"module ${id} (${hostModule.spec.name}) depends on unknown module identities: ${missing.mkString(", ")}")
+    if (modules.putIfAbsent(id, hostModule) != null)
+      throw new IllegalArgumentException(s"module identity $id (${hostModule.spec.name}) already exists")
     libraryScopes.clear()
   }
 
-  /** Removes a module whose sources were removed; modules that depend on it must be removed or added again too. */
-  private[scalapsihost] def remove(name: String): Unit = {
-    val removed = Option(modules.remove(name)).getOrElse(throw new IllegalArgumentException(s"no module named $name"))
-    if (!removed.sources.isEmpty) throw new IllegalStateException(s"module $name still has sources")
+  /** Removes a module whose sources were removed; `id` is its stable identity. */
+  private[scalapsihost] def remove(id: String): Unit = {
+    modules.synchronized {
+      val existing = Option(modules.get(id)).getOrElse(throw new IllegalArgumentException(s"no module with identity $id"))
+      if (!existing.sources.isEmpty) throw new IllegalStateException(s"module $id still has sources")
+      modules.remove(id)
+    }
     // Scopes of the modules that depend on it reach it.
     scopes.clear()
     useScopes.clear()
     libraryScopes.clear()
   }
 
+  /** Registers a source-to-module mapping for the same lifetime as the source file. */
   private[scalapsihost] def addSource(file: VirtualFile, hostModule: HostModule): Unit = {
     hostModule.sources.add(file)
     moduleOfFile.put(file, hostModule)
   }
 
+  /** Removes a source-to-module mapping and the file from its former module. */
   private[scalapsihost] def removeSource(file: VirtualFile): Unit =
     Option(moduleOfFile.remove(file)).foreach(_.sources.remove(file))
 
   /** The module and the modules it depends on, transitively, each once. */
   private def withDependencies(hostModule: HostModule): Seq[HostModule] = {
     val seen = scala.collection.mutable.LinkedHashSet.empty[HostModule]
-    def visit(m: HostModule): Unit = if (seen.add(m)) m.spec.dependsOn.flatMap(named).foreach(visit)
+    /** Visits each dependency once, preserving the build's dependencies-first order. */
+    def visit(m: HostModule): Unit = if (seen.add(m)) m.spec.dependsOn.flatMap(byId).foreach(visit)
     visit(hostModule)
     seen.toSeq
   }
@@ -90,6 +120,7 @@ final class ModuleModel(project: Project) {
   // Each library root's scope, asked for on every resolve from a library class: found once, None outside modules.
   private val libraryScopes = new ConcurrentHashMap[VirtualFile, Option[GlobalSearchScope]]()
 
+  /** The cached scope containing this module, its transitive dependencies, classpath roots and the JDK. */
   def resolveScope(hostModule: HostModule): GlobalSearchScope =
     scopes.computeIfAbsent(hostModule, module => newScope(Seq(module)))
 
@@ -136,7 +167,9 @@ final class ModuleModel(project: Project) {
     case source => ofFile(source).map(module => useScopes.computeIfAbsent(module, newUseScope))
   }
 
+  /** Creates the scope of sources that can use declarations from `used`. */
   private def newUseScope(used: HostModule): GlobalSearchScope = new GlobalSearchScope(project) {
+    /** Whether `user` can see `used` through its own module or dependency chain. */
     private def usesModule(user: HostModule) = withDependencies(user).contains(used)
 
     override def contains(file: VirtualFile): Boolean = ofFile(file).exists(usesModule)
@@ -145,12 +178,16 @@ final class ModuleModel(project: Project) {
     override def toString: String = s"ModuleWithDependents(${used.spec.name})"
   }
 
+  /** The union of the module scopes that own this library root, if any module uses it. */
   private def libraryScope(root: VirtualFile): Option[GlobalSearchScope] = {
     val owners = all.filter(_.libraryRoots.contains(root))
     Option.when(owners.nonEmpty)(newScope(owners))
   }
 
-  // A module's dependencies are fixed when it is added; its sources and the JDK roots are read on each check.
+  /**
+   * Builds the cached resolve scope for `owners`: dependencies are fixed at registration, while source membership
+   * and JDK roots are checked against current project state.
+   */
   private def newScope(owners: Seq[HostModule]): GlobalSearchScope = new GlobalSearchScope(project) {
     private val reachable = owners.flatMap(withDependencies).distinct
     // A module's classpath is the build's resolved one, transitive jars included: the jars of the modules it depends on
@@ -166,6 +203,7 @@ final class ModuleModel(project: Project) {
     override def toString: String = s"ModuleWithDependencies(${owners.map(_.spec.name).mkString(", ")})"
   }
 
+  /** Finds the mounted virtual root that owns a library or JDK file. */
   private def rootOf(file: VirtualFile): VirtualFile = {
     var f = file
     while (f.getParent != null) f = f.getParent

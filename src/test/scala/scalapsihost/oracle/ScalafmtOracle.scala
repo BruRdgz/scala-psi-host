@@ -4,9 +4,14 @@ import com.intellij.psi.util.PsiTreeUtil
 import org.jetbrains.plugins.scala.lang.psi.api.expr.{ScMethodCall, ScReferenceExpression}
 import org.jetbrains.plugins.scala.lang.psi.api.statements.{ScFunctionDefinition, ScPatternDefinition}
 import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScTypeDefinition
-import scalapsihost.{ChangeEngine, HostLog, ScalafmtFormatting, TestHost}
+
+import scalapsihost.{TestHost}
+import scalapsihost.language.{ChangeEngine}
+import scalapsihost.platform.{HostLog}
+import scalapsihost.build.{ScalafmtFormatting}
 
 import java.nio.file.{Files, Path}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 

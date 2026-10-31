@@ -5,11 +5,15 @@ import org.jetbrains.plugins.scala.codeInsight.hints.ScalaHintsSettings
 import org.jetbrains.plugins.scala.codeInsight.implicits.ImplicitHints
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.settings.ScalaApplicationSettings
-import scalapsihost.{CallLog, HostConfig, HostLog, HostModule, InlayHints, ModuleSpec, ScalaPsiHost}
+
+import scalapsihost.{HostConfig, HostModule, ModuleSpec, ScalaPsiHost}
+import scalapsihost.platform.{CallLog, HostLog}
+import scalapsihost.language.{InlayHints}
 
 import java.io.File
 import java.nio.file.{Files, Path}
 import java.util.regex.Matcher
+
 import scala.deriving.Mirror
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal

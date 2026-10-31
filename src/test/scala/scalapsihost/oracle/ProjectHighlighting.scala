@@ -2,10 +2,14 @@ package scalapsihost.oracle
 
 import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
-import scalapsihost.{BspImport, Diagnostic, HostConfig, HostLog, LineColumn, ScalaPsiHost}
+
+import scalapsihost.{Diagnostic, HostConfig, LineColumn, ScalaPsiHost}
+import scalapsihost.build.{BspImport}
+import scalapsihost.platform.{HostLog}
 
 import java.io.File
 import java.nio.file.{Files, Path}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
 

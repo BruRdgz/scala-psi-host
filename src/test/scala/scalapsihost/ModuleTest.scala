@@ -89,4 +89,34 @@ class ModuleTest extends munit.FunSuite {
       assertEquals(inClient.map(_.getContainingFile.getVirtualFile).toSet, in213.map(_.getContainingFile.getVirtualFile).toSet)
     }
   }
+
+  test("stable identities distinguish equal display names and dependencies use identities") {
+    val firstId = "bsp://identity-test/first"
+    val secondId = "bsp://identity-test/second"
+    val clientId = "bsp://identity-test/client"
+    val first = host.addModule(ModuleSpec("shared-display-name", "2.13.18", Seq.empty, Seq(library213), identity = Some(firstId)))
+    var second: Option[HostModule] = None
+    var client: Option[HostModule] = None
+    var source: Option[com.intellij.psi.PsiFile] = None
+    try {
+      second = Some(host.addModule(ModuleSpec("shared-display-name", "2.13.18", Seq.empty, Seq(library213), identity = Some(secondId))))
+      client = Some(host.addModule(ModuleSpec("identity-client", "2.13.18", Seq.empty, Seq(library213),
+        dependsOn = Seq(firstId), identity = Some(clientId))))
+
+      assertEquals(host.modules.byId(firstId), Some(first))
+      assertEquals(host.modules.byId(secondId), second)
+      assertEquals(host.modules.named("shared-display-name"), None)
+      assertEquals(client.map(_.spec.dependsOn), Some(Seq(firstId)))
+      val manager = com.intellij.openapi.module.ModuleManager.getInstance(host.project)
+      assert(manager.findModuleByName(first.module.getName) eq first.module)
+      assert(second.exists(module => manager.findModuleByName(module.module.getName) eq module.module))
+
+      source = Some(host.openFile(Path.of("/identity-test/First.scala"), "object First", first))
+      intercept[IllegalStateException](host.removeModule(firstId))
+      assertEquals(host.modules.byId(firstId), Some(first))
+    } finally {
+      source.foreach(host.closeSource)
+      Seq(clientId, secondId, firstId).foreach(id => if (host.modules.byId(id).nonEmpty) host.removeModule(id))
+    }
+  }
 }

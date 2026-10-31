@@ -1,10 +1,14 @@
 package scalapsihost.oracle
 
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
-import scalapsihost.{CallLog, HostConfig, HostLog, HostModule, ModuleSpec, ParameterInfo, ScalaPsiHost}
+
+import scalapsihost.{HostConfig, HostModule, ModuleSpec, ScalaPsiHost}
+import scalapsihost.platform.{CallLog, HostLog}
+import scalapsihost.language.{ParameterInfo}
 
 import java.io.File
 import java.nio.file.{Files, Path}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal

@@ -7,11 +7,14 @@ import com.intellij.usageView.UsageInfo
 import com.intellij.util.CommonProcessors
 import org.jetbrains.plugins.scala.findUsages.factory.{ScalaFindUsagesConfiguration, ScalaFindUsagesHandlerFactory}
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
-import scalapsihost.{CallLog, HostConfig, HostLog, HostModule, ModuleSpec, RequestEditor, ScalaPsiHost}
+
+import scalapsihost.{HostConfig, HostModule, ModuleSpec, ScalaPsiHost}
+import scalapsihost.platform.{CallLog, HostLog, RequestEditor}
 
 import java.io.File
 import java.nio.file.{Files, Path}
 import java.util.regex.Matcher
+
 import scala.collection.mutable
 import scala.deriving.Mirror
 import scala.jdk.CollectionConverters.*

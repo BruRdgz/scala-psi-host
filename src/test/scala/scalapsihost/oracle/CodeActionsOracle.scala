@@ -10,9 +10,13 @@ import org.jetbrains.plugins.scala.lang.psi.api.toplevel.typedef.ScTypeDefinitio
 import org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.surroundWith.descriptors.ScalaExpressionSurroundDescriptor
-import scalapsihost.{ChangeEngine, CodeActions, Descriptors, HostLog, HostModule, ModuleSpec, ScalaPsiHost, TestHost}
+
+import scalapsihost.{HostModule, ModuleSpec, ScalaPsiHost, TestHost}
+import scalapsihost.language.{ChangeEngine, CodeActions}
+import scalapsihost.platform.{Descriptors, HostLog}
 
 import java.nio.file.{Files, Path}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal

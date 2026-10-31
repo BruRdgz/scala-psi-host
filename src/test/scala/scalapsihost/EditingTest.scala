@@ -4,13 +4,16 @@ import com.intellij.lang.annotation.HighlightSeverity
 import com.intellij.openapi.util.TextRange
 import com.intellij.psi.search.searches.ReferencesSearch
 import com.intellij.psi.util.PsiTreeUtil
-import org.eclipse.lsp4j.CompletionItemKind
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
 import org.jetbrains.plugins.scala.lang.psi.api.statements.ScFunction
+
 import scalapsihost.TestHost.{applyEdits, choose}
+import scalapsihost.language.{ChangeEngine, Completion, ProjectSearch}
+import scalapsihost.platform.{CallLog, HostLock}
 
 import java.nio.file.Path
 import java.util.concurrent.{CountDownLatch, TimeUnit}
+
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.Duration
 import scala.jdk.CollectionConverters.*
@@ -160,7 +163,7 @@ class EditingTest extends munit.FunSuite {
       val offset = text.indexOf("Complete.mes") + "Complete.mes".length
       val result = host.completion(file, offset)
       val item = result.items.find(_.lookup == "message").getOrElse(fail(result.toString))
-      assertEquals(item.kind, CompletionItemKind.Method)
+      assertEquals(item.kind, Completion.Kind.Method)
       assert(item.tail.exists(_.contains("Int")) && item.typeText.contains("String"), item.toString)
       assertEquals(item.prefix, new TextRange(offset - 3, offset))
       assert(item.hasHandler, item.toString)

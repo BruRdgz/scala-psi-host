@@ -4,10 +4,14 @@ import com.intellij.psi.codeStyle.CodeStyleSettingsManager
 import org.jetbrains.plugins.scala.ScalaLanguage
 import org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
-import scalapsihost.{CallLog, ChangeEngine, HostConfig, HostLog, ScalaPsiHost, TestHost}
+
+import scalapsihost.{HostConfig, ScalaPsiHost, TestHost}
+import scalapsihost.platform.{CallLog, HostLog}
+import scalapsihost.language.{ChangeEngine}
 
 import java.io.File
 import java.nio.file.{Files, Path}
+
 import scala.jdk.CollectionConverters.*
 import scala.util.Using
 import scala.util.control.NonFatal

@@ -1,11 +1,16 @@
 package scalapsihost.oracle
 
 import com.intellij.psi.PsiFile
-import scalapsihost.{CallLog, HostConfig, HostLog, HostModule, ModuleSpec, Rename, ScalaPsiHost, TestHost}
+
+import scalapsihost.{HostConfig, HostModule, ModuleSpec, ScalaPsiHost, TestHost}
+import scalapsihost.platform.{CallLog, HostLog}
+import scalapsihost.language.{Rename}
+import scalapsihost.language.{ChangeEngine}
 
 import java.io.File
 import java.nio.file.{Files, Path}
 import java.util.regex.Matcher
+
 import scala.deriving.Mirror
 import scala.jdk.CollectionConverters.*
 import scala.jdk.StreamConverters.*
@@ -198,7 +203,7 @@ object RenameOracle {
     } finally opened.foreach((_, f) => host.closeSource(f))
   }
 
-  private def applied(opened: Seq[(Source, PsiFile)], changes: Seq[(PsiFile, Seq[scalapsihost.ChangeEngine.Edit])]): Seq[Source] =
+  private def applied(opened: Seq[(Source, PsiFile)], changes: Seq[(PsiFile, Seq[scalapsihost.language.ChangeEngine.Edit])]): Seq[Source] =
     opened.map { (source, file) =>
       source.copy(text = changes.find(_._1 eq file).fold(source.text)((_, edits) => TestHost.applyEdits(source.text, edits)))
     }

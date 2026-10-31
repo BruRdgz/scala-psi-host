@@ -2,11 +2,15 @@ package scalapsihost.oracle
 
 import com.intellij.openapi.util.TextRange
 import org.jetbrains.plugins.scala.lang.psi.api.ScalaFile
-import scalapsihost.{CallLog, HostConfig, HostLog, HostModule, ModuleSpec, ProjectSearch, ScalaPsiHost}
+
+import scalapsihost.{HostConfig, HostModule, ModuleSpec, ScalaPsiHost}
+import scalapsihost.platform.{CallLog, HostLog}
+import scalapsihost.language.{ProjectSearch}
 
 import java.io.File
 import java.nio.file.{Files, Path}
 import java.util.regex.Matcher
+
 import scala.collection.mutable
 import scala.deriving.Mirror
 import scala.jdk.CollectionConverters.*
