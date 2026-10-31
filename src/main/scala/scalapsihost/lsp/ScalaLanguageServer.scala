@@ -8,7 +8,7 @@ import org.eclipse.lsp4j.*
 import org.eclipse.lsp4j.jsonrpc.ResponseErrorException
 import org.eclipse.lsp4j.jsonrpc.messages.{Either as LspEither, Either3 as LspEither3, ResponseError, ResponseErrorCode, Tuple}
 import org.eclipse.lsp4j.services.*
-import scalapsihost.{CallLog, ChangeEngine, HostLog, LineColumn, ParameterInfo, Rename, ScalaPsiHost}
+import scalapsihost.{CallLog, ChangeEngine, HostLog, LineColumn, ParameterInfo, Rename, ScalafmtFormatting, ScalaPsiHost}
 
 import java.net.URI
 import java.nio.file.Path
@@ -315,7 +315,7 @@ final class ScalaLanguageServer(
           HostLog.warn(s"$kind: the change is too large to compare", e)
           throw requestError(ResponseErrorCode.RequestFailed, "the change is too large to compare")
         case e: Rename.Refused => throw requestError(ResponseErrorCode.RequestFailed, e.getMessage)
-        case e: ChangeEngine.UnsupportedFormatter =>
+        case e: ScalafmtFormatting.Failed =>
           client.showMessage(new MessageParams(MessageType.Error, e.getMessage))
           throw requestError(ResponseErrorCode.RequestFailed, e.getMessage)
         // A class the plugin needs and the host does not have is a LinkageError, not a NonFatal one: logged too.

@@ -36,8 +36,6 @@ object ChangeEngine {
   /** The changed copy's text, and the edits that turn the original into it: sorted, disjoint and not touching. */
   final case class Result(text: String, edits: Seq[Edit])
 
-  final class UnsupportedFormatter extends UnsupportedOperationException("scalafmt is not supported by scala-psi-host")
-
   /**
    * The edits `modify` makes on a copy of `file`, and what it returns (e.g. state that follows the copy's document).
    * `modify` runs in a preview session whose editor (`IntentionPreviewUtils.getPreviewEditor`) shows the copy.
@@ -133,10 +131,8 @@ object ChangeEngine {
     require(indentSize > 0, "the indent size must be positive")
     val manager = CodeStyleSettingsManager.getInstance(file.getProject)
     val settings = manager.getCurrentSettings.clone()
-    if (settings.getCustomSettings(classOf[ScalaCodeStyleSettings]).USE_SCALAFMT_FORMATTER()) {
-      HostLog.warn("scalafmt was selected, but scala-psi-host supports only the IntelliJ formatter")
-      throw new UnsupportedFormatter
-    }
+    // Configured whole-file scalafmt requests are handled before this IntelliJ-formatter entry point.
+    settings.getCustomSettings(classOf[ScalaCodeStyleSettings]).FORMATTER = ScalaCodeStyleSettings.INTELLIJ_FORMATTER
     val indent = settings.getCommonSettings(ScalaLanguage.INSTANCE).getIndentOptions
     indent.TAB_SIZE = indentSize
     indent.INDENT_SIZE = indentSize

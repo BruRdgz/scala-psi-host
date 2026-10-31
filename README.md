@@ -16,8 +16,13 @@ hints, selection ranges, formatting, rename and code actions for sbt (or any BSP
 Completion lists the suggestions of the plugin's completion contributors, ordered by its weighers; a suggestion's
 insert handler (parentheses, imports, generated code) runs once the user has chosen it, as in the IDE: the item's
 command asks the server, which applies the handler's edits (`workspace/applyEdit`) and moves the caret
-(`window/showDocument`). Formatting is the IntelliJ formatter; a change runs on a copy of the file and comes back as
-minimal edits.
+(`window/showDocument`). Formatting returns minimal edits without changing the source. With no `.scalafmt.conf`,
+it runs the IntelliJ formatter on a preview copy. Whole-file requests use scalafmt when a config exists: the nearest
+config between the file and workspace root wins; sources outside the workspace use the root's config. The config
+must declare a version. The plugin's bundled dynamic engine loads that version, resolving missing dependencies
+from Maven Central into `<state-dir>/scalafmt` and reusing the disk cache on later runs. Configured project exclusion
+filters apply; invalid configurations, source syntax or downloads fail the request and show an error. Range requests
+keep the IntelliJ formatter, matching the plugin's default for ranges.
 
 Rename runs the plugin's rename processors over the project's sources, including companions, overriders and
 references. Package-private use scopes use the packages declared in source text, including child packages.
@@ -216,6 +221,12 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   not replayed yet. Auto-import: **13 agree, 0 disagree**, through the same copy engine.
 - `oracle.FormatterOracle <intellij-scala> <report.md>` — the plugin's file-based formatter tests: 187 of 187 (its
   inline Scala test methods are not replayed).
+- `oracle.ScalafmtOracle <intellij-scala> <report.md>` — selected whole-file contracts from
+  `ScalaFmtCustomConfigTest_3_11` (including inherited methods) and `ScalaFmtCommonTest_2_7.testCompleteFile`:
+  **8 agree, 0 disagree**. Scala PSI extracts the plugin's expected text and configuration paths; the replay checks
+  rewriting, relative config includes and legacy formatter loading. It does not cover range formatting, the IDE's
+  incomplete-source wrappers or save tasks. Host and JSON-RPC tests additionally cover module config precedence,
+  exclusions, cache reuse, malformed/missing-version configs and the default IntelliJ range formatter.
 - `oracle.ParameterInfoOracle <intellij-scala> <report.md>` — the plugin's parameter info tests: 104 agree,
   3 disagree (library versions), 35 skip (Scala 3 fixtures).
 - `oracle.InlayHintsOracle <intellij-scala> <report.md> [--only=<name>,...]` — literal cases from the plugin's
@@ -253,8 +264,9 @@ Tools in the test scope, each comparing the host with the plugin's own expectati
   `OptimizeImportsTestBase`'s source/expected extraction and the suites' Scala versions and Unicode-arrow setting:
   **53 agree, 1 disagree, 7 skip**. Simple/wildcard fixtures see their sibling sources. `simple/ImportChainUsed`
   reorders a local import chain with colliding top-level `A` declarations in that setup; an isolated local-chain
-  regression preserves the dependency. Six skips require scalafmt and one custom scalastyle grouping. Inline test
-  methods and the IDE's notification text are not replayed.
+  regression preserves the dependency. Six skips use the plugin's scalafmt-specific import path, which this
+  optimizer replay does not reproduce; one needs custom scalastyle grouping. Inline test methods and the IDE's
+  notification text are not replayed.
 - `oracle.SelectionOracle <intellij-scala> <report.md>` — the plugin's selectioner tests, step by step: ScalaDoc
   2 agree, 1 disagree; interpolated strings 27 agree; ordinary strings 9 agree; no skips. The multiline/single-line
   helper runs both variants. See the trailing-newline disagreement below.
@@ -325,8 +337,11 @@ the last (measured with `-XX:SoftRefLRUPolicyMSPerMB=0`, so the plugin's soft-re
   chains use inline labels without the IDE's column alignment. The plugin suppresses definition-type and method-chain
   hints in Scala 3 compiler-highlighting mode unless X-Ray mode is enabled, as in the IDE. The oracle uses unit-test
   mode with compiler highlighting disabled, and reports inherited Scala 2 cases once.
-- Formatting uses the IntelliJ formatter with Scala's default code style: the project's code style and
-  `.scalafmt.conf` are not read.
+- IntelliJ formatting uses Scala's default code style; the project's IDE code-style settings are not imported.
+  Scalafmt handles configured whole-file requests; range formatting remains IntelliJ. IDE-specific scalafmt path
+  overrides and incomplete-source wrapping are not implemented. Only Maven Central is used for formatter artifacts;
+  a version missing from the host's cache needs network access. Git-only batch file selection is not applied to
+  explicit document-formatting requests.
 - Selection ranges: `ScalaDocCommentSelectionerTest.testMainContentSelection` expects the multiline class without
   its final newline, then the whole file. This platform's `WordSelectioner` delegates to
   `ExtendWordSelectionHandlerBase.expandToWholeLine`, which includes that newline for the multiline class, so the

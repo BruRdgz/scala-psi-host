@@ -63,7 +63,7 @@ object FormatterOracle {
     lines += "- Nonphysical copies obtain their document from the view provider: PsiDocumentManager.getDocument deliberately returns null for them. " +
       "Copies register both the document manager and its PriorityEventCollector. Omitting the latter lost same-length document changes and " +
       "caused two PSI consistency errors during initial replay; the completed run treats any logged platform error as disagreement."
-    lines += "- Scalafmt is rejected explicitly before formatting; its dynamic preprocessor and configuration resolution are not installed. " +
+    lines += "- Scalafmt requests are routed separately by ProjectSession; this replay exercises the IntelliJ formatter. " +
       "The registered processors are ScalaDocNewlinedPreFormatProcessor, ScalaBracePostFormatProcessor and ScalaTrailingCommaProcessor."
     lines += ""
     lines += "Cancellation inside util-diff's array algorithm is incomplete upstream. Large-file latency, diff limits and retained heap " +

@@ -648,26 +648,46 @@ class LanguageServerTest extends munit.FunSuite {
     }
   }
 
-  test("an explicitly selected scalafmt reports an LSP error and a visible message") {
-    val settings = scalapsihost.HostLock.write {
-      val settings = com.intellij.psi.codeStyle.CodeStyleSettingsManager.getInstance(TestHost.host.project).getCurrentSettings
-        .getCustomSettings(classOf[org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings])
-      settings.FORMATTER = org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings.SCALAFMT_FORMATTER
-      settings
+  test("formats with the module scalafmt config, preserves range defaults and reports invalid config") {
+    val config = fixture.resolve("app/.scalafmt.conf")
+    assert(!Files.exists(config), "the test must not overwrite an existing module config")
+    val original = Files.readString(main).replace("val text: String", "val text: Int")
+    val text = "object ScalafmtBuffer {\nval x=1+2\n}\n"
+    val service = server.getTextDocumentService
+    def change(value: String, version: Int): Unit = service.didChange(new DidChangeTextDocumentParams(
+      new VersionedTextDocumentIdentifier(main.toUri.toString, version),
+      java.util.List.of(new TextDocumentContentChangeEvent(value))))
+    def applied(edits: Seq[TextEdit]): String = {
+      val snapshot = new com.intellij.openapi.editor.impl.DocumentImpl(text, true)
+      def offset(p: Position) = snapshot.getLineStartOffset(p.getLine) + p.getCharacter
+      edits.reverse.foldLeft(text) { (current, edit) =>
+        current.substring(0, offset(edit.getRange.getStart)) + edit.getNewText +
+          current.substring(offset(edit.getRange.getEnd))
+      }
     }
+    Files.copy(Path.of("fixtures/scalafmt/.scalafmt.conf"), config)
     try {
-      val request = implementation.getTextDocumentService.formatting(new DocumentFormattingParams(document(main), new FormattingOptions(2, true)))
-      val error = intercept[java.util.concurrent.ExecutionException](request.get(1, TimeUnit.MINUTES))
+      change(text, 33)
+      val params = new DocumentFormattingParams(document(main), new FormattingOptions(2, true))
+      val edits = service.formatting(params).get(10, TimeUnit.MINUTES).asScala.toSeq
+      assertEquals(applied(edits), "object ScalafmtBuffer {\n    val x = 1 + 2\n}\n")
+      assertEquals(service.formatting(params).get(1, TimeUnit.MINUTES).asScala.toSeq, edits)
+      val selected = service.rangeFormatting(new DocumentRangeFormattingParams(document(main),
+        new FormattingOptions(2, true), new Range(new Position(1, 0), new Position(1, 9))))
+        .get(1, TimeUnit.MINUTES).asScala.toSeq
+      assertEquals(applied(selected), "object ScalafmtBuffer {\n  val x = 1 + 2\n}\n")
+      Files.writeString(config, "version = [\n")
+      val error = intercept[java.util.concurrent.ExecutionException](service.formatting(params).get(1, TimeUnit.MINUTES))
       error.getCause match {
-        case unsupported: org.eclipse.lsp4j.jsonrpc.ResponseErrorException =>
-          assertEquals(unsupported.getResponseError.getCode, org.eclipse.lsp4j.jsonrpc.messages.ResponseErrorCode.RequestFailed.getValue)
-          assert(unsupported.getMessage.contains("scalafmt"))
+        case failed: org.eclipse.lsp4j.jsonrpc.ResponseErrorException =>
+          assertEquals(failed.getResponseError.getCode, ResponseErrorCode.RequestFailed.getValue)
         case other => fail(s"scalafmt did not report an LSP error: $other")
       }
       val shown = Client.shown.poll(10, TimeUnit.SECONDS)
       assert(shown != null && shown.getMessage.contains("scalafmt"), String.valueOf(shown))
-    } finally scalapsihost.HostLock.write {
-      settings.FORMATTER = org.jetbrains.plugins.scala.lang.formatting.settings.ScalaCodeStyleSettings.INTELLIJ_FORMATTER
+    } finally {
+      Files.delete(config)
+      change(original, 34)
     }
   }
 

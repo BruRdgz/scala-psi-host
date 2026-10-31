@@ -107,6 +107,7 @@ object Fold {
 final class ProjectSession private (
   host: ScalaPsiHost,
   build: BuildConnection,
+  root: Path,
 ) extends AutoCloseable {
   private val files = new ConcurrentHashMap[Path, PsiFile]()
   // The build's modules as last imported (changed only by `importBuild`, on the session's thread).
@@ -115,6 +116,7 @@ final class ProjectSession private (
   // Classpath jars whose sources were asked for, attached or not.
   private var sourcesAskedFor = Set.empty[Path]
   private val documentCompiler = new DocumentCompiler
+  private val scalafmt = new ScalafmtFormatting(host.stateDir.resolve("scalafmt"))
   // The build's compiler problems from its last compile, by file (for files the document compiler does not cover).
   private val buildProblems = new AtomicReference[Map[Path, Seq[CompilerDiagnostic]]](Map.empty)
 
@@ -205,7 +207,14 @@ final class ProjectSession private (
     file(path) match {
       case f: ScalaFile =>
         val selected = host.read(range.map((start, end) => new TextRange(offset(document(f), start), offset(document(f), end))))
-        val edits = host.formatting(f, selected, indentSize, useTabs)
+        // The plugin defaults to the IntelliJ formatter for range requests even when scalafmt is selected.
+        val config = if (range.isEmpty) ScalafmtFormatting.configFor(root, path) else None
+        val edits = config match {
+          case Some(configFile) =>
+            val before = host.read(f.getText)
+            ChangeEngine.diff(before, scalafmt.format(configFile, path, before))
+          case None => host.formatting(f, selected, indentSize, useTabs)
+        }
         host.read(edits.map(textChange(document(f), _)))
       case _ => Seq.empty
     }
@@ -645,7 +654,7 @@ final class ProjectSession private (
     (before.keySet ++ after.keySet).filter(p => before.get(p) != after.get(p) && files.containsKey(p))
   }
 
-  override def close(): Unit = build.close()
+  override def close(): Unit = try build.close() finally scalafmt.close()
 }
 
 object ProjectSession {
@@ -661,7 +670,7 @@ object ProjectSession {
       host.addJdk(javaHome)
       // The JDK's sources, as the IDE attaches them to the JDK.
       Some(javaHome.resolve("lib/src.zip")).filter(Files.isRegularFile(_)).foreach(host.addJdkSources)
-      val session = new ProjectSession(host, build)
+      val session = new ProjectSession(host, build, root)
       session.importBuild(reload = false, progress)
       session
     } catch {
