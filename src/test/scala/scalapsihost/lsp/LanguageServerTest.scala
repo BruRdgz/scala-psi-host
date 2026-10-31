@@ -14,7 +14,7 @@ import java.io.{ByteArrayInputStream, ByteArrayOutputStream, OutputStream, Piped
 import java.nio.file.{Files, Path}
 import java.time.Instant
 import java.util.{List as JavaList}
-import java.util.concurrent.{CompletableFuture, LinkedBlockingQueue, TimeUnit}
+import java.util.concurrent.{CompletableFuture, CountDownLatch, Executors, LinkedBlockingQueue, TimeUnit}
 
 import scala.concurrent.duration.*
 import scala.jdk.CollectionConverters.*
@@ -790,6 +790,36 @@ class LanguageServerTest extends munit.FunSuite {
     } finally {
       plain.shutdown().get(30, TimeUnit.SECONDS)
       plain.exit()
+      releaseModules()
+    }
+  }
+
+  test("source checks do not wait for an ongoing diagnostic read") {
+    val session = ProjectSession.open(TestHost.host, fixture)
+    val executor = Executors.newSingleThreadExecutor(r => new Thread(r, "session-diagnostic-test"))
+    val started = new CountDownLatch(1)
+    val release = new CountDownLatch(1)
+    val listeners = com.intellij.openapi.util.Disposer.newDisposable()
+    HostLock.addReadListener(new com.intellij.openapi.application.ReadActionListener {
+      override def readActionStarted(action: Class[?]): Unit =
+        if (Thread.currentThread().getName == "session-diagnostic-test") {
+          started.countDown()
+          val released = release.await(30, TimeUnit.SECONDS)
+          assert(released, "the diagnostic read was not released")
+        }
+    }, listeners)
+    val problems = CompletableFuture.supplyAsync(() => session.problems(main), executor)
+    try {
+      assert(started.await(30, TimeUnit.SECONDS), "diagnostics did not acquire the read lock")
+      assert(CompletableFuture.supplyAsync(() => session.isSource(main)).get(5, TimeUnit.SECONDS))
+      release.countDown()
+      problems.get(30, TimeUnit.SECONDS)
+    } finally {
+      release.countDown()
+      com.intellij.openapi.util.Disposer.dispose(listeners)
+      executor.shutdown()
+      assert(executor.awaitTermination(30, TimeUnit.SECONDS))
+      session.close()
       releaseModules()
     }
   }

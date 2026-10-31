@@ -10,6 +10,7 @@ import scalapsihost.platform.{HostLock, HostLog}
 import java.nio.file.{Files, Path}
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.locks.ReentrantReadWriteLock
 
 import scala.util.Using
 
@@ -38,7 +39,7 @@ final class ProjectSession private (
 ) extends AutoCloseable {
   private val files = new ConcurrentHashMap[Path, PsiFile]()
   // Diagnostics run apart from the serialized documents executor; keep their source check/read outside a partial import.
-  private val importSnapshotLock = new Object
+  private val importSnapshotLock = new ReentrantReadWriteLock(true)
   // The build's modules as last imported (changed only by `importBuild`, on the session's thread).
   @volatile private var imported: Seq[ImportedModule] = Seq.empty
   @volatile private var compileSpecs: Map[String, CompileSpec] = Map.empty
@@ -79,9 +80,13 @@ final class ProjectSession private (
    *
    * @param path source path as registered by the build
    */
-  def isSource(path: Path): Boolean = importSnapshotLock.synchronized {
-    ensureUsable()
-    files.containsKey(path)
+  def isSource(path: Path): Boolean = {
+    val readLock = importSnapshotLock.readLock()
+    readLock.lock()
+    try {
+      ensureUsable()
+      files.containsKey(path)
+    } finally readLock.unlock()
   }
 
   /** Reports whether source requests remain permitted by the import-failure guard. */
@@ -213,10 +218,14 @@ final class ProjectSession private (
    * @param path registered project-source path
    * @return `Seq[FileProblem]` combining the enabled plugin and compiler diagnostics
    */
-  def problems(path: Path): Seq[FileProblem] = importSnapshotLock.synchronized {
-    val source = file(path)
-    val spec = moduleSpec(source)
-    language.problems(path, spec, buildProblems.get.getOrElse(path, Seq.empty))
+  def problems(path: Path): Seq[FileProblem] = {
+    val readLock = importSnapshotLock.readLock()
+    readLock.lock()
+    try {
+      val source = file(path)
+      val spec = moduleSpec(source)
+      language.problems(path, spec, buildProblems.get.getOrElse(path, Seq.empty))
+    } finally readLock.unlock()
   }
 
   /** Finds a source's owning module compile settings while the caller holds the import guard. */
@@ -395,7 +404,9 @@ final class ProjectSession private (
     /** Applies a prepared plan under both locks, recording mutation failures before unlocking. */
     def applyPreparedImport(preparedPlan: ImportPlan): Unit = {
       var hostMutationStarted = false
-      importSnapshotLock.synchronized {
+      val writeLock = importSnapshotLock.writeLock()
+      writeLock.lock()
+      try {
         HostLock.write {
           try applyImport(preparedPlan, progress, () => hostMutationStarted = true)
           catch {
@@ -404,7 +415,7 @@ final class ProjectSession private (
               throw error
           }
         }
-      }
+      } finally writeLock.unlock()
     }
 
     ensureUsable()
